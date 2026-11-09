@@ -68,7 +68,7 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `--api-key` | `$OPENAI_API_KEY` | DeepSeek key，也可用环境变量或此参数提供 |
 | `-m, --model` | `$OPENAI_MODEL` 或 `Deepseek-V4.1-Flash` | 模型名 |
 | `--temperature` | 不发送 | 采样温度；部分推理模型不接受该字段，因此默认省略 |
-| `--max-steps` | `20` | 每轮最多调用模型多少次 |
+| `--max-steps` | `100` | 每轮最多调用模型多少次 |
 | `--timeout` | `120` | HTTP 超时（秒） |
 | `--cwd` | 当前目录 | 工具的根目录，文件访问被限制在该目录内 |
 | `-i, --image` | 无 | 给任务附加图片，可重复，最多 4 张、单张 10 MB |
@@ -79,7 +79,7 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `--no-skill-scripts` | 关 | 禁用 `run_skill_script`；技能说明和资源仍可用 |
 | `--plain` | 关 | 不渲染 Markdown，直接输出原始文本 |
 | `--thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`（网关返回该字段时）；交互模式可用 `/thinking on\|off` 切换 |
-| `-c, --continue` | 无 | 按 8 位 uuid 恢复会话，例如 `-c a1b2c3d4` |
+| `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
 | `--list` | 关 | 列出已保存的会话并退出，不联网、不需要 API key |
 | `--web` | 关 | 启动浏览器界面；网页模式强制免确认 |
 | `--host` | `127.0.0.1` | 网页监听地址 |
@@ -103,9 +103,13 @@ python3 benben-agent.py --cwd /path/to/project "..."
 
 ```bash
 python3 benben-agent.py --list
-python3 benben-agent.py -c a1b2c3d4                    # 交互模式继续
-python3 benben-agent.py -c a1b2c3d4 "继续刚才的任务"   # 一次性继续
+python3 benben-agent.py -c                             # 恢复最新会话；没有就新建
+python3 benben-agent.py -c a1b2c3d4                    # 交互模式继续指定会话
+python3 benben-agent.py -c a1b2c3d4 "继续刚才的任务"   # 一次性继续指定会话
+python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + 一次性任务
 ```
+
+`-c` 后面的值只有是 8 位小写十六进制时才当作会话 id，否则按 prompt 处理。
 
 `--list` 显示 uuid、日期、消息数、模型、工作区和首条用户消息，按序号倒序。恢复只带回消息历史；模型仍由 `-m`/默认值决定，工具根目录仍是当前 `--cwd`。
 

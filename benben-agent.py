@@ -16,7 +16,7 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --api-key KEY           API key，默认 $OPENAI_API_KEY（代码不内置 key）
     -m, --model NAME        模型名，默认 $OPENAI_MODEL 或 Deepseek-V4.1-Flash
     --temperature FLOAT     采样温度；默认不发送
-    --max-steps N           每轮最多调用模型多少次，默认 20
+    --max-steps N           每轮最多调用模型多少次，默认 100
     --timeout SECONDS       HTTP 超时，默认 120
     --cwd DIR               工具的工作区根目录，默认当前目录
     --confirm               写文件/修改状态的命令前询问
@@ -25,7 +25,7 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --plain                 不渲染终端 Markdown，直接输出原文
     -i, --image PATH        给任务附加图片，可重复，最多 4 张、单张 10 MB
     --thinking              打印模型的 reasoning_content（默认关闭）
-    -c, --continue UUID     按 8 位 uuid 恢复会话，例如 -c a1b2c3d4
+    -c, --continue [UUID]   恢复会话；省略 UUID 取最新，没有会话则新建
     --list                  列出已保存会话并退出，不联网
     --web                   启动网页界面；强制免确认
     --host HOST             网页监听地址，默认 127.0.0.1
@@ -626,6 +626,18 @@ def session_summaries() -> list[dict[str, Any]]:
         })
     rows.sort(key=lambda row: row["sequence"], reverse=True)
     return rows
+
+
+def latest_session_uuid() -> str | None:
+    best: tuple[int, str, str] | None = None
+    for path in _session_files():
+        match = re.match(r"(\d+)-(\d{8})-([0-9a-f]{8})\.jsonl$", os.path.basename(path))
+        if not match:
+            continue
+        key = (int(match.group(1)), match.group(2), match.group(3))
+        if best is None or key > best:
+            best = key
+    return best[2] if best else None
 
 
 def list_sessions() -> int:
@@ -2913,7 +2925,7 @@ def main(argv: list[str] | None = None) -> int:
         help="model name (default: %(default)s)",
     )
     parser.add_argument("--temperature", type=float, default=None, help="sampling temperature (omitted by default)")
-    parser.add_argument("--max-steps", type=int, default=20, help="max model calls per turn (default: %(default)s)")
+    parser.add_argument("--max-steps", type=int, default=100, help="max model calls per turn (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds (default: %(default)s)")
     parser.add_argument("--cwd", default=".", help="workspace root for tools (default: current directory)")
     confirm_group = parser.add_mutually_exclusive_group()
@@ -2950,8 +2962,10 @@ def main(argv: list[str] | None = None) -> int:
         "-c",
         "--continue",
         dest="resume",
+        nargs="?",
+        const="",
         metavar="UUID",
-        help="resume a saved session by its 8-character id",
+        help="resume the latest session, or one by its 8-character id",
     )
     parser.add_argument(
         "--list",
@@ -2988,6 +3002,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # `-c` may be followed by a prompt; only an 8-hex value is a session id.
+    if args.resume is not None and args.resume and not re.fullmatch(r"[0-9a-f]{8}", args.resume):
+        args.prompt.insert(0, args.resume)
+        args.resume = ""
+
     if args.list_sessions:
         return list_sessions()
 
@@ -3012,18 +3031,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.web:
         if args.prompt or args.image:
             print("[web] prompt/image arguments are ignored in web mode", file=sys.stderr)
+        if args.resume is not None:
+            print("[web] -c is ignored in web mode", file=sys.stderr)
         return run_web(args.host, args.port, workspace, client, args.max_steps, args.thinking)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt(workspace.root, workspace.skills)}
     ]
     session = None
-    if args.resume:
-        try:
-            session = load_session(args.resume, messages)
-        except SessionError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        print(f"resumed session: {os.path.basename(session.path)} ({len(messages) - 1} messages)")
+    if args.resume is not None:
+        resume_uuid = args.resume or latest_session_uuid()
+        if resume_uuid is None:
+            print("no saved sessions; starting a new session", file=sys.stderr)
+        else:
+            try:
+                session = load_session(resume_uuid, messages)
+            except SessionError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(f"resumed session: {os.path.basename(session.path)} ({len(messages) - 1} messages)")
 
     try:
         if args.prompt or args.image:
