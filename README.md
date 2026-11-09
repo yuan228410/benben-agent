@@ -1,6 +1,6 @@
 # 零依赖 AI Agent
 
-`benben-agent.py` 是一个只用 Python 3.8+ 标准库实现的命令行 AI agent，通过 OpenAI 兼容的 `POST /chat/completions` 接口驱动。支持多轮对话、会话持久化、function calling（工具调用）和图片输入，模型可以读写工作区文件、执行命令，然后给出最终回答。
+`benben-agent.py` 是一个只用 Python 3.8+ 标准库实现的命令行 AI agent，通过 OpenAI 兼容的 `POST /chat/completions` 接口驱动。支持多轮对话、会话持久化、Agent Skills、function calling（工具调用）和图片输入，模型可以读写工作区文件、执行命令，然后给出最终回答。
 
 ## 快速开始
 
@@ -27,6 +27,8 @@ you> 把 hello.txt 里的内容改成 Hello World
 you> /confirm on      # 需要时开启确认；只读命令不会询问
 you> /thinking on     # 显示模型的思考内容（默认关闭）
 you> /image shot.png  # 附带图片，随下一条消息发送
+you> /skill            # 列出已加载的 Agent Skills
+you> /skill log-triage 排查 502  # 强制用指定技能回答问题
 you> /save            # 把当前会话保存为工作区里的 chat-<时间戳>.md（只存对话）
 you> /save --tool --thinking notes.md  # 连同工具调用/输出和思考一起保存
 you> /model list      # 按名称排序列出网关可用模型（带编号，* 为当前模型）
@@ -66,12 +68,15 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `--api-key` | `$OPENAI_API_KEY` | DeepSeek key，也可用环境变量或此参数提供 |
 | `-m, --model` | `$OPENAI_MODEL` 或 `Deepseek-V4.1-Flash` | 模型名 |
 | `--temperature` | 不发送 | 采样温度；部分推理模型不接受该字段，因此默认省略 |
-| `--max-steps` | `12` | 每轮最多调用模型多少次 |
+| `--max-steps` | `20` | 每轮最多调用模型多少次 |
 | `--timeout` | `120` | HTTP 超时（秒） |
 | `--cwd` | 当前目录 | 工具的根目录，文件访问被限制在该目录内 |
 | `-i, --image` | 无 | 给任务附加图片，可重复，最多 4 张、单张 10 MB |
 | `--confirm` / `--no-confirm` | 关 | 是否在写文件和会修改状态的命令前询问；只读命令从不询问，`--yes` 是 `--no-confirm` 的别名 |
 | `--no-shell` | 关 | 禁用 `run_command` |
+| `--skill` / `--no-skill` | 开 | 是否扫描 Agent Skills 并向模型暴露技能工具；`--no-skill` 时完全不加载 |
+| `--only-own-skills` | 关 | 只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
+| `--no-skill-scripts` | 关 | 禁用 `run_skill_script`；技能说明和资源仍可用 |
 | `--plain` | 关 | 不渲染 Markdown，直接输出原始文本 |
 | `--thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`（网关返回该字段时）；交互模式可用 `/thinking on\|off` 切换 |
 | `-c, --continue` | 无 | 按 8 位 uuid 恢复会话，例如 `-c a1b2c3d4` |
@@ -106,6 +111,62 @@ python3 benben-agent.py -c a1b2c3d4 "继续刚才的任务"   # 一次性继续
 
 交互模式里 `/reset` 会清空上下文并结束当前会话文件，下一条消息写入新文件，旧文件保留可随时 `-c` 恢复。删除会话目前只在网页入口提供（带确认弹框），CLI 没有删除命令。
 
+## 技能（Agent Skills）
+
+兼容 [Agent Skills](https://agentskills.io/specification) 开放格式。技能按需加载，不会在启动时把全部说明和脚本塞进上下文：
+
+```text
+<workspace>/.agents/skills/      # 项目级，跨客户端
+<workspace>/.claude/skills/      # Claude Code 项目级
+<workspace>/.codex/skills/       # Codex 旧路径（项目级）
+~/.benben-agent/skills/          # 本项目全局
+~/.agents/skills/                # 跨客户端 / Codex 现行用户目录
+~/.claude/skills/                # Claude Code 个人目录
+~/.codex/skills/                 # Codex 旧用户目录（$CODEX_HOME/skills）
+/etc/codex/skills/               # Codex 管理员目录
+```
+
+同名技能按上面的顺序优先，先加载的生效。Codex 的 `$CODEX_HOME` 环境变量会生效；Claude 的技能可以省略 `name`，此时直接用目录名。
+
+只扫描工作区根目录和上述用户目录，不会像 Codex/Claude 那样向上遍历父目录；需要在父目录共享技能时，用软链接或把技能放进工作区。加 `--only-own-skills` 后只扫描 `~/.benben-agent/skills/`，不会加载其他客户端的技能。
+
+每个技能是一个目录：
+
+```text
+log-triage/
+├── SKILL.md          # 必需：YAML frontmatter + 指令
+├── scripts/          # 可选：可执行脚本
+├── references/       # 可选：参考文档
+└── assets/           # 可选：模板和资源
+```
+
+```markdown
+---
+name: log-triage
+description: 按时间线归纳日志。处理日志排查、异常定位时使用。
+---
+
+## 步骤
+1. 查看最近日志…
+```
+
+- `name` 可省略（Claude 风格，默认用目录名）；提供时必须是小写字母/数字/连字符；`description` 为 1-1024 字符；
+- 启动只读 frontmatter；`load_skill` 才加载完整 SKILL.md；资源和脚本只在真正需要时读取；
+- 支持 `license`、`compatibility`、`metadata`；`allowed-tools` 会解析但暂不生效；
+- Claude 的 `!` 命令注入、`$ARGUMENTS` 等宿主特性不会执行，技能正文按普通文本加载。
+
+模型侧只看到技能清单，并按需调用：
+
+| 工具 | 作用 | 需要批准 |
+| --- | --- | --- |
+| `load_skill` | 读取完整 SKILL.md | 否 |
+| `read_skill_resource` | 读取技能目录内的参考文件 | 否 |
+| `run_skill_script` | 执行 `scripts/` 下的脚本 | 是 |
+
+脚本按 shebang、扩展名（py/sh/js/rb/pl/php/ps1）或可执行文件运行；cwd 是当前工作区，并注入 `BENBEN_SKILL_DIR` 和 `BENBEN_WORKSPACE`。脚本默认启用，`--no-skill-scripts` 关闭；`--confirm` 下每次执行都要确认；web 模式没有审批，启动会打印警告。
+
+关闭技能用 `--no-skill`：不扫描技能目录，也不向模型暴露任何技能工具。交互模式里 `/skill` 列出已加载技能，`/skill <name> <问题>` 会强制加载指定技能并用它回答。
+
 ## 网页入口
 
 ```bash
@@ -134,8 +195,11 @@ python3 benben-agent.py --web
 | `write_file` | 创建或覆盖文件 | 是 |
 | `edit_file` | 替换文件中的一段文本（类似 patch） | 是 |
 | `run_command` | 在工作区执行 shell 命令 | 是 |
+| `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 否 |
+| `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 否 |
+| `run_skill_script` | 执行技能 `scripts/` 下的脚本（仅在启用脚本且存在脚本时提供） | 是 |
 
-默认不询问，写文件和命令直接执行。加 `--confirm` 后，写文件和会修改状态的命令会询问 `Allow? [Y/n]`（直接回车即允许）；只读命令（grep、tail、ps、df、journalctl、curl 等）任何时候都不询问。判断是保守白名单：未知命令、包装器（sudo、timeout、env）、重定向、命令替换和危险参数都按修改状态处理；`curl` 带 `-o/-d/-X` 等写文件或发数据的参数、`wget` 不带 `-O -`/`--spider` 时都要求批准。标准输入不是终端（例如管道、CI）时直接拒绝，并把原因返回给模型。交互模式里可以随时用 `/confirm on` 和 `/confirm off` 切换。模型最多执行 `--max-steps` 次模型调用，达到上限会以退出码 1 结束。交互模式下 Ctrl+C 需要连按两次才退出：第一次取消当前输入或中断正在执行的任务，2 秒内再按一次才退出。
+默认不询问，写文件和命令直接执行。加 `--confirm` 后，写文件和会修改状态的命令会询问 `Allow? [Y/n]`（直接回车即允许）；只读命令（grep、tail、ps、df、journalctl、curl 等）任何时候都不询问。判断是保守白名单：未知命令、包装器（sudo、timeout、env）、重定向、命令替换和危险参数都按修改状态处理；`curl` 带 `-o/-d/-X` 等写文件或发数据的参数、`wget` 不带 `-O -`/`--spider` 时都要求批准。标准输入不是终端（例如管道、CI）时直接拒绝，并把原因返回给模型。交互模式里可以随时用 `/confirm on` 和 `/confirm off` 切换。模型最多执行 `--max-steps` 次模型调用，一次性任务达到上限会以退出码 1 结束，交互模式只提示后继续。交互模式下 Ctrl+C 需要连按两次才退出：第一次取消当前输入或中断正在执行的任务，2 秒内再按一次才退出。
 
 ## 图片识别
 
@@ -183,4 +247,3 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 ## 许可
 
 本项目基于 [MIT License](LICENSE) 开源。
-

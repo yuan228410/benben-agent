@@ -1,14 +1,73 @@
 #!/usr/bin/env python3
-"""A small AI agent that talks to any OpenAI-compatible /chat/completions API.
+"""笨笨：零依赖的单文件 AI Agent（Python 3.8+，仅标准库）。
 
-Uses only the Python standard library (urllib, json, subprocess, ...).
+通过任何 OpenAI 兼容的 POST /chat/completions 接口驱动，支持多轮对话、
+function calling、会话持久化、Agent Skills、图片输入和网页界面。
 
-Examples:
+快速开始：
     export OPENAI_API_KEY=sk-...
-    python3 benben-agent.py "summarize the files in this directory"
-    python3 benben-agent.py --base-url http://localhost:8000/v1 --model local "fix the bug"
-    python3 benben-agent.py            # interactive mode
-    python3 benben-agent.py --web      # web UI (http://127.0.0.1:8765)
+    python3 benben-agent.py "列出当前目录，并总结这些文件是做什么的"
+    python3 benben-agent.py                      # 交互模式
+    python3 benben-agent.py --web                # 网页界面
+
+常用参数（完整列表见 --help）：
+    prompt ...              一次性任务；省略则进入交互模式
+    --base-url URL          接口地址，默认 $OPENAI_BASE_URL 或 https://api.deepseek.com/v1
+    --api-key KEY           API key，默认 $OPENAI_API_KEY（代码不内置 key）
+    -m, --model NAME        模型名，默认 $OPENAI_MODEL 或 Deepseek-V4.1-Flash
+    --temperature FLOAT     采样温度；默认不发送
+    --max-steps N           每轮最多调用模型多少次，默认 20
+    --timeout SECONDS       HTTP 超时，默认 120
+    --cwd DIR               工具的工作区根目录，默认当前目录
+    --confirm               写文件/修改状态的命令前询问
+    --no-confirm, --yes     从不询问（默认，--yes 为别名）
+    --no-shell              禁用 run_command
+    --plain                 不渲染终端 Markdown，直接输出原文
+    -i, --image PATH        给任务附加图片，可重复，最多 4 张、单张 10 MB
+    --thinking              打印模型的 reasoning_content（默认关闭）
+    -c, --continue UUID     按 8 位 uuid 恢复会话，例如 -c a1b2c3d4
+    --list                  列出已保存会话并退出，不联网
+    --web                   启动网页界面；强制免确认
+    --host HOST             网页监听地址，默认 127.0.0.1
+    --port PORT             网页端口，默认 8765；0 表示系统分配
+    --skill                 启用 Agent Skills（默认）
+    --no-skill              不扫描技能，也不暴露技能工具
+    --only-own-skills       只加载 ~/.benben-agent/skills，忽略其他客户端目录
+    --no-skill-scripts      禁用 run_skill_script（技能说明/资源仍可用）
+
+交互模式斜杠命令：
+    /help                         显示帮助
+    /reset                        清空上下文，下一条消息开新会话文件
+    /skill                        列出已加载技能
+    /skill <name>                 查看技能说明和用法
+    /skill <name> <问题>          强制加载指定技能来回答
+    /image <path...>              附加图片到下一条消息
+    /image clear                  清空待发图片
+    /save [--tool] [--thinking] [file]
+                                  导出 Markdown 会话
+    /confirm on|off               切换写操作确认
+    /thinking on|off              切换思考内容显示
+    /model [name|number|list]     查看/切换模型
+    /exit, /quit                  退出（Ctrl-D 同效）
+
+环境变量：
+    OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL
+    NO_COLOR=1                    关闭终端颜色
+    CODEX_HOME                    Codex 技能目录的根（默认 ~/.codex）
+
+数据位置：
+    会话              ~/.benben-agent/*.jsonl（目录 0700，文件 0600）
+    技能              <cwd>/.agents/skills、<cwd>/.claude/skills、
+                      <cwd>/.codex/skills、~/.benben-agent/skills、
+                      ~/.agents/skills、~/.claude/skills、
+                      ~/.codex/skills、/etc/codex/skills
+
+内置工具：list_dir、read_file、search、glob、write_file、edit_file、
+run_command；启用技能时按需增加 load_skill、read_skill_resource、
+run_skill_script。工具结果默认截断到 20000 字符。
+
+安全提示：agent 可以读写工作区文件并执行命令；网页模式没有审批，
+只监听本机并依赖启动时生成的 token。技能脚本以当前用户权限运行。
 """
 
 from __future__ import annotations
@@ -22,6 +81,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -58,6 +118,27 @@ SESSION_DIR = os.path.expanduser("~/.benben-agent")
 SESSION_VERSION = 1
 WEB_PORT = 8765
 WEB_MAX_BODY = 60 * 1024 * 1024
+HOME_SKILLS_DIR = os.path.join(SESSION_DIR, "skills")
+CROSS_SKILLS_DIR = os.path.expanduser("~/.agents/skills")
+CLAUDE_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+CODEX_SKILLS_DIR = os.path.join(CODEX_HOME, "skills")
+CODEX_ADMIN_SKILLS_DIR = "/etc/codex/skills"
+SKILL_FRONTMATTER_BYTES = 8192
+MAX_SKILL_BYTES = 64 * 1024
+MAX_SKILL_RESOURCE_BYTES = 1024 * 1024
+SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SCRIPT_RUNNERS = {
+    ".py": [sys.executable],
+    ".sh": ["bash", "sh"],
+    ".bash": ["bash", "sh"],
+    ".js": ["node"],
+    ".mjs": ["node"],
+    ".rb": ["ruby"],
+    ".pl": ["perl"],
+    ".php": ["php"],
+    ".ps1": ["pwsh", "powershell"],
+}
 SKIP_DIRS = {
     ".git", ".hg", ".svn", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
     "__pycache__", "node_modules", "venv", ".venv", "dist", "build", "target",
@@ -569,6 +650,270 @@ def list_sessions() -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Skills (Agent Skills open format)
+# --------------------------------------------------------------------------- #
+
+
+def _yaml_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_frontmatter(text: str) -> dict[str, Any] | None:
+    """Parse the small YAML subset used by SKILL.md frontmatter."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    end = None
+    for index in range(1, len(lines)):
+        if lines[index].rstrip() == "---":
+            end = index
+            break
+    if end is None:
+        return None
+
+    meta: dict[str, Any] = {}
+    seen: set[str] = set()
+    recognized = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+    nested: dict[str, str] | None = None
+    block_key: str | None = None
+    block_style = ""
+    block: list[str] = []
+    index = 1
+    while index < end:
+        raw = lines[index]
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            index += 1
+            continue
+        if raw.startswith((" ", "\t")):
+            if nested is not None:
+                match = re.match(r"^([^:]+):\s*(.*)$", raw.strip())
+                if match:
+                    nested[_yaml_value(match.group(1))] = _yaml_value(match.group(2))
+            elif block_key is not None:
+                block.append(raw.strip())
+            index += 1
+            continue
+
+        if block_key is not None:
+            meta[block_key] = (" " if block_style == ">" else "\n").join(block).strip()
+            block_key = None
+            block = []
+        nested = None
+
+        match = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", raw)
+        if not match:
+            index += 1
+            continue
+        key = match.group(1)
+        value = match.group(2).strip()
+        if key in recognized:
+            if key in seen:
+                return None
+            seen.add(key)
+        if key == "metadata":
+            nested = {}
+            meta["metadata"] = nested
+        elif value in ("|", ">", "|-", ">-", "|+", ">+"):
+            block_key = key
+            block_style = value[0]
+            block = []
+        else:
+            meta[key] = _yaml_value(value)
+        index += 1
+
+    if block_key is not None:
+        meta[block_key] = (" " if block_style == ">" else "\n").join(block).strip()
+    return meta
+
+
+def _validate_skill_meta(meta: dict[str, Any], directory: str) -> tuple[str | None, str | None]:
+    name = meta.get("name", directory)
+    if not isinstance(name, str) or not SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
+        return None, "name must be 1-64 lowercase letters, digits and hyphens"
+    description = meta.get("description")
+    if not isinstance(description, str) or not (1 <= len(description) <= 1024):
+        return None, "description must be 1-1024 characters"
+    compatibility = meta.get("compatibility")
+    if compatibility is not None and (not isinstance(compatibility, str) or len(compatibility) > 500):
+        return None, "compatibility must be at most 500 characters"
+    metadata = meta.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return None, "metadata must be a mapping"
+    allowed = meta.get("allowed-tools")
+    if allowed is not None and not isinstance(allowed, str):
+        return None, "allowed-tools must be a space-separated string"
+    return str(name), None
+
+
+def skill_roots(workspace_root: str, only_own: bool = False) -> list[str]:
+    if only_own:
+        return [HOME_SKILLS_DIR]
+    return [
+        os.path.join(workspace_root, ".agents", "skills"),
+        os.path.join(workspace_root, ".claude", "skills"),
+        os.path.join(workspace_root, ".codex", "skills"),
+        HOME_SKILLS_DIR,
+        CROSS_SKILLS_DIR,
+        CLAUDE_SKILLS_DIR,
+        CODEX_SKILLS_DIR,
+        CODEX_ADMIN_SKILLS_DIR,
+    ]
+
+
+def _dir_has_files(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    for _root, _dirs, files in os.walk(path):
+        if files:
+            return True
+    return False
+
+
+def _has_extra_files(skill_dir: str) -> bool:
+    for root, _dirs, files in os.walk(skill_dir):
+        for name in files:
+            if root == skill_dir and name == "SKILL.md":
+                continue
+            return True
+    return False
+
+
+def discover_skills(workspace_root: str, only_own: bool = False) -> dict[str, dict[str, Any]]:
+    """Load only skill metadata; bodies and resources stay on disk until requested."""
+    skills: dict[str, dict[str, Any]] = {}
+    for root in skill_roots(workspace_root, only_own):
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            directory = os.path.join(root, entry)
+            skill_md = os.path.join(directory, "SKILL.md")
+            if not os.path.isdir(directory) or not os.path.isfile(skill_md):
+                continue
+            try:
+                with open(skill_md, "r", encoding="utf-8", errors="replace") as handle:
+                    head = handle.read(SKILL_FRONTMATTER_BYTES)
+            except OSError as exc:
+                print(f"[skill] {entry}: {exc}", file=sys.stderr)
+                continue
+            meta = _parse_frontmatter(head)
+            if meta is None:
+                print(f"[skill] {entry}: invalid or missing frontmatter", file=sys.stderr)
+                continue
+            name, problem = _validate_skill_meta(meta, entry)
+            if problem:
+                print(f"[skill] {entry}: {problem}", file=sys.stderr)
+                continue
+            if name in skills:
+                continue
+            skills[name] = {
+                "name": name,
+                "description": meta["description"],
+                "path": skill_md,
+                "dir": directory,
+                "license": meta.get("license") or "",
+                "compatibility": meta.get("compatibility") or "",
+                "metadata": meta.get("metadata") or {},
+                "allowed_tools": meta.get("allowed-tools") or "",
+                "has_scripts": _dir_has_files(os.path.join(directory, "scripts")),
+                "has_resources": _has_extra_files(directory),
+            }
+    return skills
+
+
+def build_system_prompt(root: str, skills: dict[str, dict[str, Any]]) -> str:
+    prompt = SYSTEM_PROMPT.format(root=root)
+    if not skills:
+        return prompt
+    lines = ["", "可用技能（任务匹配时先调用 load_skill 读取完整说明）："]
+    for skill in sorted(skills.values(), key=lambda item: item["name"]):
+        description = " ".join(skill["description"].split())
+        lines.append(f"- {skill['name']}：{description}")
+    return prompt + "\n".join(lines)
+
+
+LOAD_SKILL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "load_skill",
+        "description": "Load the full SKILL.md instructions for an available skill.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill name from the available skills list."}
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+READ_SKILL_RESOURCE_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_skill_resource",
+        "description": "Read a reference or asset file inside a skill directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill name."},
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to the skill root, e.g. references/REFERENCE.md.",
+                },
+            },
+            "required": ["name", "path"],
+        },
+    },
+}
+
+RUN_SKILL_SCRIPT_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "run_skill_script",
+        "description": "Run a script from a skill's scripts/ directory. Requires user approval.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill name."},
+                "script": {
+                    "type": "string",
+                    "description": "Script path relative to the skill's scripts/ directory.",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Command-line arguments passed to the script.",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Kill the script after this many seconds. Default 60, max 300.",
+                },
+            },
+            "required": ["name", "script"],
+        },
+    },
+}
+
+
+def tool_schemas(workspace: "Workspace") -> list[dict[str, Any]]:
+    tools = list(TOOL_SCHEMAS)
+    if not workspace.skills:
+        return tools
+    tools.append(LOAD_SKILL_SCHEMA)
+    if any(skill["has_resources"] for skill in workspace.skills.values()):
+        tools.append(READ_SKILL_RESOURCE_SCHEMA)
+    if workspace.allow_skill_scripts and any(skill["has_scripts"] for skill in workspace.skills.values()):
+        tools.append(RUN_SKILL_SCRIPT_SCHEMA)
+    return tools
+
+
+# --------------------------------------------------------------------------- #
 # Tools
 # --------------------------------------------------------------------------- #
 
@@ -832,11 +1177,123 @@ def is_read_only_command(command: str) -> bool:
     return True
 
 
+def _capture_process(
+    args: Any,
+    cwd: str,
+    timeout: int,
+    env: dict[str, str] | None = None,
+    shell: bool = False,
+) -> tuple[int, str, str, bool]:
+    """Run a process and cap each output stream at MAX_TOOL_OUTPUT."""
+
+    def drain(pipe: Any, store: dict[str, Any]) -> None:
+        try:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                room = MAX_TOOL_OUTPUT - store["size"]
+                if room <= 0:
+                    store["truncated"] = True
+                    continue
+                if len(chunk) > room:
+                    store["truncated"] = True
+                    chunk = chunk[:room]
+                store["parts"].append(chunk)
+                store["size"] += len(chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    try:
+        process = subprocess.Popen(
+            args,
+            shell=shell,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            env=env,
+        )
+    except OSError as exc:
+        raise ToolError(str(exc)) from exc
+
+    out: dict[str, Any] = {"parts": [], "size": 0, "truncated": False}
+    err: dict[str, Any] = {"parts": [], "size": 0, "truncated": False}
+    readers = [
+        threading.Thread(target=drain, args=(process.stdout, out), daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, err), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        process.wait()
+    for reader in readers:
+        reader.join(1.0)
+    if timed_out:
+        raise ToolError(f"command timed out after {timeout}s")
+    return (
+        process.returncode,
+        "".join(out["parts"]),
+        "".join(err["parts"]),
+        bool(out["truncated"] or err["truncated"]),
+    )
+
+
+def _script_command(path: str) -> list[str]:
+    try:
+        with open(path, "rb") as handle:
+            first = handle.readline(256)
+    except OSError as exc:
+        raise ToolError(str(exc)) from exc
+    text = first.decode("utf-8", "replace").strip()
+    if text.startswith("#!"):
+        parts = shlex.split(text[2:].strip())
+        if parts:
+            return parts + [path]
+    candidates = SCRIPT_RUNNERS.get(os.path.splitext(path)[1].lower())
+    if candidates:
+        for candidate in candidates:
+            if os.path.isabs(candidate):
+                if os.access(candidate, os.X_OK):
+                    return [candidate, path]
+                continue
+            found = shutil.which(candidate)
+            if found:
+                return [found, path]
+        raise ToolError(f"interpreter not found for {os.path.splitext(path)[1]}: {', '.join(candidates)}")
+    if os.access(path, os.X_OK):
+        return [path]
+    raise ToolError(
+        f"cannot determine how to run {os.path.basename(path)}; add a shebang or use a supported extension"
+    )
+
+
 class Workspace:
-    def __init__(self, root: str, confirm: bool = False, allow_shell: bool = True) -> None:
+    def __init__(
+        self,
+        root: str,
+        confirm: bool = False,
+        allow_shell: bool = True,
+        skills: dict[str, dict[str, Any]] | None = None,
+        allow_skill_scripts: bool = True,
+    ) -> None:
         self.root = os.path.realpath(root)
         self.confirm = confirm
         self.allow_shell = allow_shell
+        self.skills = skills or {}
+        self.allow_skill_scripts = allow_skill_scripts
         self.interactive = sys.stdin.isatty()
 
     # -- helpers ---------------------------------------------------------- #
@@ -1054,6 +1511,96 @@ class Workspace:
             shown = full
         return shown + (" (overwritten)" if existed else "")
 
+    def _skill(self, name: str) -> dict[str, Any]:
+        skill = self.skills.get(name)
+        if skill is None:
+            raise ToolError(f"unknown skill: {name}")
+        return skill
+
+    def load_skill(self, name: str) -> str:
+        skill = self._skill(name)
+        try:
+            with open(skill["path"], "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read(MAX_SKILL_BYTES + 1)
+        except OSError as exc:
+            raise ToolError(str(exc)) from exc
+        if len(text) > MAX_SKILL_BYTES:
+            text = text[:MAX_SKILL_BYTES] + "\n... (truncated)"
+        return text
+
+    def read_skill_resource(self, name: str, path: str) -> str:
+        skill = self._skill(name)
+        base = os.path.realpath(skill["dir"])
+        full = os.path.realpath(os.path.join(base, path))
+        try:
+            inside = os.path.commonpath([full, base]) == base
+        except ValueError:
+            inside = False
+        if not inside:
+            raise ToolError("resource path is outside the skill directory")
+        if full == os.path.realpath(skill["path"]):
+            raise ToolError("use load_skill to read SKILL.md")
+        if not os.path.isfile(full):
+            raise ToolError(f"not a file: {path}")
+        try:
+            if os.path.getsize(full) > MAX_SKILL_RESOURCE_BYTES:
+                raise ToolError(f"resource is too large: {path}")
+            with open(full, "rb") as handle:
+                data = handle.read()
+        except OSError as exc:
+            raise ToolError(str(exc)) from exc
+        if b"\x00" in data[:4096]:
+            raise ToolError(f"binary resource: {path}")
+        text = data.decode("utf-8", "replace")
+        if len(text) > MAX_SKILL_BYTES:
+            text = text[:MAX_SKILL_BYTES] + "\n... (truncated)"
+        return f"# {os.path.relpath(full, base)}\n\n{text}"
+
+    def run_skill_script(
+        self,
+        name: str,
+        script: str,
+        args: list[str] | None = None,
+        timeout_seconds: int = 60,
+    ) -> str:
+        if not self.allow_skill_scripts:
+            raise ToolError("skill scripts are disabled")
+        skill = self._skill(name)
+        script_root = os.path.realpath(os.path.join(skill["dir"], "scripts"))
+        full = os.path.realpath(os.path.join(script_root, script))
+        try:
+            inside = os.path.commonpath([full, script_root]) == script_root
+        except ValueError:
+            inside = False
+        if not inside:
+            raise ToolError("script path is outside the skill's scripts directory")
+        if not os.path.isfile(full):
+            raise ToolError(f"not a file: {script}")
+        if args is None:
+            args = []
+        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+            raise ToolError("args must be a list of strings")
+        command = _script_command(full)
+        preview = f"{name}/{script}" + (" " + " ".join(args[:10]) if args else "")
+        if not self._approve("run_skill_script", preview):
+            raise ToolError("permission denied by user")
+        timeout = max(1, min(int(timeout_seconds), 300))
+        env = os.environ.copy()
+        env["BENBEN_SKILL_DIR"] = skill["dir"]
+        env["BENBEN_WORKSPACE"] = self.root
+        returncode, stdout, stderr, truncated = _capture_process(
+            command + args, self.root, timeout, env=env
+        )
+        parts = [f"exit code: {returncode}"]
+        if stdout:
+            parts.append("stdout:\n" + stdout)
+        if stderr:
+            parts.append("stderr:\n" + stderr)
+        output = "\n".join(parts)
+        if truncated or len(output) > MAX_TOOL_OUTPUT:
+            output = output[:MAX_TOOL_OUTPUT] + "\n... (output truncated)"
+        return output
+
     def run_command(self, command: str, timeout_seconds: int = 60) -> str:
         if not self.allow_shell:
             raise ToolError("the run_command tool is disabled")
@@ -1062,73 +1609,14 @@ class Workspace:
         if not self._approve("run_command", command, read_only=is_read_only_command(command)):
             raise ToolError("permission denied by user")
         timeout = max(1, min(int(timeout_seconds), 300))
-
-        def drain(pipe: Any, store: dict[str, Any]) -> None:
-            try:
-                while True:
-                    chunk = pipe.read(4096)
-                    if not chunk:
-                        break
-                    room = MAX_TOOL_OUTPUT - store["size"]
-                    if room <= 0:
-                        store["truncated"] = True
-                        continue
-                    if len(chunk) > room:
-                        store["truncated"] = True
-                        chunk = chunk[:room]
-                    store["parts"].append(chunk)
-                    store["size"] += len(chunk)
-            except (OSError, ValueError):
-                pass
-            finally:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
-
-        try:
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=self.root,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                errors="replace",
-            )
-        except OSError as exc:
-            raise ToolError(str(exc)) from exc
-
-        out: dict[str, Any] = {"parts": [], "size": 0, "truncated": False}
-        err: dict[str, Any] = {"parts": [], "size": 0, "truncated": False}
-        readers = [
-            threading.Thread(target=drain, args=(process.stdout, out), daemon=True),
-            threading.Thread(target=drain, args=(process.stderr, err), daemon=True),
-        ]
-        for reader in readers:
-            reader.start()
-        timed_out = False
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            process.wait()
-        for reader in readers:
-            reader.join(1.0)
-        if timed_out:
-            raise ToolError(f"command timed out after {timeout}s")
-
-        stdout = "".join(out["parts"])
-        stderr = "".join(err["parts"])
-        parts = [f"exit code: {process.returncode}"]
+        returncode, stdout, stderr, truncated = _capture_process(command, self.root, timeout, shell=True)
+        parts = [f"exit code: {returncode}"]
         if stdout:
             parts.append("stdout:\n" + stdout)
         if stderr:
             parts.append("stderr:\n" + stderr)
         output = "\n".join(parts)
-        if out["truncated"] or err["truncated"] or len(output) > MAX_TOOL_OUTPUT:
+        if truncated or len(output) > MAX_TOOL_OUTPUT:
             output = output[:MAX_TOOL_OUTPUT] + "\n... (output truncated)"
         return output
 
@@ -1142,6 +1630,11 @@ class Workspace:
             "edit_file": self.edit_file,
             "run_command": self.run_command,
         }
+        if self.skills:
+            handlers["load_skill"] = self.load_skill
+            handlers["read_skill_resource"] = self.read_skill_resource
+            if self.allow_skill_scripts:
+                handlers["run_skill_script"] = self.run_skill_script
         handler = handlers.get(name)
         if handler is None:
             raise ToolError(f"unknown tool: {name}")
@@ -1162,6 +1655,7 @@ def run_turn(
     show_thinking: bool = False,
     session: "Session | None" = None,
     emit: "Callable[[str, str], None] | None" = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Let the model call tools until it produces a final answer. Returns True if it did."""
 
@@ -1180,7 +1674,7 @@ def run_turn(
 
     try:
         for _ in range(max_steps):
-            reply = client.chat(messages, TOOL_SCHEMAS)
+            reply = client.chat(messages, tools if tools is not None else TOOL_SCHEMAS)
             reasoning = reply.get("reasoning_content") or reply.get("reasoning") or ""
             reply = clean_assistant_message(reply)
             if isinstance(reasoning, str) and reasoning.strip():
@@ -1448,8 +1942,11 @@ def _print_thinking(text: str) -> None:
 
 
 def print_help() -> None:
-    print("Commands: /help, /reset, /image [path|clear], /save [--tool] [--thinking] [file],")
-    print("          /confirm on|off, /thinking on|off, /model [name|number|list], /exit (Ctrl-D)")
+    print("Commands: /help, /reset, /skill [name [question]], /image [path|clear],")
+    print("          /save [--tool] [--thinking] [file], /confirm on|off,")
+    print("          /thinking on|off, /model [name|number|list], /exit (Ctrl-D)")
+    print("Skills: <cwd>/.agents|.claude|.codex/skills, ~/.benben-agent/skills,")
+    print("        ~/.agents/skills, ~/.claude/skills, ~/.codex/skills")
     print(f"Sessions are saved to {SESSION_DIR}; list with --list, resume with -c <id>.")
     print("Ctrl+C needs two presses to exit; the first one cancels input or the running task.")
 
@@ -2157,8 +2654,9 @@ def run_web(
     token = secrets.token_urlsafe(16)
     token_bytes = token.encode("utf-8")
     lock = threading.Lock()
-    system_message = {"role": "system", "content": SYSTEM_PROMPT.format(root=workspace.root)}
+    system_message = {"role": "system", "content": build_system_prompt(workspace.root, workspace.skills)}
     state: dict[str, Any] = {"messages": [system_message], "session": None}
+    tools = tool_schemas(workspace)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "benben-agent"
@@ -2353,6 +2851,7 @@ def run_web(
                             show_thinking=show_thinking,
                             session=state["session"],
                             emit=lambda kind, text: events.append({"type": kind, "text": text}),
+                            tools=tools,
                         )
                     except ChatError as exc:
                         self._error(502, f"model request failed: {exc}")
@@ -2377,6 +2876,10 @@ def run_web(
     print(f"web ui: http://{display_host}:{bound_port}/?token={token}", flush=True)
     if workspace.allow_shell:
         print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr)
+    if workspace.allow_skill_scripts and any(
+        skill["has_scripts"] for skill in workspace.skills.values()
+    ):
+        print("[web] warning: skill scripts can run without approval", file=sys.stderr)
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(f"[web] warning: listening on {host}; anyone who can reach this port can use the agent", file=sys.stderr)
     try:
@@ -2410,7 +2913,7 @@ def main(argv: list[str] | None = None) -> int:
         help="model name (default: %(default)s)",
     )
     parser.add_argument("--temperature", type=float, default=None, help="sampling temperature (omitted by default)")
-    parser.add_argument("--max-steps", type=int, default=12, help="max model calls per turn (default: %(default)s)")
+    parser.add_argument("--max-steps", type=int, default=20, help="max model calls per turn (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds (default: %(default)s)")
     parser.add_argument("--cwd", default=".", help="workspace root for tools (default: current directory)")
     confirm_group = parser.add_mutually_exclusive_group()
@@ -2459,6 +2962,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--web", action="store_true", help="serve a minimal browser UI")
     parser.add_argument("--host", default="127.0.0.1", help="web bind address (default: %(default)s)")
     parser.add_argument("--port", type=int, default=WEB_PORT, help="web port (default: %(default)s)")
+    parser.add_argument(
+        "--no-skill-scripts",
+        action="store_true",
+        help="disable run_skill_script (skill scripts are enabled by default)",
+    )
+    skill_group = parser.add_mutually_exclusive_group()
+    skill_group.add_argument(
+        "--skill",
+        dest="skills",
+        action="store_true",
+        default=True,
+        help="enable Agent Skills and expose skill tools (default: on)",
+    )
+    skill_group.add_argument(
+        "--no-skill",
+        dest="skills",
+        action="store_false",
+        help="disable Agent Skills; do not scan skills or expose skill tools",
+    )
+    parser.add_argument(
+        "--only-own-skills",
+        action="store_true",
+        help="only load ~/.benben-agent/skills; ignore Claude, Codex and cross-client directories",
+    )
     args = parser.parse_args(argv)
 
     if args.list_sessions:
@@ -2469,6 +2996,11 @@ def main(argv: list[str] | None = None) -> int:
         confirm=False if args.web else args.confirm,
         allow_shell=not args.no_shell,
     )
+    workspace.skills = (
+        discover_skills(workspace.root, only_own=args.only_own_skills) if args.skills else {}
+    )
+    workspace.allow_skill_scripts = args.skills and not args.no_skill_scripts
+    tools = tool_schemas(workspace)
     render_output = not args.plain and sys.stdout.isatty()
     client = ChatClient(
         args.base_url,
@@ -2482,7 +3014,7 @@ def main(argv: list[str] | None = None) -> int:
             print("[web] prompt/image arguments are ignored in web mode", file=sys.stderr)
         return run_web(args.host, args.port, workspace, client, args.max_steps, args.thinking)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(root=workspace.root)}
+        {"role": "system", "content": build_system_prompt(workspace.root, workspace.skills)}
     ]
     session = None
     if args.resume:
@@ -2510,7 +3042,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"session: {os.path.basename(session.path)} (continue with -c {session.uuid})")
             messages.append(message)
             return 0 if run_turn(
-                client, workspace, messages, args.max_steps, render_output, args.thinking, session
+                client, workspace, messages, args.max_steps, render_output, args.thinking, session,
+                tools=tools,
             ) else 1
 
         show_thinking = args.thinking
@@ -2540,6 +3073,59 @@ def main(argv: list[str] | None = None) -> int:
             if user_input == "/help":
                 print_help()
                 continue
+            if (
+                user_input in ("/skill", "/skills")
+                or user_input.startswith("/skill ")
+                or user_input.startswith("/skills ")
+            ):
+                _command, _, argument = user_input.partition(" ")
+                argument = argument.strip()
+                if not args.skills:
+                    print("skills are disabled (remove --no-skill to enable)")
+                    continue
+                if not argument:
+                    if not workspace.skills:
+                        print("no skills found")
+                        continue
+                    for skill in sorted(workspace.skills.values(), key=lambda item: item["name"]):
+                        flags = []
+                        if skill["has_scripts"]:
+                            flags.append("scripts")
+                        if skill["has_resources"]:
+                            flags.append("resources")
+                        suffix = f" [{', '.join(flags)}]" if flags else ""
+                        print(f"- {skill['name']}: {skill['description']}{suffix}")
+                    print("usage: /skill <name> <question>")
+                    continue
+                parts = argument.split(maxsplit=1)
+                name = parts[0]
+                question = parts[1].strip() if len(parts) > 1 else ""
+                skill = workspace.skills.get(name)
+                if skill is None:
+                    print(f"unknown skill: {name}; use /skill to list")
+                    continue
+                flags = []
+                if skill["has_scripts"]:
+                    flags.append("scripts")
+                if skill["has_resources"]:
+                    flags.append("resources")
+                suffix = f" [{', '.join(flags)}]" if flags else ""
+                if not question:
+                    print(f"- {name}: {skill['description']}{suffix}")
+                    print(f"  {skill['path']}")
+                    print(f"usage: /skill {name} <question>")
+                    continue
+                try:
+                    content = workspace.load_skill(name)
+                except ToolError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    continue
+                user_input = (
+                    f"[使用技能 {name}]\n\n{content}\n\n---\n\n"
+                    f"技能说明已经在上面，直接按它执行，不要重复调用 load_skill。\n\n"
+                    f"{question}"
+                )
+                # fall through to the normal send path below
             if user_input == "/reset":
                 messages = messages[:1]
                 pending_images = []
@@ -2671,7 +3257,8 @@ def main(argv: list[str] | None = None) -> int:
             pending_images = []
             try:
                 run_turn(
-                    client, workspace, messages, args.max_steps, render_output, show_thinking, session
+                    client, workspace, messages, args.max_steps, render_output, show_thinking, session,
+                    tools=tools,
                 )
             except ChatError as exc:
                 print(f"error: {exc}", file=sys.stderr)
@@ -2693,4 +3280,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
