@@ -30,14 +30,15 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --web                   启动网页界面；强制免确认
     --host HOST             网页监听地址，默认 127.0.0.1
     --port PORT             网页端口，默认 8765；0 表示系统分配
-    --skill                 启用 Agent Skills（默认）
-    --no-skill              不扫描技能，也不暴露技能工具
-    --only-own-skills       只加载 ~/.benben-agent/skills，忽略其他客户端目录
-    --no-skill-scripts      禁用 run_skill_script（技能说明/资源仍可用）
+    --skill                 启用 Agent Skills（默认关闭）
+    --no-skill              显式关闭 Agent Skills（默认行为）
+    --only-own-skills       配合 --skill：只加载 ~/.benben-agent/skills，忽略其他目录
+    --no-skill-scripts      启用技能时禁用 run_skill_script（说明/资源仍可用）
 
 交互模式斜杠命令：
     /help                         显示帮助
     /reset                        清空上下文，下一条消息开新会话文件
+    /compact [N]                  压缩历史，保留最近 N 个用户回合（默认 2）
     /skill                        列出已加载技能
     /skill <name>                 查看技能说明和用法
     /skill <name> <问题>          强制加载指定技能来回答
@@ -116,6 +117,13 @@ MAX_SEARCH_FILE = 2_000_000
 MAX_GLOB_RESULTS = 500
 SESSION_DIR = os.path.expanduser("~/.benben-agent")
 SESSION_VERSION = 1
+COMPACT_VERSION = 1
+COMPACT_DEFAULT_KEEP = 2
+COMPACT_MAX_CHARS = 48_000
+COMPACT_MESSAGE_CHARS = 4_000
+COMPACT_TOOL_CHARS = 800
+COMPACT_ARGS_CHARS = 400
+COMPACT_SUMMARY_CHARS = 1_200
 WEB_PORT = 8765
 WEB_MAX_BODY = 60 * 1024 * 1024
 HOME_SKILLS_DIR = os.path.join(SESSION_DIR, "skills")
@@ -196,6 +204,10 @@ class SessionError(Exception):
     """Raised when a saved session cannot be created, listed or loaded."""
 
 
+class CompactError(Exception):
+    """Raised when there is not enough history to compact."""
+
+
 # --------------------------------------------------------------------------- #
 # API client
 # --------------------------------------------------------------------------- #
@@ -217,6 +229,10 @@ class ChatClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.temperature = temperature
+        self.last_usage: dict[str, Any] = {}
+        self.last_finish_reason: str | None = None
+        self.last_turn_usage: dict[str, int] = {}
+        self.last_turn_truncated = False
 
     def _request(
         self,
@@ -276,11 +292,16 @@ class ChatClient:
 
         data = self._request(f"{self.base_url}/chat/completions", payload)
         try:
-            message = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            message = choice["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ChatError(f"Unexpected API response: {json.dumps(data)[:1000]}") from exc
         if not isinstance(message, dict):
             raise ChatError(f"Unexpected API response: {json.dumps(data)[:1000]}")
+        usage = data.get("usage")
+        self.last_usage = usage if isinstance(usage, dict) else {}
+        finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+        self.last_finish_reason = finish_reason if isinstance(finish_reason, str) else None
         return message
 
     def list_models(self) -> list[str]:
@@ -306,6 +327,25 @@ def _retry_delay(retry_after: str | None, attempt: int) -> float:
         except ValueError:
             pass
     return min(2.0 ** attempt, 16.0)
+
+
+def merge_usage(total: dict[str, int], usage: Any) -> None:
+    """Accumulate OpenAI-style usage dicts, including reasoning and cached tokens."""
+    if not isinstance(usage, dict):
+        return
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            total[key] = total.get(key, 0) + value
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+        total["reasoning_tokens"] = total.get("reasoning_tokens", 0) + details["reasoning_tokens"]
+    prompt_details = usage.get("prompt_tokens_details")
+    cached = prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
+    if not isinstance(cached, int):
+        cached = usage.get("prompt_cache_hit_tokens")
+    if isinstance(cached, int):
+        total["cached_tokens"] = total.get("cached_tokens", 0) + cached
 
 
 def clean_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -445,6 +485,27 @@ def _message_text(content: Any) -> str:
 def history_view(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     view = []
     for message in messages:
+        if message.get("_compact"):
+            raw = message.get("content")
+            if isinstance(raw, str):
+                summary = raw
+            elif isinstance(raw, list):
+                summary = "\n".join(
+                    part.get("text") or ""
+                    for part in raw
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            else:
+                summary = ""
+            summary = summary.strip()
+            if summary.startswith("[历史对话摘要]"):
+                summary = summary[len("[历史对话摘要]"):].strip()
+            keep = message.get("_compact_keep")
+            label = "上下文已压缩"
+            if isinstance(keep, int) and not isinstance(keep, bool):
+                label += " · 仅保留摘要" if keep == 0 else f" · 保留最近 {keep} 轮"
+            view.append({"role": "notice", "text": label, "summary": summary})
+            continue
         role = message.get("role")
         if role not in ("user", "assistant"):
             continue
@@ -499,6 +560,16 @@ class Session:
             raise SessionError(str(exc)) from exc
         self.saved = len(messages)
 
+    def append_compact(self, record: dict[str, Any], tail: list[dict[str, Any]]) -> None:
+        """Append a compact marker followed by the retained tail (one write)."""
+        lines = [json.dumps(record, ensure_ascii=False)]
+        lines.extend(json.dumps(message, ensure_ascii=False) for message in tail)
+        try:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+        except OSError as exc:
+            raise SessionError(str(exc)) from exc
+
 
 def create_session(model: str, workspace: str) -> Session:
     try:
@@ -538,6 +609,62 @@ def create_session(model: str, workspace: str) -> Session:
         return session
 
 
+def _summary_message(record: dict[str, Any]) -> dict[str, Any]:
+    summary = record.get("summary")
+    text = summary.strip() if isinstance(summary, str) else ""
+    keep = record.get("keep")
+    message: dict[str, Any] = {
+        "role": "user",
+        "content": "[历史对话摘要]\n\n" + (text or "(摘要为空)"),
+        "_compact": True,
+    }
+    if isinstance(keep, int) and not isinstance(keep, bool):
+        message["_compact_keep"] = keep
+    return message
+
+
+def _iter_session_records(handle: Any) -> Any:
+    for raw in handle:
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict):
+            yield record
+
+
+def _replay_session_records(records: Any) -> list[dict[str, Any]]:
+    """Rebuild messages, resetting at every compact marker (the last one wins)."""
+    loaded: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("_type") == "compact":
+            loaded = [_summary_message(record)]
+            continue
+        if record.get("role"):
+            loaded.append(record)
+    return loaded
+
+
+def _last_compact_offset(path: str) -> int | None:
+    """Find the byte offset of the last compact record without parsing old lines."""
+    last: int | None = None
+    with open(path, "rb") as handle:
+        while True:
+            offset = handle.tell()
+            raw = handle.readline()
+            if not raw:
+                break
+            if b'"compact"' not in raw:
+                continue
+            try:
+                record = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(record, dict) and record.get("_type") == "compact":
+                last = offset
+    return last
+
+
 def load_session(uuid: str, messages: list[dict[str, Any]]) -> Session:
     if not re.fullmatch(r"[0-9a-f]{8}", uuid):
         raise SessionError("session id must be 8 lowercase hex characters")
@@ -549,19 +676,12 @@ def load_session(uuid: str, messages: list[dict[str, Any]]) -> Session:
     path = matches[0]
     match = re.match(r"(\d+)-(\d{8})-([0-9a-f]{8})\.jsonl$", os.path.basename(path))
     sequence = int(match.group(1)) if match else 0
-    loaded: list[dict[str, Any]] = []
     try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict) and record.get("role"):
-                    loaded.append(record)
+        offset = _last_compact_offset(path)
+        with open(path, "rb") as handle:
+            if offset:
+                handle.seek(offset)
+            loaded = _replay_session_records(_iter_session_records(handle))
     except OSError as exc:
         raise SessionError(str(exc)) from exc
     messages.extend(loaded)
@@ -607,6 +727,9 @@ def session_summaries() -> list[dict[str, Any]]:
                     if record.get("_type") == "meta":
                         model = record.get("model") or "?"
                         workspace = record.get("workspace") or "?"
+                        continue
+                    if record.get("_type") == "compact":
+                        count = 1  # the synthetic summary message
                         continue
                     if not record.get("role"):
                         continue
@@ -659,6 +782,219 @@ def list_sessions() -> int:
         print("showing the latest 50")
     print("resume with: python3 benben-agent.py -c <ID>")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Context compaction
+# --------------------------------------------------------------------------- #
+
+
+COMPACT_PROMPT = f"""你在为一个 AI agent 压缩对话历史。请把下面的对话总结成简洁、结构化的中文摘要，
+供之后继续任务时使用。只根据对话内容总结，不要编造，也不要回答对话里的问题。
+
+输出使用下面的小节（没有内容就写“无”）：
+## 目标
+## 已完成
+## 关键决策
+## 涉及的文件与路径
+## 执行过的命令
+## 未完成事项
+## 注意事项
+
+总长度控制在 {COMPACT_SUMMARY_CHARS} 字以内。"""
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = max(1, limit * 2 // 3)
+    tail = limit - head - 12
+    if tail > 0:
+        return text[:head] + " …(截断)… " + text[-tail:]
+    return text[:limit]
+
+
+def _content_text(message: dict[str, Any]) -> tuple[str, int]:
+    """Return (text, image count) without ever copying base64 payloads."""
+    raw = message.get("content")
+    if isinstance(raw, str):
+        return raw.strip(), 0
+    if not isinstance(raw, list):
+        return "", 0
+    texts: list[str] = []
+    images = 0
+    for part in raw:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            texts.append(part.get("text") or "")
+        elif part.get("type") == "image_url":
+            images += 1
+    return "\n".join(texts).strip(), images
+
+
+def _summary_text(message: dict[str, Any]) -> str:
+    body, images = _content_text(message)
+    if images:
+        body = (body + "\n[图片]").strip()
+    role = message.get("role")
+    if role == "user":
+        return ("用户：" + _truncate_text(body, COMPACT_MESSAGE_CHARS)) if body else ""
+    if role == "tool":
+        return ("工具结果：" + _truncate_text(body, COMPACT_TOOL_CHARS)) if body else ""
+    if role == "assistant":
+        pieces: list[str] = []
+        if body:
+            pieces.append(_truncate_text(body, COMPACT_MESSAGE_CHARS))
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            arguments = _truncate_text(str(function.get("arguments") or "{}"), COMPACT_ARGS_CHARS)
+            pieces.append(f"[调用工具 {function.get('name')}] {arguments}")
+        return ("助手：\n" + "\n".join(pieces)) if pieces else ""
+    return ""
+
+
+def _estimate_text_tokens(text: str) -> int:
+    wide = 0
+    for char in text:
+        code = ord(char)
+        if (
+            0x2E80 <= code <= 0xA4CF
+            or 0xAC00 <= code <= 0xD7AF
+            or 0xF900 <= code <= 0xFAFF
+            or 0xFE30 <= code <= 0xFE4F
+            or 0xFF00 <= code <= 0xFFEF
+        ):
+            wide += 1
+    return wide + max(1, (len(text) - wide) // 4)
+
+
+def estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough context estimate for display only (CJK count as one token)."""
+    total = 0
+    for message in messages:
+        body, images = _content_text(message)
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            body += "\n" + str(function.get("arguments") or "")
+        total += 4 + _estimate_text_tokens(body) + 800 * images
+    return total
+
+
+def _compact_split(messages: list[dict[str, Any]], keep: int) -> int:
+    """Index where the retained tail starts; cuts only before a user turn."""
+    if keep <= 0:
+        return len(messages)
+    seen = 0
+    for index in range(len(messages) - 1, 0, -1):
+        message = messages[index]
+        if message.get("role") == "user" and not message.get("_compact"):
+            seen += 1
+            if seen >= keep:
+                return index
+    return 1
+
+
+def _compaction_chunks(messages: list[dict[str, Any]]) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for message in messages:
+        text = _summary_text(message)
+        if not text:
+            continue
+        if current and size + len(text) + 1 > COMPACT_MAX_CHARS:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(text)
+        size += len(text) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def compact_history(
+    client: ChatClient,
+    messages: list[dict[str, Any]],
+    session: "Session | None" = None,
+    keep: int = COMPACT_DEFAULT_KEEP,
+    progress: "Callable[[str], None] | None" = None,
+) -> dict[str, Any]:
+    """Summarize older turns, then append a marker plus the retained tail."""
+    if not messages or messages[0].get("role") != "system":
+        raise CompactError("messages must start with the system prompt")
+    if keep < 0:
+        keep = 0
+    split = _compact_split(messages, keep)
+    prefix = messages[1:split]
+    tail = messages[split:]
+    if not prefix:
+        raise CompactError("nothing to compact (history is too short)")
+    chunks = _compaction_chunks(prefix)
+    if not chunks:
+        raise CompactError("nothing to compact (no text in history)")
+
+    before_tokens = estimate_tokens(messages)
+    before_total = len(messages) - 1
+    usage: dict[str, int] = {}
+    truncated = False
+    summary = ""
+    for index, chunk in enumerate(chunks, 1):
+        if progress is not None:
+            progress(f"正在总结第 {index}/{len(chunks)} 段…")
+        if summary:
+            prompt = (
+                f"{COMPACT_PROMPT}\n\n已有摘要：\n{summary}\n\n"
+                f"接下来要并入摘要的对话：\n{chunk}"
+            )
+        else:
+            prompt = f"{COMPACT_PROMPT}\n\n待压缩的对话：\n{chunk}"
+        reply = client.chat([{"role": "user", "content": prompt}], [])
+        merge_usage(usage, client.last_usage)
+        if client.last_finish_reason == "length":
+            truncated = True
+        content, _images = _content_text(reply)
+        if not content:
+            raise ChatError("summarization returned an empty answer")
+        summary = content
+
+    summary_message = {
+        "role": "user",
+        "content": "[历史对话摘要]\n\n" + summary,
+        "_compact": True,
+        "_compact_keep": keep,
+    }
+    new_messages = [messages[0], summary_message, *tail]
+    record = {
+        "_type": "compact",
+        "version": COMPACT_VERSION,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "keep": keep,
+        "tail_count": len(tail),
+        "before_messages": len(prefix),
+        "summary": summary,
+    }
+    if session is not None:
+        session.log(messages)
+        session.append_compact(record, tail)
+    messages[:] = new_messages
+    if session is not None:
+        session.saved = len(messages)
+    return {
+        "summary": summary,
+        "keep": keep,
+        "before_messages": len(prefix),
+        "before_total": before_total,
+        "after_messages": len(new_messages) - 1,
+        "kept_messages": len(tail),
+        "before_tokens": before_tokens,
+        "after_tokens": estimate_tokens(new_messages),
+        "usage": usage,
+        "truncated": truncated,
+        "chunks": len(chunks),
+        "persisted": session is not None,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1681,12 +2017,25 @@ def run_turn(
                 print(f"{_agent_prefix()}{text.rstrip(chr(10) + chr(13))}", flush=True)
         elif kind == "tool":
             print(_style(f"  {text}", DIM, supports_color()), flush=True)
+        elif kind == "usage":
+            print(_style(f"  {text}", DIM, supports_color()), file=sys.stderr, flush=True)
+        elif kind == "warning":
+            print(_style(f"  {text}", YELLOW, supports_color()), file=sys.stderr, flush=True)
         else:
             _print_thinking(text)
+
+    usage_total: dict[str, int] = {}
+    truncated = False
+
+    def add_usage(usage: Any) -> None:
+        merge_usage(usage_total, usage)
 
     try:
         for _ in range(max_steps):
             reply = client.chat(messages, tools if tools is not None else TOOL_SCHEMAS)
+            add_usage(client.last_usage)
+            if client.last_finish_reason == "length":
+                truncated = True
             reasoning = reply.get("reasoning_content") or reply.get("reasoning") or ""
             reply = clean_assistant_message(reply)
             if isinstance(reasoning, str) and reasoning.strip():
@@ -1721,6 +2070,19 @@ def run_turn(
         print(f"[stopped] reached the limit of {max_steps} model calls without a final answer", file=sys.stderr)
         return False
     finally:
+        client.last_turn_usage = dict(usage_total)
+        client.last_turn_truncated = truncated
+        if usage_total:
+            parts = [
+                f"prompt={usage_total.get('prompt_tokens', 0)}",
+                f"completion={usage_total.get('completion_tokens', 0)}",
+                f"reasoning={usage_total.get('reasoning_tokens', 0)}",
+                f"cached={usage_total.get('cached_tokens', 0)}",
+                f"total={usage_total.get('total_tokens', 0)}",
+            ]
+            report("usage", "[usage] " + " ".join(parts))
+        if truncated:
+            report("warning", "输出被 max_tokens 截断，回答可能不完整")
         if session is not None:
             try:
                 session.log(messages)
@@ -1742,6 +2104,7 @@ UNDERLINE = "\x1b[4m"
 STRIKE = "\x1b[9m"
 CYAN = "\x1b[36m"
 MAGENTA = "\x1b[35m"
+YELLOW = "\x1b[33m"
 
 
 def supports_color() -> bool:
@@ -1954,11 +2317,12 @@ def _print_thinking(text: str) -> None:
 
 
 def print_help() -> None:
-    print("Commands: /help, /reset, /skill [name [question]], /image [path|clear],")
-    print("          /save [--tool] [--thinking] [file], /confirm on|off,")
-    print("          /thinking on|off, /model [name|number|list], /exit (Ctrl-D)")
-    print("Skills: <cwd>/.agents|.claude|.codex/skills, ~/.benben-agent/skills,")
-    print("        ~/.agents/skills, ~/.claude/skills, ~/.codex/skills")
+    print("Commands: /help, /reset, /compact [N], /skill [name [question]],")
+    print("          /image [path|clear], /save [--tool] [--thinking] [file],")
+    print("          /confirm on|off, /thinking on|off, /model [name|number|list],")
+    print("          /exit (Ctrl-D)")
+    print("Skills: off by default; enable with --skill (dirs: <cwd>/.agents|.claude|.codex/skills,")
+    print("        ~/.benben-agent/skills, ~/.agents/skills, ~/.claude/skills, ~/.codex/skills)")
     print(f"Sessions are saved to {SESSION_DIR}; list with --list, resume with -c <id>.")
     print("Ctrl+C needs two presses to exit; the first one cancels input or the running task.")
 
@@ -2053,6 +2417,9 @@ def render_history(
         else:
             text = raw
         content = text.rstrip()
+        if message.get("_compact"):
+            lines.extend(["", "## 上下文摘要", "", content or "(无摘要)"])
+            continue
         if role == "user":
             lines.extend(["", "## 用户", "", content or "(无文字)"])
             for name in message.get("_images") or []:
@@ -2125,6 +2492,14 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .msg.user { align-self: flex-end; background: #dcebff; }
 .msg.assistant { align-self: flex-start; background: #fff; border: 1px solid #e3e6ea; white-space: normal; }
 .tool { align-self: flex-start; color: #8a919c; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
+.warning { align-self: flex-start; color: #d92d20; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
+.compact { align-self: stretch; margin: -2px 0 12px; padding: 8px 12px; border: 1px dashed #c9ced6; border-radius: 8px; background: #fafbfc; color: #667085; font-size: 12px; white-space: normal; }
+.compact summary { cursor: pointer; }
+.compact-body { margin-top: 8px; color: #344054; font-size: 13px; }
+.compact-body p { margin: 6px 0; }
+.compact-body h1, .compact-body h2, .compact-body h3 { margin: 8px 0 4px; font-size: 14px; }
+.compact-body ul, .compact-body ol { margin: 6px 0; padding-left: 22px; }
+.compact-body code { background: #f4f5f7; padding: 1px 4px; border-radius: 4px; }
 #status { min-height: 20px; padding: 0 18px; color: #8a919c; }
 #composer { border-top: 1px solid #e3e6ea; background: #fff; padding: 12px 18px; }
 #input { width: 100%; height: 72px; resize: vertical; padding: 8px; border: 1px solid #c9ced6; border-radius: 6px; font: inherit; }
@@ -2133,6 +2508,8 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #files-label { color: #8a919c; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #send { padding: 6px 18px; border: 0; border-radius: 6px; background: #4a6cf7; color: #fff; cursor: pointer; }
 #send:disabled { background: #a9b8f8; cursor: default; }
+#compact { padding: 6px 12px; border: 1px solid #c9ced6; border-radius: 6px; background: #f9fafb; color: #475467; cursor: pointer; }
+#compact:disabled { color: #b0b6c0; cursor: default; }
 .msg.assistant > :first-child { margin-top: 0; }
 .msg.assistant > :last-child { margin-bottom: 0; }
 .msg.assistant p { margin: 6px 0; }
@@ -2181,6 +2558,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
       <div class="row">
         <label class="file">选择图片<input id="files" type="file" accept="image/*" multiple hidden></label>
         <span id="files-label"></span>
+        <button id="compact" title="把较早的对话总结成摘要，减少上下文">压缩</button>
         <button id="send">发送</button>
       </div>
     </div>
@@ -2200,6 +2578,7 @@ const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 const inputEl = document.getElementById("input");
 const sendEl = document.getElementById("send");
+const compactEl = document.getElementById("compact");
 const filesEl = document.getElementById("files");
 const filesLabel = document.getElementById("files-label");
 const sessionsEl = document.getElementById("sessions");
@@ -2427,7 +2806,18 @@ function addUserMessage(text, images) {
 function renderHistory(messages) {
   logEl.textContent = "";
   for (const message of messages) {
-    if (message.role === "assistant") {
+    if (message.role === "notice") {
+      const details = document.createElement("details");
+      details.className = "compact";
+      const summary = document.createElement("summary");
+      summary.textContent = message.text || "上下文已压缩";
+      const body = document.createElement("div");
+      body.className = "compact-body";
+      body.innerHTML = renderMarkdown(message.summary || "");
+      details.appendChild(summary);
+      details.appendChild(body);
+      logEl.appendChild(details);
+    } else if (message.role === "assistant") {
       addMarkdown(message.text);
     } else {
       const images = (message.images || []).map((url, index) => ({
@@ -2571,6 +2961,30 @@ async function newSession() {
   }
 }
 
+async function compactContext(keep) {
+  if (reading > 0 || sendEl.disabled) return;
+  if (!token) { statusEl.textContent = "缺少 token"; return; }
+  if (!confirm("把较早的对话压缩成摘要？原记录仍保留在会话文件里，但不再发送给模型。")) return;
+  const value = Number.isInteger(keep) && keep >= 0 ? keep : 2;
+  compactEl.disabled = true;
+  sendEl.disabled = true;
+  statusEl.textContent = "正在压缩上下文…";
+  try {
+    const data = await api("/api/compact", { keep: value });
+    currentSession = data.session;
+    renderHistory(data.messages);
+    statusEl.textContent = "已压缩：" + data.before_total + " 条 → " + data.after_messages
+      + " 条，约 " + data.before_tokens + " → " + data.after_tokens + " tokens";
+    loadSessions();
+  } catch (err) {
+    statusEl.textContent = String(err);
+  } finally {
+    compactEl.disabled = false;
+    sendEl.disabled = false;
+    inputEl.focus();
+  }
+}
+
 filesEl.onchange = () => {
   uploads = [];
   const files = Array.from(filesEl.files).slice(0, 4);
@@ -2598,6 +3012,12 @@ async function send() {
   const text = inputEl.value.trim();
   if ((!text && uploads.length === 0) || reading > 0 || sendEl.disabled) return;
   if (!token) { statusEl.textContent = "缺少 token"; return; }
+  const compactMatch = text.match(/^\/compact(?:\s+(\d+))?$/);
+  if (compactMatch) {
+    inputEl.value = "";
+    compactContext(compactMatch[1] ? parseInt(compactMatch[1], 10) : 2);
+    return;
+  }
   const images = uploads.slice();
   const previousSession = currentSession;
   addUserMessage(text, images);
@@ -2609,15 +3029,51 @@ async function send() {
   sendEl.disabled = true;
   statusEl.textContent = "处理中…";
   try {
-    const data = await api("/api/chat", { message: text, images: images });
-    for (const ev of data.events) {
-      if (ev.type === "content") addMarkdown(ev.text);
-      else if (ev.type === "tool") addLine("tool", ev.text);
-      else if (ev.type === "thinking") addLine("tool", "思考: " + ev.text);
+    const response = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "X-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, images: images }),
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || response.statusText);
     }
-    currentSession = data.session;
-    statusEl.textContent = data.ok ? "" : "达到最大步数，任务未完成";
-    if (data.session !== previousSession) loadSessions();
+    if (!response.body) throw new Error("浏览器不支持流式响应");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let doneEvent = null;
+    let failed = false;
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const line = block.split("\n").find((item) => item.startsWith("data: "));
+        if (!line) continue;
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "content") addMarkdown(event.text);
+        else if (event.type === "tool") addLine("tool", event.text);
+        else if (event.type === "thinking") addLine("tool", "思考: " + event.text);
+        else if (event.type === "usage") addLine("tool", event.text);
+        else if (event.type === "warning") addLine("warning", "⚠ " + event.text);
+        else if (event.type === "error") {
+          addLine("warning", "⚠ " + event.text);
+          failed = true;
+          statusEl.textContent = "请求失败";
+        } else if (event.type === "done") doneEvent = event;
+      }
+    }
+    if (doneEvent) {
+      currentSession = doneEvent.session;
+      if (!failed) statusEl.textContent = doneEvent.ok ? "" : "达到最大步数，任务未完成";
+      if (doneEvent.session !== previousSession) loadSessions();
+    } else if (!failed) {
+      statusEl.textContent = "连接中断，未收到完成事件";
+    }
   } catch (err) {
     statusEl.textContent = String(err);
   } finally {
@@ -2627,6 +3083,7 @@ async function send() {
 }
 
 document.getElementById("new").onclick = newSession;
+compactEl.onclick = () => compactContext(2);
 sendEl.onclick = send;
 inputEl.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
@@ -2696,6 +3153,29 @@ def run_web(
         def _error(self, code: int, message: str) -> None:
             self._json(code, {"error": message})
 
+        def _sse_start(self) -> bool:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.end_headers()
+                self.close_connection = True
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+
+        def _sse(self, payload: dict[str, Any]) -> None:
+            data = "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            try:
+                self.wfile.write(data.encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         def _authorized(self, value: str | None) -> bool:
             if not value:
                 return False
@@ -2706,6 +3186,95 @@ def run_web(
                 self._error(403, "invalid or missing token")
                 return False
             return True
+
+        def _handle_chat(self, payload: dict[str, Any], stream: bool) -> None:
+            message = payload.get("message")
+            images = payload.get("images") or []
+            if not isinstance(message, str):
+                self._error(400, "message must be a string")
+                return
+            if not isinstance(images, list) or len(images) > MAX_IMAGES:
+                self._error(400, f"images must be a list of at most {MAX_IMAGES}")
+                return
+            loaded = []
+            try:
+                for item in images:
+                    if not isinstance(item, dict):
+                        raise ImageError("invalid image item")
+                    loaded.append(check_data_url(item.get("data_url"), str(item.get("name") or "upload")))
+            except ImageError as exc:
+                self._error(400, str(exc))
+                return
+
+            events: list[dict[str, str]] = []
+            with lock:
+                if not message.strip() and not loaded:
+                    self._error(400, "empty message")
+                    return
+                try:
+                    user_message = build_user_message(message, loaded)
+                except ImageError as exc:
+                    self._error(400, str(exc))
+                    return
+                if state["session"] is None:
+                    try:
+                        state["session"] = create_session(client.model, workspace.root)
+                    except SessionError as exc:
+                        self._error(500, str(exc))
+                        return
+                state["messages"].append(user_message)
+                if stream and not self._sse_start():
+                    return
+
+                def emit(kind: str, text: str) -> None:
+                    if stream:
+                        self._sse({"type": kind, "text": text})
+                    else:
+                        events.append({"type": kind, "text": text})
+
+                try:
+                    ok = run_turn(
+                        client,
+                        workspace,
+                        state["messages"],
+                        max_steps,
+                        render=False,
+                        show_thinking=show_thinking,
+                        session=state["session"],
+                        emit=emit,
+                        tools=tools,
+                    )
+                except ChatError as exc:
+                    detail = f"model request failed: {exc}"
+                    if stream:
+                        self._sse({"type": "error", "text": detail})
+                        self._sse({
+                            "type": "done",
+                            "session": state["session"].uuid,
+                            "ok": False,
+                            "usage": client.last_turn_usage,
+                            "truncated": client.last_turn_truncated,
+                        })
+                    else:
+                        self._error(502, detail)
+                    return
+
+                result = {
+                    "session": state["session"].uuid,
+                    "ok": ok,
+                    "usage": client.last_turn_usage,
+                    "truncated": client.last_turn_truncated,
+                }
+                if stream:
+                    self._sse({"type": "done", **result})
+                else:
+                    self._json(200, {
+                        **result,
+                        "reply": "\n".join(
+                            event["text"] for event in events if event["type"] == "content"
+                        ),
+                        "events": events,
+                    })
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -2818,62 +3387,35 @@ def run_web(
                 self._json(200, {"model": current})
                 return
 
-            if parsed.path == "/api/chat":
-                message = payload.get("message")
-                images = payload.get("images") or []
-                if not isinstance(message, str):
-                    self._error(400, "message must be a string")
+            if parsed.path == "/api/compact":
+                keep = payload.get("keep", COMPACT_DEFAULT_KEEP)
+                if isinstance(keep, bool) or not isinstance(keep, int) or not 0 <= keep <= 100:
+                    self._error(400, "keep must be an integer between 0 and 100")
                     return
-                if not isinstance(images, list) or len(images) > MAX_IMAGES:
-                    self._error(400, f"images must be a list of at most {MAX_IMAGES}")
-                    return
-                loaded = []
-                try:
-                    for item in images:
-                        if not isinstance(item, dict):
-                            raise ImageError("invalid image item")
-                        loaded.append(check_data_url(item.get("data_url"), str(item.get("name") or "upload")))
-                except ImageError as exc:
-                    self._error(400, str(exc))
-                    return
-                events: list[dict[str, str]] = []
                 with lock:
-                    if not message.strip() and not loaded:
-                        self._error(400, "empty message")
+                    if state["session"] is None:
+                        self._error(400, "nothing to compact (start a conversation first)")
                         return
                     try:
-                        user_message = build_user_message(message, loaded)
-                    except ImageError as exc:
+                        stats = compact_history(client, state["messages"], state["session"], keep)
+                    except CompactError as exc:
                         self._error(400, str(exc))
                         return
-                    if state["session"] is None:
-                        try:
-                            state["session"] = create_session(client.model, workspace.root)
-                        except SessionError as exc:
-                            self._error(500, str(exc))
-                            return
-                    state["messages"].append(user_message)
-                    try:
-                        ok = run_turn(
-                            client,
-                            workspace,
-                            state["messages"],
-                            max_steps,
-                            render=False,
-                            show_thinking=show_thinking,
-                            session=state["session"],
-                            emit=lambda kind, text: events.append({"type": kind, "text": text}),
-                            tools=tools,
-                        )
                     except ChatError as exc:
-                        self._error(502, f"model request failed: {exc}")
+                        self._error(502, f"summarization failed: {exc}")
+                        return
+                    except SessionError as exc:
+                        self._error(500, str(exc))
                         return
                     self._json(200, {
                         "session": state["session"].uuid,
-                        "reply": "\n".join(event["text"] for event in events if event["type"] == "content"),
-                        "events": events,
-                        "ok": ok,
+                        "messages": history_view(state["messages"]),
+                        **stats,
                     })
+                return
+
+            if parsed.path in ("/api/chat", "/api/chat/stream"):
+                self._handle_chat(payload, parsed.path.endswith("/stream"))
                 return
 
             self._error(404, "not found")
@@ -2979,26 +3521,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-skill-scripts",
         action="store_true",
-        help="disable run_skill_script (skill scripts are enabled by default)",
+        help="disable run_skill_script when skills are enabled (--skill)",
     )
     skill_group = parser.add_mutually_exclusive_group()
     skill_group.add_argument(
         "--skill",
         dest="skills",
         action="store_true",
-        default=True,
-        help="enable Agent Skills and expose skill tools (default: on)",
+        default=False,
+        help="enable Agent Skills and expose skill tools (default: off)",
     )
     skill_group.add_argument(
         "--no-skill",
         dest="skills",
         action="store_false",
-        help="disable Agent Skills; do not scan skills or expose skill tools",
+        help="disable Agent Skills (default; do not scan skills or expose skill tools)",
     )
     parser.add_argument(
         "--only-own-skills",
         action="store_true",
-        help="only load ~/.benben-agent/skills; ignore Claude, Codex and cross-client directories",
+        help="with --skill, only load ~/.benben-agent/skills; ignore other directories",
     )
     args = parser.parse_args(argv)
 
@@ -3074,7 +3616,7 @@ def main(argv: list[str] | None = None) -> int:
         show_thinking = args.thinking
         pending_images: list[str] = []
         print(f"AI agent | model: {args.model} | workspace: {workspace.root}")
-        print(f"confirm: {'on' if workspace.confirm else 'off'} | thinking: {'on' if show_thinking else 'off'}")
+        print(f"confirm: {'on' if workspace.confirm else 'off'} | thinking: {'on' if show_thinking else 'off'} | skills: {'on' if args.skills else 'off'}")
         print_help()
         enable_utf8_input()
         guard = InterruptGuard()
@@ -3106,7 +3648,7 @@ def main(argv: list[str] | None = None) -> int:
                 _command, _, argument = user_input.partition(" ")
                 argument = argument.strip()
                 if not args.skills:
-                    print("skills are disabled (remove --no-skill to enable)")
+                    print("skills are disabled (use --skill to enable)")
                     continue
                 if not argument:
                     if not workspace.skills:
@@ -3156,6 +3698,59 @@ def main(argv: list[str] | None = None) -> int:
                 pending_images = []
                 session = None
                 print("history cleared; the next message starts a new session")
+                continue
+            if user_input == "/compact" or user_input.startswith("/compact "):
+                parts = user_input.split()
+                if len(parts) > 2:
+                    print("usage: /compact [N]   (N = user turns to keep, default 2)")
+                    continue
+                keep = COMPACT_DEFAULT_KEEP
+                if len(parts) == 2:
+                    try:
+                        keep = int(parts[1])
+                    except ValueError:
+                        print("usage: /compact [N]   (N = user turns to keep, default 2)")
+                        continue
+                    if keep < 0:
+                        print("usage: /compact [N]   (N must be >= 0)")
+                        continue
+                try:
+                    stats = compact_history(
+                        client,
+                        messages,
+                        session,
+                        keep,
+                        progress=lambda text: print(
+                            _style(f"  {text}", DIM, supports_color()), file=sys.stderr, flush=True
+                        ),
+                    )
+                except CompactError as exc:
+                    print(str(exc))
+                    continue
+                except ChatError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    continue
+                except SessionError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    continue
+                print(
+                    f"compacted: {stats['before_total']} -> {stats['after_messages']} messages "
+                    f"(summarized {stats['before_messages']}, kept {stats['kept_messages']}), "
+                    f"~{stats['before_tokens']} -> ~{stats['after_tokens']} tokens (estimated)"
+                )
+                if not stats["persisted"]:
+                    print("warning: no session file; compaction is memory-only", file=sys.stderr)
+                if stats["truncated"]:
+                    print("warning: the summary may have been truncated by max_tokens", file=sys.stderr)
+                if stats["usage"]:
+                    usage = stats["usage"]
+                    print(
+                        "[usage] "
+                        f"prompt={usage.get('prompt_tokens', 0)} "
+                        f"completion={usage.get('completion_tokens', 0)} "
+                        f"total={usage.get('total_tokens', 0)}",
+                        file=sys.stderr,
+                    )
                 continue
             if user_input == "/image" or user_input.startswith("/image "):
                 argument = user_input[len("/image"):].strip()

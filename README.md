@@ -27,10 +27,12 @@ you> 把 hello.txt 里的内容改成 Hello World
 you> /confirm on      # 需要时开启确认；只读命令不会询问
 you> /thinking on     # 显示模型的思考内容（默认关闭）
 you> /image shot.png  # 附带图片，随下一条消息发送
-you> /skill            # 列出已加载的 Agent Skills
+you> /skill            # 列出已加载的 Agent Skills（启动时加 --skill）
 you> /skill log-triage 排查 502  # 强制用指定技能回答问题
 you> /save            # 把当前会话保存为工作区里的 chat-<时间戳>.md（只存对话）
 you> /save --tool --thinking notes.md  # 连同工具调用/输出和思考一起保存
+you> /compact         # 压缩历史，保留最近 2 个用户回合
+you> /compact 4       # 压缩历史，保留最近 4 个用户回合
 you> /model list      # 按名称排序列出网关可用模型（带编号，* 为当前模型）
 you> /model 2         # 按编号切换
 you> /model deepseek-reasoner  # 或直接写模型名
@@ -40,6 +42,8 @@ you> /exit
 ```
 
 `/save` 默认只保存用户和助手的对话；`--tool` 加上工具调用和完整工具输出，`--thinking` 加上模型思考内容，两个选项可以同时用。导出内容不截断，文件名原样使用（默认 `chat-<时间戳>.md`），可以写到工作区外的路径；指定文件已存在时直接覆盖。
+
+`/compact` 会让模型把较早的对话总结成一段结构化摘要，之后只发送摘要和最近保留的轮次，减少上下文占用。`/compact 0` 表示不保留最近轮次，只留摘要。压缩后会话文件不会变小，原历史仍然保留在磁盘上，只是 `-c` 加载时从最后一次压缩标记开始重建上下文。
 
 常用写法：
 
@@ -74,9 +78,9 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `-i, --image` | 无 | 给任务附加图片，可重复，最多 4 张、单张 10 MB |
 | `--confirm` / `--no-confirm` | 关 | 是否在写文件和会修改状态的命令前询问；只读命令从不询问，`--yes` 是 `--no-confirm` 的别名 |
 | `--no-shell` | 关 | 禁用 `run_command` |
-| `--skill` / `--no-skill` | 开 | 是否扫描 Agent Skills 并向模型暴露技能工具；`--no-skill` 时完全不加载 |
-| `--only-own-skills` | 关 | 只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
-| `--no-skill-scripts` | 关 | 禁用 `run_skill_script`；技能说明和资源仍可用 |
+| `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
+| `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
+| `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
 | `--plain` | 关 | 不渲染 Markdown，直接输出原始文本 |
 | `--thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`（网关返回该字段时）；交互模式可用 `/thinking on\|off` 切换 |
 | `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
@@ -115,9 +119,18 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 
 交互模式里 `/reset` 会清空上下文并结束当前会话文件，下一条消息写入新文件，旧文件保留可随时 `-c` 恢复。删除会话目前只在网页入口提供（带确认弹框），CLI 没有删除命令。
 
+### 压缩上下文
+
+`/compact [N]` 把较早的对话交给模型总结，默认保留最近 2 个用户回合（`N=0` 表示不保留）。压缩会在 JSONL 末尾追加一条 `_type: "compact"` 记录，后面再写一遍保留的轮次；原历史一行不删。`-c` 和网页加载时只从**最后一条**压缩记录开始重建上下文，所以文件仍然完整，但不会把旧历史发给模型。
+
+- 摘要固定包含目标、已完成、关键决策、文件路径、执行过的命令、未完成事项和注意事项；
+- 待压缩内容过长时会分块滚动总结；
+- 图片只以 `[图片]` 占位进入摘要，base64 不会发进摘要请求；
+- 网页输入框下方的「压缩」按钮等价于 `/compact`，压缩后刷新页面仍会显示摘要提示。
+
 ## 技能（Agent Skills）
 
-兼容 [Agent Skills](https://agentskills.io/specification) 开放格式。技能按需加载，不会在启动时把全部说明和脚本塞进上下文：
+兼容 [Agent Skills](https://agentskills.io/specification) 开放格式。技能默认关闭，加 `--skill` 才扫描并向模型暴露技能工具；启用后按需加载，不会在启动时把全部说明和脚本塞进上下文：
 
 ```text
 <workspace>/.agents/skills/      # 项目级，跨客户端
@@ -167,9 +180,9 @@ description: 按时间线归纳日志。处理日志排查、异常定位时使�
 | `read_skill_resource` | 读取技能目录内的参考文件 | 否 |
 | `run_skill_script` | 执行 `scripts/` 下的脚本 | 是 |
 
-脚本按 shebang、扩展名（py/sh/js/rb/pl/php/ps1）或可执行文件运行；cwd 是当前工作区，并注入 `BENBEN_SKILL_DIR` 和 `BENBEN_WORKSPACE`。脚本默认启用，`--no-skill-scripts` 关闭；`--confirm` 下每次执行都要确认；web 模式没有审批，启动会打印警告。
+脚本按 shebang、扩展名（py/sh/js/rb/pl/php/ps1）或可执行文件运行；cwd 是当前工作区，并注入 `BENBEN_SKILL_DIR` 和 `BENBEN_WORKSPACE`。启用技能时脚本默认可用，`--no-skill-scripts` 关闭；`--confirm` 下每次执行都要确认；web 模式没有审批，启动会打印警告。
 
-关闭技能用 `--no-skill`：不扫描技能目录，也不向模型暴露任何技能工具。交互模式里 `/skill` 列出已加载技能，`/skill <name> <问题>` 会强制加载指定技能并用它回答。
+技能默认关闭，用 `--skill` 开启；`--no-skill` 可显式关闭。关闭时不扫描技能目录，也不向模型暴露任何技能工具。交互模式里 `/skill` 列出已加载技能，`/skill <name> <问题>` 会强制加载指定技能并用它回答。
 
 ## 网页入口
 
@@ -181,12 +194,13 @@ python3 benben-agent.py --web
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
 - 页面支持对话、新建/切换/删除历史会话（删除有确认弹框，也可以右键会话删除）、上传图片，左侧下拉框可以切换模型（等价于 CLI 的 `/model`，切换后立即生效）；
+- 输入框下方有「压缩」按钮，等价于 `/compact`；在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
 - 网页模式强制免确认，`run_command` 是否可用仍由 `--no-shell` 决定；shell 开启时启动会打印提醒；
 - 监听非回环地址会打印警告；
 - `--web` 与位置参数 prompt 同时出现时忽略 prompt 并提示。
 
-页面全部内嵌在 `benben-agent.py` 里，无 CDN、无前端构建，离线可用。assistant 回复会渲染常用 Markdown（标题、粗体、行内代码、代码块、列表、引用、链接、分隔线和表格），`![](...)` 图片也会直接显示；用户上传的图片在发送后显示缩略图，重新打开历史会话时也会从 JSONL 里读回并显示。整个页面仍然是非流式输出。
+页面全部内嵌在 `benben-agent.py` 里，无 CDN、无前端构建，离线可用。assistant 回复会渲染常用 Markdown（标题、粗体、行内代码、代码块、列表、引用、链接、分隔线和表格），`![](...)` 图片也会直接显示；用户上传的图片在发送后显示缩略图，重新打开历史会话时也会从 JSONL 里读回并显示。网页通过 `/api/chat/stream` 做步骤级流式：工具调用和每个步骤的中间回答会逐步出现，但单次模型请求仍是非流式的，思考和正文会一起到达。旧的 `/api/chat` JSON 接口保留。
 
 ## 内置工具
 
@@ -239,13 +253,13 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 
 ## 限制
 
-- 只使用非流式请求，最终回答一次性输出；开启 `--thinking` 时，思考内容也要等整段响应返回后才显示，不是实时。
-- 历史消息不做自动裁剪，长对话可能超出模型上下文。
+- 只使用非流式模型请求，单次调用里的思考和正文会一起到达；网页的步骤级 SSE 只解决工具调用和中间回答的逐步显示。
+- 历史消息不会自动裁剪；长对话需要手动 `/compact`，否则可能超出模型上下文。
 - 模型必须支持 OpenAI 风格的 `tools` / `tool_calls`；不支持 function calling 的模型只能当聊天机器人用。
 - 图片不会缩放或转码，单张上限 10 MB，不支持 HEIC；图片会占用较多上下文 token。
-- 会话文件只增不减，不会自动清理或压缩；文件包含完整对话内容，注意 `~/.benben-agent/` 的访问权限。
+- 会话文件默认只增不减，`/compact` 也只在末尾追加压缩记录，不删除原历史；文件包含完整对话内容，注意 `~/.benben-agent/` 的访问权限。
 - 交互模式下网络/API 错误只打印原因并保留历史，不会退出；可以直接重试，或 `/exit` 后用 `-c` 恢复。
-- 网页模式同样是非流式的，长回答要等整段返回；只适合本机单用户使用，不做多用户隔离。
+- 网页使用步骤级 SSE，长回答仍要等单次模型请求返回；只适合本机单用户使用，不做多用户隔离。
 - 网页里 assistant 输出的远程 `https` 图片会直接加载，会向图片服务器暴露本机 IP；上传的图片以 base64 写入会话文件，带图会话会明显变大。
 
 ## 许可
