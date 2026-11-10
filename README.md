@@ -72,6 +72,10 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `--api-key` | `$OPENAI_API_KEY` | DeepSeek key，也可用环境变量或此参数提供 |
 | `-m, --model` | `$OPENAI_MODEL` 或 `Deepseek-V4.1-Flash` | 模型名 |
 | `--temperature` | 不发送 | 采样温度；部分推理模型不接受该字段，因此默认省略 |
+| `--max-tokens` | 不发送；Anthropic/Responses 默认 8192 | 最大输出 token |
+| `--api-format` | `openai-chat-completions` | `openai-chat-completions`（`/chat/completions`）、`openai-responses`（`/responses`）、`anthropic-messages`（`/v1/messages`）；默认值可在代码顶部 `DEFAULT_API_FORMAT` 修改 |
+| `--anthropic-version` | `2023-06-01` | Anthropic API 版本头 |
+| `--anthropic-auth` | `x-api-key` | Anthropic 认证方式：`x-api-key` 或 `bearer` |
 | `--max-steps` | `100` | 每轮最多调用模型多少次 |
 | `--timeout` | `120` | HTTP 超时（秒） |
 | `--cwd` | 当前目录 | 工具的根目录，文件访问被限制在该目录内 |
@@ -83,11 +87,81 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
 | `--plain` | 关 | 不渲染 Markdown，直接输出原始文本 |
 | `--thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`（网关返回该字段时）；交互模式可用 `/thinking on\|off` 切换 |
+| `--reasoning` | 不发送 | 思考控制，格式 `provider:level`；provider 支持 `deepseek`/`kimi`/`minimax`，level 支持 `off/minimal/low/medium/high/max`；详见下文 |
 | `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
 | `--list` | 关 | 列出已保存的会话并退出，不联网、不需要 API key |
 | `--web` | 关 | 启动浏览器界面；网页模式强制免确认 |
 | `--host` | `127.0.0.1` | 网页监听地址 |
 | `--port` | `8765` | 网页端口，`0` 表示由系统分配 |
+
+## 思考参数
+
+`--thinking` 只控制是否显示 `reasoning_content`，不改变模型是否思考；`--reasoning` 才真正控制发给模型的思考参数。
+
+```bash
+python3 benben-agent.py --reasoning deepseek:off "..."
+python3 benben-agent.py --reasoning kimi:low "..."
+python3 benben-agent.py --reasoning minimax:low "..."
+```
+
+| provider | `off` | 级别 | 实际发送 |
+| --- | --- | --- | --- |
+| `deepseek` | `thinking: {"type":"disabled"}` | `minimal`→low，`low/medium/high`，`max`→high | `thinking` / `reasoning_effort` |
+| `kimi` | `thinking: {"type":"disabled"}` | 同 DeepSeek | `thinking` / `reasoning_effort` |
+| `minimax` | **不支持，启动报错** | `minimal`→low，`low/medium/high/max` | `reasoning_effort` |
+
+- 不设置 `--reasoning` 时不发送任何思考字段，使用模型默认值；MiniMax-M3.1-Flash 默认是 `max`。
+- DeepSeek/Kimi 的 `off` 实测能把 reasoning token 归零；MiniMax-M3.1-Flash 强制 adaptive thinking，不能关闭。
+- `none` 可以作为 `off` 的别名，但 `minimax:none` 同样会报错。
+- 交互模式用 `/reasoning provider:level` 设置，`/reasoning clear` 清除，`/reasoning` 查看当前值。
+- 如果网关忽略了 `off`，运行时会打印一次警告。
+- `qwen`、`glm`、`claude`、`openai/codex`、`gemini`、`grok` 暂不支持；指定这些 provider 会直接报错，避免误以为生效。
+- 切换模型时如果 provider 与模型名明显不匹配，会给出警告，但不会自动清除配置。
+- `/compact` 的摘要调用复用同一份配置，`off` 时摘要也更省 token。
+
+## Anthropic 协议
+
+默认使用 OpenAI Chat Completions（`/chat/completions`）。加 `--api-format anthropic-messages` 后改用 Anthropic Messages API（`/v1/messages`），消息、工具和图片会在客户端内部转换；会话、技能、压缩、网页等功能保持不变。
+
+```bash
+python3 benben-agent.py \
+  --api-format anthropic-messages \
+  --base-url https://api.anthropic.com \
+  --api-key sk-ant-... \
+  -m claude-sonnet-4-5 \
+  "解释这个报错"
+```
+
+- 默认认证是 `x-api-key` + `anthropic-version: 2023-06-01`；只认 Bearer 的兼容网关用 `--anthropic-auth bearer`；
+- Anthropic 必须传 `max_tokens`，默认 8192，可用 `--max-tokens` 调整；
+- 支持文本、工具调用、PNG/JPEG/GIF/WEBP 图片；BMP 会直接报错；
+- 非流式；暂不支持 Claude extended thinking、prompt caching、PDF；
+- `--reasoning` 只用于 OpenAI 兼容的 deepseek/kimi/minimax，Anthropic 模式会报错；
+- 内网 A 系列本身走 OpenAI 兼容接口，不需要加 `--api-format anthropic-messages`。
+
+## Responses 协议
+
+`--api-format openai-responses` 使用 OpenAI Responses API（`/v1/responses`），支持文本、图片和工具调用；非流式、无状态（`store: false`）。
+
+```bash
+python3 benben-agent.py \
+  --api-format openai-responses \
+  --base-url https://api.openai.com/v1 \
+  --api-key sk-... \
+  -m gpt-5 \
+  --max-tokens 4096 \
+  "..."
+```
+
+- 系统提示放在顶层 `instructions`；
+- 工具使用 Responses 的扁平 function schema，工具结果用 `function_call_output` 回传；
+- 不使用 `previous_response_id`，每次发送完整历史，保证 `-c` 恢复一致；
+- `max_output_tokens` 默认 8192，可用 `--max-tokens` 调整；
+- 支持 PNG/JPEG/GIF/WEBP 图片，BMP 会报错；
+- `store` 固定为 `false`；
+- 暂不支持流式、内置工具（web_search/file_search/computer_use）和 `reasoning.effort` 映射；
+- `--reasoning` 与 `responses` 同时使用会启动报错；
+- 内网网关也支持 `/v1/responses`，可以直接用 `--api-format openai-responses`。
 
 ## 会话持久化
 
@@ -257,6 +331,9 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - 历史消息不会自动裁剪；长对话需要手动 `/compact`，否则可能超出模型上下文。
 - 模型必须支持 OpenAI 风格的 `tools` / `tool_calls`；不支持 function calling 的模型只能当聊天机器人用。
 - 图片不会缩放或转码，单张上限 10 MB，不支持 HEIC；图片会占用较多上下文 token。
+- MiniMax-M3.1-Flash 不能关闭思考，只能降低 `reasoning_effort`；Qwen、GLM、Claude、OpenAI/Codex、Gemini、Grok 未纳入思考映射。
+- Anthropic 协议目前是非流式的，不支持 Claude extended thinking、prompt caching 和 PDF 输入。
+- Responses 协议目前是非流式、无状态的，不支持内置工具（web_search/file_search/computer_use）和 `reasoning.effort` 映射。
 - 会话文件默认只增不减，`/compact` 也只在末尾追加压缩记录，不删除原历史；文件包含完整对话内容，注意 `~/.benben-agent/` 的访问权限。
 - 交互模式下网络/API 错误只打印原因并保留历史，不会退出；可以直接重试，或 `/exit` 后用 `-c` 恢复。
 - 网页使用步骤级 SSE，长回答仍要等单次模型请求返回；只适合本机单用户使用，不做多用户隔离。

@@ -16,6 +16,14 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --api-key KEY           API key，默认 $OPENAI_API_KEY（代码不内置 key）
     -m, --model NAME        模型名，默认 $OPENAI_MODEL 或 Deepseek-V4.1-Flash
     --temperature FLOAT     采样温度；默认不发送
+    --max-tokens N          最大输出 token；Anthropic/Responses 默认 8192，OpenAI 默认不发送
+    --api-format FORMAT     接口协议：
+                            openai-chat-completions（/chat/completions）、
+                            openai-responses（/responses）、
+                            anthropic-messages（/v1/messages）
+                            默认 DEFAULT_API_FORMAT（当前 openai-chat-completions）
+    --anthropic-version V   Anthropic API 版本头，默认 2023-06-01
+    --anthropic-auth MODE   Anthropic 认证：x-api-key 或 bearer，默认 x-api-key
     --max-steps N           每轮最多调用模型多少次，默认 100
     --timeout SECONDS       HTTP 超时，默认 120
     --cwd DIR               工具的工作区根目录，默认当前目录
@@ -25,6 +33,9 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --plain                 不渲染终端 Markdown，直接输出原文
     -i, --image PATH        给任务附加图片，可重复，最多 4 张、单张 10 MB
     --thinking              打印模型的 reasoning_content（默认关闭）
+    --reasoning PROVIDER:LEVEL
+                            思考控制：deepseek|kimi|minimax 加
+                            off|minimal|low|medium|high|max，例如 deepseek:low
     -c, --continue [UUID]   恢复会话；省略 UUID 取最新，没有会话则新建
     --list                  列出已保存会话并退出，不联网
     --web                   启动网页界面；强制免确认
@@ -48,6 +59,7 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
                                   导出 Markdown 会话
     /confirm on|off               切换写操作确认
     /thinking on|off              切换思考内容显示
+    /reasoning <provider>:<level> 设置模型思考参数；clear 清除
     /model [name|number|list]     查看/切换模型
     /exit, /quit                  退出（Ctrl-D 同效）
 
@@ -75,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import fnmatch
 import glob as glob_mod
 import json
@@ -92,7 +105,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import islice
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 try:
@@ -105,6 +118,12 @@ try:
 except ImportError:
     readline = None  # type: ignore[assignment]
 
+API_FORMATS = (
+    "openai-chat-completions",
+    "openai-responses",
+    "anthropic-messages",
+)
+DEFAULT_API_FORMAT = "openai-chat-completions"
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "Deepseek-V4.1-Flash"
 # DeepSeek 官方接口需要在 OPENAI_API_KEY 或 --api-key 中提供 key，不在代码里内置。
@@ -124,6 +143,7 @@ COMPACT_MESSAGE_CHARS = 4_000
 COMPACT_TOOL_CHARS = 800
 COMPACT_ARGS_CHARS = 400
 COMPACT_SUMMARY_CHARS = 1_200
+REASONING_LEVELS = ("off", "minimal", "low", "medium", "high", "max")
 WEB_PORT = 8765
 WEB_MAX_BODY = 60 * 1024 * 1024
 HOME_SKILLS_DIR = os.path.join(SESSION_DIR, "skills")
@@ -208,12 +228,142 @@ class CompactError(Exception):
     """Raised when there is not enough history to compact."""
 
 
+class ReasoningError(Exception):
+    """Raised when the requested thinking configuration cannot be applied."""
+
+
+class ReasoningConfig(NamedTuple):
+    provider: str
+    level: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.provider}:{self.level}"
+
+
+class ReasoningSpec(NamedTuple):
+    """Declarative thinking-control mapping for one provider.
+
+    Adding a provider is normally one entry in REASONING_SPECS. Providers
+    whose level payload is not ``{effort_field: effort}`` can pass a custom
+    ``level_builder`` without touching the request code.
+    """
+
+    name: str
+    off_payload: dict[str, Any] | None
+    off_error: str
+    efforts: dict[str, str]
+    model_hints: tuple[str, ...]
+    effort_field: str = "reasoning_effort"
+    level_builder: Callable[[str], dict[str, Any]] | None = None
+
+    def supports_off(self) -> bool:
+        return self.off_payload is not None
+
+    def payload(self, level: str) -> dict[str, Any]:
+        if level == "off":
+            if self.off_payload is None:
+                raise ReasoningError(self.off_error or f"{self.name} cannot disable thinking")
+            return copy.deepcopy(self.off_payload)
+        effort = self.efforts.get(level)
+        if effort is None:
+            raise ReasoningError(f"reasoning level {level} is not supported for {self.name}")
+        if self.level_builder is not None:
+            return self.level_builder(effort)
+        return {self.effort_field: effort}
+
+
+_THINKING_DISABLED = {"thinking": {"type": "disabled"}}
+_COMMON_EFFORTS = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "max": "high",
+}
+
+# Add future providers here. Keep off_payload=None when the provider cannot
+# turn thinking off; off_error is shown before any request is sent.
+REASONING_SPECS: dict[str, ReasoningSpec] = {
+    "deepseek": ReasoningSpec(
+        name="deepseek",
+        off_payload=_THINKING_DISABLED,
+        off_error="",
+        efforts=dict(_COMMON_EFFORTS),
+        model_hints=("deepseek",),
+    ),
+    "kimi": ReasoningSpec(
+        name="kimi",
+        off_payload=_THINKING_DISABLED,
+        off_error="",
+        efforts=dict(_COMMON_EFFORTS),
+        model_hints=("kimi", "moonshot"),
+    ),
+    "minimax": ReasoningSpec(
+        name="minimax",
+        off_payload=None,
+        off_error="MiniMax-M3.1-Flash cannot disable thinking; use minimax:low or higher",
+        efforts={**_COMMON_EFFORTS, "max": "max"},
+        model_hints=("minimax",),
+    ),
+}
+REASONING_PROVIDERS = tuple(REASONING_SPECS)
+
+
+def _parse_reasoning(value: str) -> ReasoningConfig:
+    """Parse PROVIDER:LEVEL and validate what the supported gateways accept."""
+    provider, separator, level = value.partition(":")
+    provider = provider.strip().lower()
+    level = level.strip().lower()
+    if not separator or not provider or not level:
+        raise ReasoningError("reasoning must be PROVIDER:LEVEL, e.g. deepseek:low")
+    if level == "none":
+        level = "off"
+    spec = REASONING_SPECS.get(provider)
+    if spec is None:
+        raise ReasoningError(
+            "unsupported reasoning provider: "
+            f"{provider} (supported: {', '.join(REASONING_PROVIDERS)})"
+        )
+    if level not in REASONING_LEVELS:
+        raise ReasoningError(
+            f"invalid reasoning level: {level} (use: {', '.join(REASONING_LEVELS)})"
+        )
+    if level == "off" and not spec.supports_off():
+        raise ReasoningError(spec.off_error or f"{provider} cannot disable thinking")
+    return ReasoningConfig(provider, level)
+
+
+def reasoning_payload(config: ReasoningConfig) -> dict[str, Any]:
+    """Map a canonical provider:level to OpenAI-compatible request fields."""
+    spec = REASONING_SPECS.get(config.provider)
+    if spec is None:
+        raise ReasoningError(f"unsupported reasoning provider: {config.provider}")
+    return spec.payload(config.level)
+
+
+def reasoning_model_warning(config: ReasoningConfig | None, model: str) -> str | None:
+    """Warn when an explicitly selected provider does not look like the model."""
+    if config is None:
+        return None
+    spec = REASONING_SPECS.get(config.provider)
+    if spec is None or not spec.model_hints:
+        return None
+    name = (model or "").lower()
+    if any(hint in name for hint in spec.model_hints):
+        return None
+    return (
+        f"当前模型 {model} 与 reasoning provider {config.provider} 不匹配，"
+        "参数可能被忽略或报错"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # API client
 # --------------------------------------------------------------------------- #
 
 
-class ChatClient:
+class BaseChatClient:
     def __init__(
         self,
         base_url: str,
@@ -222,6 +372,8 @@ class ChatClient:
         timeout: float = 120.0,
         max_retries: int = 3,
         temperature: float | None = None,
+        reasoning: ReasoningConfig | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -229,10 +381,23 @@ class ChatClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.temperature = temperature
+        self.reasoning = reasoning
+        self.max_tokens = max_tokens
+        self.supports_reasoning_config = True
         self.last_usage: dict[str, Any] = {}
         self.last_finish_reason: str | None = None
         self.last_turn_usage: dict[str, int] = {}
         self.last_turn_truncated = False
+        self.last_reasoning_ignored = False
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _v1_root(self) -> str:
+        return self.base_url if self.base_url.endswith("/v1") else f"{self.base_url}/v1"
 
     def _request(
         self,
@@ -240,13 +405,11 @@ class ChatClient:
         payload: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        headers = {"Accept": "application/json"}
+        headers = self._headers()
         data = None
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
             url, data=data, headers=headers, method="POST" if data is not None else "GET"
         )
@@ -275,6 +438,8 @@ class ChatClient:
             print(f"[retry] {error}; retrying in {delay:.1f}s", file=sys.stderr)
             time.sleep(delay)
 
+
+class ChatClient(BaseChatClient):
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -286,10 +451,15 @@ class ChatClient:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
+        if self.reasoning is not None:
+            payload.update(reasoning_payload(self.reasoning))
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
+        self.last_reasoning_ignored = False
         data = self._request(f"{self.base_url}/chat/completions", payload)
         try:
             choice = data["choices"][0]
@@ -302,10 +472,560 @@ class ChatClient:
         self.last_usage = usage if isinstance(usage, dict) else {}
         finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
         self.last_finish_reason = finish_reason if isinstance(finish_reason, str) else None
+        if self.reasoning is not None and self.reasoning.level == "off":
+            details = self.last_usage.get("completion_tokens_details")
+            reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else 0
+            reasoning_text = message.get("reasoning_content") or message.get("reasoning") or ""
+            if (isinstance(reasoning_tokens, int) and reasoning_tokens > 0) or (
+                isinstance(reasoning_text, str) and reasoning_text.strip()
+            ):
+                self.last_reasoning_ignored = True
         return message
 
     def list_models(self) -> list[str]:
         data = self._request(f"{self.base_url}/models", timeout=min(self.timeout, 30.0))
+        models = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
+        return sorted(
+            (item["id"] for item in models if isinstance(item, dict) and item.get("id")),
+            key=_natural_key,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Anthropic Messages protocol
+# --------------------------------------------------------------------------- #
+
+ANTHROPIC_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+ANTHROPIC_STOP_REASONS = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "tool_use": "tool_calls",
+    "max_tokens": "length",
+    "pause_turn": "stop",
+    "refusal": "stop",
+}
+
+
+def _plain_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text") or ""
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _anthropic_image_block(url: str) -> dict[str, Any]:
+    if url.startswith(("http://", "https://")):
+        return {"type": "image", "source": {"type": "url", "url": url}}
+    prefix, separator, payload = url.partition(",")
+    if not separator or not prefix.startswith("data:image/") or not prefix.endswith(";base64"):
+        raise ImageError("unsupported image URL for the Anthropic protocol")
+    media_type = prefix[len("data:"):-len(";base64")]
+    if media_type not in ANTHROPIC_IMAGE_TYPES:
+        raise ImageError(f"Anthropic does not support {media_type}; use PNG, JPEG, GIF or WEBP")
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": payload},
+    }
+
+
+def _anthropic_user_blocks(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if not isinstance(content, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            text = part.get("text") or ""
+            if text:
+                blocks.append({"type": "text", "text": text})
+        elif part.get("type") == "image_url":
+            url = (part.get("image_url") or {}).get("url")
+            if isinstance(url, str) and url:
+                blocks.append(_anthropic_image_block(url))
+    return blocks
+
+
+def _anthropic_assistant_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    thinking_blocks = message.get("_thinking_blocks")
+    if isinstance(thinking_blocks, list):
+        for block in thinking_blocks:
+            if isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"):
+                blocks.append(block)
+    content = message.get("content")
+    if isinstance(content, str):
+        if content:
+            blocks.append({"type": "text", "text": content})
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text") or ""
+                if text:
+                    blocks.append({"type": "text", "text": text})
+    for index, call in enumerate(message.get("tool_calls") or []):
+        function = call.get("function") or {}
+        raw = function.get("arguments") or "{}"
+        try:
+            arguments = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        blocks.append({
+            "type": "tool_use",
+            "id": call.get("id") or f"call_{index}",
+            "name": function.get("name") or "unknown",
+            "input": arguments,
+        })
+    return blocks
+
+
+def _anthropic_tool_result(message: dict[str, Any]) -> dict[str, Any]:
+    content = message.get("content")
+    if isinstance(content, list):
+        text = _plain_text(content)
+    elif isinstance(content, str):
+        text = content
+    else:
+        text = json.dumps(content, ensure_ascii=False)
+    result: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": message.get("tool_call_id") or "",
+        "content": text,
+    }
+    if text.startswith("error:"):
+        result["is_error"] = True
+    return result
+
+
+def _append_anthropic_message(converted: list[dict[str, Any]], role: str, blocks: list[dict[str, Any]]) -> None:
+    if not blocks:
+        return
+    if converted and converted[-1]["role"] == role:
+        converted[-1]["content"].extend(blocks)
+    else:
+        converted.append({"role": role, "content": blocks})
+
+
+def _to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    system_parts: list[str] = []
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            text = _plain_text(message.get("content"))
+            if text:
+                system_parts.append(text)
+            continue
+        if role == "user":
+            _append_anthropic_message(converted, "user", _anthropic_user_blocks(message.get("content")))
+            continue
+        if role == "assistant":
+            _append_anthropic_message(converted, "assistant", _anthropic_assistant_blocks(message))
+            continue
+        if role == "tool":
+            _append_anthropic_message(converted, "user", [_anthropic_tool_result(message)])
+    return "\n\n".join(system_parts), converted
+
+
+def _anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function") or {}
+        converted.append({
+            "name": function.get("name") or "unknown",
+            "description": function.get("description") or "",
+            "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return converted
+
+
+def _anthropic_response(data: dict[str, Any]) -> tuple[dict[str, Any], str | None, dict[str, Any]]:
+    content = data.get("content")
+    if not isinstance(content, list):
+        raise ChatError(f"Unexpected Anthropic response: {json.dumps(data)[:1000]}")
+    texts: list[str] = []
+    thinking_texts: list[str] = []
+    thinking_blocks: list[dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            texts.append(block.get("text") or "")
+        elif block_type == "thinking":
+            thinking = block.get("thinking") or ""
+            if thinking:
+                thinking_texts.append(thinking)
+            thinking_blocks.append(block)
+        elif block_type == "redacted_thinking":
+            thinking_blocks.append(block)
+        elif block_type == "tool_use":
+            tool_calls.append({
+                "id": block.get("id") or f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": block.get("name") or "unknown",
+                    "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                },
+            })
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(texts)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    if thinking_texts:
+        message["reasoning_content"] = "\n".join(thinking_texts)
+    if thinking_blocks:
+        message["_thinking_blocks"] = thinking_blocks
+    stop_reason = data.get("stop_reason")
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    return message, stop_reason if isinstance(stop_reason, str) else None, usage
+
+
+class AnthropicClient(BaseChatClient):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float = 120.0,
+        max_retries: int = 3,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        anthropic_version: str = "2023-06-01",
+        anthropic_auth: str = "x-api-key",
+    ) -> None:
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            timeout,
+            max_retries,
+            temperature,
+            reasoning=None,
+            max_tokens=max_tokens if max_tokens else 8192,
+        )
+        self.anthropic_version = anthropic_version
+        self.anthropic_auth = anthropic_auth
+        self.supports_reasoning_config = False
+
+    def _root(self) -> str:
+        return self._v1_root()
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "anthropic-version": self.anthropic_version,
+        }
+        if self.api_key:
+            if self.anthropic_auth == "bearer":
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            else:
+                headers["x-api-key"] = self.api_key
+        return headers
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        try:
+            system, converted = _to_anthropic_messages(messages)
+        except ImageError as exc:
+            raise ChatError(str(exc)) from exc
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens or 8192,
+            "messages": converted,
+        }
+        if system:
+            payload["system"] = system
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if tools:
+            payload["tools"] = _anthropic_tools(tools)
+            payload["tool_choice"] = {"type": "auto"}
+
+        self.last_reasoning_ignored = False
+        data = self._request(f"{self._root()}/messages", payload)
+        message, stop_reason, usage = _anthropic_response(data)
+        input_tokens = int(usage.get("input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+        completion_tokens = int(usage.get("output_tokens") or 0)
+        prompt_tokens = input_tokens + cache_read + cache_creation
+        self.last_usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        if cache_read > 0:
+            self.last_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
+        output_details = usage.get("output_tokens_details")
+        thinking_tokens = (
+            output_details.get("thinking_tokens") if isinstance(output_details, dict) else None
+        )
+        if isinstance(thinking_tokens, int) and thinking_tokens > 0:
+            self.last_usage["completion_tokens_details"] = {"reasoning_tokens": thinking_tokens}
+        self.last_finish_reason = ANTHROPIC_STOP_REASONS.get(stop_reason or "", "stop")
+        return message
+
+    def list_models(self) -> list[str]:
+        data = self._request(f"{self._root()}/models", timeout=min(self.timeout, 30.0))
+        models = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
+        return sorted(
+            (item["id"] for item in models if isinstance(item, dict) and item.get("id")),
+            key=_natural_key,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# OpenAI Responses protocol
+# --------------------------------------------------------------------------- #
+
+RESPONSES_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def _responses_image_url(url: str) -> str:
+    if url.startswith(("http://", "https://")):
+        return url
+    prefix, separator, _payload = url.partition(",")
+    if not separator or not prefix.startswith("data:image/") or not prefix.endswith(";base64"):
+        raise ImageError("unsupported image URL for the Responses protocol")
+    media_type = prefix[len("data:"):-len(";base64")]
+    if media_type not in RESPONSES_IMAGE_TYPES:
+        raise ImageError(f"Responses API does not support {media_type}; use PNG, JPEG, GIF or WEBP")
+    return url
+
+
+def _responses_user_item(content: Any) -> dict[str, Any] | None:
+    if isinstance(content, str):
+        return {"role": "user", "content": content} if content else None
+    if not isinstance(content, list):
+        return None
+    texts: list[str] = []
+    parts: list[dict[str, Any]] = []
+    has_image = False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            text = part.get("text") or ""
+            if text:
+                texts.append(text)
+                parts.append({"type": "input_text", "text": text})
+        elif part.get("type") == "image_url":
+            url = (part.get("image_url") or {}).get("url")
+            if isinstance(url, str) and url:
+                has_image = True
+                parts.append({"type": "input_image", "image_url": _responses_image_url(url)})
+    if not has_image:
+        joined = "\n".join(texts)
+        return {"role": "user", "content": joined} if joined else None
+    if not parts:
+        return None
+    return {"role": "user", "content": parts}
+
+
+def _responses_assistant_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    content = _plain_text(message.get("content"))
+    if content:
+        items.append({"role": "assistant", "content": content})
+    for index, call in enumerate(message.get("tool_calls") or []):
+        function = call.get("function") or {}
+        arguments = function.get("arguments") or "{}"
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        items.append({
+            "type": "function_call",
+            "call_id": call.get("id") or f"call_{index}",
+            "name": function.get("name") or "unknown",
+            "arguments": arguments,
+        })
+    return items
+
+
+def _responses_tool_item(message: dict[str, Any]) -> dict[str, Any]:
+    content = message.get("content")
+    if isinstance(content, list):
+        output = _plain_text(content)
+    elif isinstance(content, str):
+        output = content
+    else:
+        output = json.dumps(content, ensure_ascii=False)
+    return {
+        "type": "function_call_output",
+        "call_id": message.get("tool_call_id") or "",
+        "output": output,
+    }
+
+
+def _to_responses_input(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    instructions: list[str] = []
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            text = _plain_text(message.get("content"))
+            if text:
+                instructions.append(text)
+            continue
+        if role == "user":
+            item = _responses_user_item(message.get("content"))
+            if item is not None:
+                items.append(item)
+            continue
+        if role == "assistant":
+            items.extend(_responses_assistant_items(message))
+            continue
+        if role == "tool":
+            items.append(_responses_tool_item(message))
+    return "\n\n".join(instructions), items
+
+
+def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function") or {}
+        converted.append({
+            "type": "function",
+            "name": function.get("name") or "unknown",
+            "description": function.get("description") or "",
+            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return converted
+
+
+def _responses_response(data: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    output = data.get("output")
+    if not isinstance(output, list):
+        raise ChatError(f"Unexpected Responses response: {json.dumps(data)[:1000]}")
+    texts: list[str] = []
+    thinking_texts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            for block in item.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "output_text":
+                    texts.append(block.get("text") or "")
+                elif block.get("type") == "refusal":
+                    texts.append(block.get("refusal") or "")
+        elif item_type == "function_call":
+            arguments = item.get("arguments") or "{}"
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            tool_calls.append({
+                "id": item.get("call_id") or f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": item.get("name") or "unknown",
+                    "arguments": arguments,
+                },
+            })
+        elif item_type == "reasoning":
+            for block in item.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "reasoning_text":
+                    thinking_texts.append(block.get("text") or "")
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(texts)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    if thinking_texts:
+        message["reasoning_content"] = "\n".join(thinking_texts)
+    incomplete = data.get("incomplete_details")
+    reason = incomplete.get("reason") if isinstance(incomplete, dict) else None
+    if reason == "max_output_tokens":
+        finish_reason = "length"
+    elif tool_calls:
+        finish_reason = "tool_calls"
+    else:
+        finish_reason = "stop"
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    total_tokens = usage.get("total_tokens")
+    if not isinstance(total_tokens, int):
+        total_tokens = input_tokens + output_tokens
+    converted_usage: dict[str, Any] = {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+    input_details = usage.get("input_tokens_details")
+    cached = input_details.get("cached_tokens") if isinstance(input_details, dict) else None
+    if isinstance(cached, int) and cached > 0:
+        converted_usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    output_details = usage.get("output_tokens_details")
+    reasoning = output_details.get("reasoning_tokens") if isinstance(output_details, dict) else None
+    if isinstance(reasoning, int) and reasoning > 0:
+        converted_usage["completion_tokens_details"] = {"reasoning_tokens": reasoning}
+    return message, finish_reason, converted_usage
+
+
+class ResponsesClient(BaseChatClient):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float = 120.0,
+        max_retries: int = 3,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> None:
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            timeout,
+            max_retries,
+            temperature,
+            reasoning=None,
+            max_tokens=max_tokens if max_tokens else 8192,
+        )
+        self.supports_reasoning_config = False
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        try:
+            instructions, input_items = _to_responses_input(messages)
+        except ImageError as exc:
+            raise ChatError(str(exc)) from exc
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": input_items,
+            "max_output_tokens": self.max_tokens or 8192,
+            "store": False,
+        }
+        if instructions:
+            payload["instructions"] = instructions
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if tools:
+            payload["tools"] = _responses_tools(tools)
+            payload["tool_choice"] = "auto"
+
+        self.last_reasoning_ignored = False
+        data = self._request(f"{self._v1_root()}/responses", payload)
+        message, finish_reason, usage = _responses_response(data)
+        self.last_usage = usage
+        self.last_finish_reason = finish_reason
+        return message
+
+    def list_models(self) -> list[str]:
+        data = self._request(f"{self._v1_root()}/models", timeout=min(self.timeout, 30.0))
         models = data.get("data") if isinstance(data, dict) else None
         if not isinstance(models, list):
             raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
@@ -364,6 +1084,10 @@ def clean_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
             }
             for index, call in enumerate(tool_calls)
         ]
+    thinking_blocks = message.get("_thinking_blocks")
+    if isinstance(thinking_blocks, list) and thinking_blocks:
+        # Anthropic requires signed thinking blocks to be sent back with tool results.
+        cleaned["_thinking_blocks"] = thinking_blocks
     return cleaned
 
 
@@ -915,7 +1639,7 @@ def _compaction_chunks(messages: list[dict[str, Any]]) -> list[str]:
 
 
 def compact_history(
-    client: ChatClient,
+    client: BaseChatClient,
     messages: list[dict[str, Any]],
     session: "Session | None" = None,
     keep: int = COMPACT_DEFAULT_KEEP,
@@ -940,6 +1664,7 @@ def compact_history(
     usage: dict[str, int] = {}
     truncated = False
     summary = ""
+    reasoning_warned = False
     for index, chunk in enumerate(chunks, 1):
         if progress is not None:
             progress(f"正在总结第 {index}/{len(chunks)} 段…")
@@ -951,6 +1676,12 @@ def compact_history(
         else:
             prompt = f"{COMPACT_PROMPT}\n\n待压缩的对话：\n{chunk}"
         reply = client.chat([{"role": "user", "content": prompt}], [])
+        if client.last_reasoning_ignored and not reasoning_warned:
+            reasoning_warned = True
+            print(
+                "[reasoning] warning: 网关忽略了关闭思考的请求；摘要仍包含 reasoning token",
+                file=sys.stderr,
+            )
         merge_usage(usage, client.last_usage)
         if client.last_finish_reason == "length":
             truncated = True
@@ -1995,7 +2726,7 @@ class Workspace:
 
 
 def run_turn(
-    client: ChatClient,
+    client: BaseChatClient,
     workspace: Workspace,
     messages: list[dict[str, Any]],
     max_steps: int,
@@ -2026,6 +2757,7 @@ def run_turn(
 
     usage_total: dict[str, int] = {}
     truncated = False
+    reasoning_warned = False
 
     def add_usage(usage: Any) -> None:
         merge_usage(usage_total, usage)
@@ -2033,6 +2765,13 @@ def run_turn(
     try:
         for _ in range(max_steps):
             reply = client.chat(messages, tools if tools is not None else TOOL_SCHEMAS)
+            if client.last_reasoning_ignored and not reasoning_warned:
+                reasoning_warned = True
+                label = client.reasoning.label if client.reasoning is not None else "off"
+                report(
+                    "warning",
+                    f"网关忽略了关闭思考的请求（{label}）；响应仍包含 reasoning token",
+                )
             add_usage(client.last_usage)
             if client.last_finish_reason == "length":
                 truncated = True
@@ -2319,8 +3058,8 @@ def _print_thinking(text: str) -> None:
 def print_help() -> None:
     print("Commands: /help, /reset, /compact [N], /skill [name [question]],")
     print("          /image [path|clear], /save [--tool] [--thinking] [file],")
-    print("          /confirm on|off, /thinking on|off, /model [name|number|list],")
-    print("          /exit (Ctrl-D)")
+    print("          /confirm on|off, /thinking on|off, /reasoning provider:level,")
+    print("          /model [name|number|list], /exit (Ctrl-D)")
     print("Skills: off by default; enable with --skill (dirs: <cwd>/.agents|.claude|.codex/skills,")
     print("        ~/.benben-agent/skills, ~/.agents/skills, ~/.claude/skills, ~/.codex/skills)")
     print(f"Sessions are saved to {SESSION_DIR}; list with --list, resume with -c <id>.")
@@ -2912,7 +3651,8 @@ modelEl.onchange = async () => {
   try {
     const data = await api("/api/model", { model: name });
     currentModel = data.model;
-    statusEl.textContent = "模型已切换: " + data.model;
+    statusEl.textContent = "模型已切换: " + data.model
+      + (data.reasoning_warning ? "；" + data.reasoning_warning : "");
   } catch (err) {
     statusEl.textContent = String(err);
     modelEl.value = currentModel;
@@ -3116,7 +3856,7 @@ def run_web(
     host: str,
     port: int,
     workspace: Workspace,
-    client: ChatClient,
+    client: BaseChatClient,
     max_steps: int,
     show_thinking: bool,
 ) -> int:
@@ -3384,7 +4124,8 @@ def run_web(
                 with lock:
                     client.model = model.strip()
                     current = client.model
-                self._json(200, {"model": current})
+                    warning = reasoning_model_warning(client.reasoning, client.model)
+                self._json(200, {"model": current, "reasoning_warning": warning})
                 return
 
             if parsed.path == "/api/compact":
@@ -3428,6 +4169,12 @@ def run_web(
     bound_port = server.server_address[1]
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     print(f"web ui: http://{display_host}:{bound_port}/?token={token}", flush=True)
+    if isinstance(client, AnthropicClient):
+        print("[web] api: anthropic-messages", file=sys.stderr)
+    elif isinstance(client, ResponsesClient):
+        print("[web] api: openai-responses", file=sys.stderr)
+    if client.reasoning is not None:
+        print(f"[web] reasoning: {client.reasoning.label}", file=sys.stderr)
     if workspace.allow_shell:
         print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr)
     if workspace.allow_skill_scripts and any(
@@ -3447,7 +4194,7 @@ def run_web(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="AI agent using an OpenAI-compatible chat completions API (standard library only).",
+        description="AI agent using OpenAI chat, OpenAI Responses, or Anthropic Messages APIs (standard library only).",
     )
     parser.add_argument("prompt", nargs="*", help="task to run; omit for interactive mode")
     parser.add_argument(
@@ -3467,6 +4214,34 @@ def main(argv: list[str] | None = None) -> int:
         help="model name (default: %(default)s)",
     )
     parser.add_argument("--temperature", type=float, default=None, help="sampling temperature (omitted by default)")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="max output tokens; Anthropic/Responses default to 8192, OpenAI omits it by default",
+    )
+    parser.add_argument(
+        "--api-format",
+        choices=API_FORMATS,
+        default=DEFAULT_API_FORMAT,
+        help=(
+            "wire protocol (default: %(default)s). "
+            "openai-chat-completions: POST /chat/completions; "
+            "openai-responses: POST /responses; "
+            "anthropic-messages: POST /v1/messages"
+        ),
+    )
+    parser.add_argument(
+        "--anthropic-version",
+        default="2023-06-01",
+        help="Anthropic API version header (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--anthropic-auth",
+        choices=("x-api-key", "bearer"),
+        default="x-api-key",
+        help="Anthropic authentication header style (default: x-api-key)",
+    )
     parser.add_argument("--max-steps", type=int, default=100, help="max model calls per turn (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds (default: %(default)s)")
     parser.add_argument("--cwd", default=".", help="workspace root for tools (default: current directory)")
@@ -3499,6 +4274,14 @@ def main(argv: list[str] | None = None) -> int:
         "--thinking",
         action="store_true",
         help="print the model's reasoning content before each answer (default: off)",
+    )
+    parser.add_argument(
+        "--reasoning",
+        metavar="PROVIDER:LEVEL",
+        help=(
+            "thinking control: deepseek|kimi|minimax : "
+            "off|minimal|low|medium|high|max (default: send nothing)"
+        ),
     )
     parser.add_argument(
         "-c",
@@ -3543,6 +4326,8 @@ def main(argv: list[str] | None = None) -> int:
         help="with --skill, only load ~/.benben-agent/skills; ignore other directories",
     )
     args = parser.parse_args(argv)
+    if args.api_format not in API_FORMATS:
+        parser.error(f"DEFAULT_API_FORMAT must be one of: {', '.join(API_FORMATS)}")
 
     # `-c` may be followed by a prompt; only an 8-hex value is a session id.
     if args.resume is not None and args.resume and not re.fullmatch(r"[0-9a-f]{8}", args.resume):
@@ -3551,6 +4336,25 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_sessions:
         return list_sessions()
+
+    reasoning = None
+    if args.reasoning:
+        try:
+            reasoning = _parse_reasoning(args.reasoning)
+        except ReasoningError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        print("error: --max-tokens must be greater than 0", file=sys.stderr)
+        return 2
+    if args.api_format != "openai-chat-completions" and reasoning is not None:
+        print(
+            "error: --reasoning is not supported with --api-format "
+            f"{args.api_format} yet; use openai-chat-completions",
+            file=sys.stderr,
+        )
+        return 2
 
     workspace = Workspace(
         args.cwd,
@@ -3563,13 +4367,41 @@ def main(argv: list[str] | None = None) -> int:
     workspace.allow_skill_scripts = args.skills and not args.no_skill_scripts
     tools = tool_schemas(workspace)
     render_output = not args.plain and sys.stdout.isatty()
-    client = ChatClient(
-        args.base_url,
-        args.api_key,
-        args.model,
-        timeout=args.timeout,
-        temperature=args.temperature,
-    )
+    client: BaseChatClient
+    if args.api_format == "anthropic-messages":
+        client = AnthropicClient(
+            args.base_url,
+            args.api_key,
+            args.model,
+            timeout=args.timeout,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            anthropic_version=args.anthropic_version,
+            anthropic_auth=args.anthropic_auth,
+        )
+    elif args.api_format == "openai-responses":
+        client = ResponsesClient(
+            args.base_url,
+            args.api_key,
+            args.model,
+            timeout=args.timeout,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+    else:
+        client = ChatClient(
+            args.base_url,
+            args.api_key,
+            args.model,
+            timeout=args.timeout,
+            temperature=args.temperature,
+            reasoning=reasoning,
+            max_tokens=args.max_tokens,
+        )
+    if reasoning is not None:
+        warning = reasoning_model_warning(reasoning, client.model)
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
     if args.web:
         if args.prompt or args.image:
             print("[web] prompt/image arguments are ignored in web mode", file=sys.stderr)
@@ -3615,8 +4447,9 @@ def main(argv: list[str] | None = None) -> int:
 
         show_thinking = args.thinking
         pending_images: list[str] = []
-        print(f"AI agent | model: {args.model} | workspace: {workspace.root}")
-        print(f"confirm: {'on' if workspace.confirm else 'off'} | thinking: {'on' if show_thinking else 'off'} | skills: {'on' if args.skills else 'off'}")
+        print(f"AI agent | model: {args.model} | api: {args.api_format} | workspace: {workspace.root}")
+        reasoning_label = client.reasoning.label if client.reasoning is not None else "default"
+        print(f"confirm: {'on' if workspace.confirm else 'off'} | thinking: {'on' if show_thinking else 'off'} | skills: {'on' if args.skills else 'off'} | reasoning: {reasoning_label}")
         print_help()
         enable_utf8_input()
         guard = InterruptGuard()
@@ -3752,6 +4585,35 @@ def main(argv: list[str] | None = None) -> int:
                         file=sys.stderr,
                     )
                 continue
+            if user_input == "/reasoning" or user_input.startswith("/reasoning "):
+                if not client.supports_reasoning_config:
+                    print("Anthropic 模式暂不支持 /reasoning")
+                    continue
+                argument = user_input[len("/reasoning"):].strip()
+                if not argument:
+                    current = client.reasoning.label if client.reasoning is not None else "default"
+                    print(f"reasoning: {current}")
+                    print(
+                        "usage: /reasoning <provider>:<level> | /reasoning clear "
+                        f"(providers: {', '.join(REASONING_PROVIDERS)}; "
+                        f"levels: {', '.join(REASONING_LEVELS)})"
+                    )
+                    continue
+                if argument.lower() in ("clear", "default", "reset", "off"):
+                    client.reasoning = None
+                    print("reasoning: cleared (no extra fields)")
+                    continue
+                try:
+                    config = _parse_reasoning(argument)
+                except ReasoningError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    continue
+                client.reasoning = config
+                print(f"reasoning: {config.label}")
+                warning = reasoning_model_warning(config, client.model)
+                if warning:
+                    print(f"warning: {warning}", file=sys.stderr)
+                continue
             if user_input == "/image" or user_input.startswith("/image "):
                 argument = user_input[len("/image"):].strip()
                 if argument.lower() == "clear":
@@ -3859,6 +4721,9 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                 client.model = argument
                 print(f"model switched to: {client.model}")
+                warning = reasoning_model_warning(client.reasoning, client.model)
+                if warning:
+                    print(f"warning: {warning}", file=sys.stderr)
                 continue
 
             try:
