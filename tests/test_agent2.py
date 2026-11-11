@@ -123,6 +123,31 @@ try:
 except agent.ToolError as exc:
     check("glob outside symlink blocked", "outside" in str(exc), str(exc))
 
+# ---------- pruning / binary skip / scan budget ----------
+write("node_modules/pkg/hidden.py", "needle\n")
+check("glob prunes node_modules", "node_modules" not in ws.glob("**/*.py"))
+check("search prunes node_modules", "node_modules" not in ws.search("needle", include="*.py"))
+write("src/photo.png", "needle\n")
+check("search skips binary extension", "photo.png" not in ws.search("needle", include="*.png"))
+
+write("budget/a.py", "budgettoken\n")
+write("budget/b.py", "budgettoken\n")
+old_limit = agent.MAX_SEARCH_FILES
+agent.MAX_SEARCH_FILES = 1
+try:
+    budget_out = ws.search("budgettoken", include="*.py")
+finally:
+    agent.MAX_SEARCH_FILES = old_limit
+check("search scan budget", "scan budget" in budget_out, budget_out)
+
+leftovers = [
+    os.path.join(dirpath, name)
+    for dirpath, _dirs, files in os.walk(base)
+    for name in files
+    if name.startswith(".benben-")
+]
+check("atomic writes leave no temp files", not leftovers, leftovers)
+
 # ---------- curl / wget whitelist ----------
 ro = agent.is_read_only_command
 cases = {
@@ -198,7 +223,7 @@ client = agent.ChatClient(f"http://127.0.0.1:{server.server_port}/v1", "", "m", 
 messages = [{"role": "user", "content": "go"}]
 ok = agent.run_turn(client, ws, messages, 3)
 check("run_turn with edit_file", ok and "GAMMA" in open(os.path.join(base, "edit/a.txt")).read(), messages[-1])
-check("all 7 tools sent", messages[-1]["content"] == "done:list_dir,read_file,search,glob,write_file,edit_file,run_command", messages[-1])
+check("all 9 tools sent", messages[-1]["content"] == "done:list_dir,read_file,search,glob,write_file,edit_file,run_command,list_shells,switch_shell", messages[-1])
 
 server.shutdown()
 shutil.rmtree(base)

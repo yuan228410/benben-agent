@@ -5,6 +5,7 @@
 function calling、会话持久化、Agent Skills、图片输入和网页界面。
 
 快速开始：
+    python3 benben-agent.py --connect            # 配置 DeepSeek/MiniMax/自定义连接
     export OPENAI_API_KEY=sk-...
     python3 benben-agent.py "列出当前目录，并总结这些文件是做什么的"
     python3 benben-agent.py                      # 交互模式
@@ -27,9 +28,16 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --max-steps N           每轮最多调用模型多少次，默认 100
     --timeout SECONDS       HTTP 超时，默认 120
     --cwd DIR               工具的工作区根目录，默认当前目录
+    --profile NAME          使用已保存的连接（不修改配置里的 active）
+    --config PATH           配置文件路径，默认 ~/.benben-agent/config.json
+    --no-config             启动时忽略配置文件（/connect 保存时仍保留其他连接）
+    --no-env                忽略 OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL
+    --connect               打开连接配置向导；没有 prompt/--web 时配置完退出
     --confirm               写文件/修改状态的命令前询问
     --no-confirm, --yes     从不询问（默认，--yes 为别名）
     --no-shell              禁用 run_command
+    --shell NAME|PATH       指定 shell：auto、pwsh、powershell、git-bash、cmd、
+                            bash、zsh、sh 或绝对路径（默认 auto）
     --plain                 不渲染终端 Markdown，直接输出原文
     -i, --image PATH        给任务附加图片，可重复，最多 4 张、单张 10 MB
     --thinking              打印模型的 reasoning_content（默认关闭）
@@ -48,6 +56,15 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
 
 交互模式斜杠命令：
     /help                         显示帮助
+    /connect                      连接配置向导
+    /connect list                 列出已保存的连接
+    /connect use <name>           切换连接并设为 active
+    /connect delete <name>        删除连接（不能删除当前连接）
+    /connect deepseek|minimax|custom
+                                  直接进入对应预设
+    /shell                        查看当前和可用 shell
+    /shell <name|path>            切换 shell
+    /shell auto                   重新自动检测
     /reset                        清空上下文，下一条消息开新会话文件
     /compact [N]                  压缩历史，保留最近 N 个用户回合（默认 2）
     /skill                        列出已加载技能
@@ -70,14 +87,21 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
 
 数据位置：
     会话              ~/.benben-agent/*.jsonl（目录 0700，文件 0600）
+    连接配置          ~/.benben-agent/config.json（目录 0700，文件 0600；
+                      API key 默认明文保存，可用空 key + OPENAI_API_KEY）
     技能              <cwd>/.agents/skills、<cwd>/.claude/skills、
                       <cwd>/.codex/skills、~/.benben-agent/skills、
                       ~/.agents/skills、~/.claude/skills、
                       ~/.codex/skills、/etc/codex/skills
 
 内置工具：list_dir、read_file、search、glob、write_file、edit_file、
-run_command；启用技能时按需增加 load_skill、read_skill_resource、
-run_skill_script。工具结果默认截断到 20000 字符。
+run_command、list_shells、switch_shell；启用技能时按需增加 load_skill、
+read_skill_resource、run_skill_script。工具结果默认截断到 20000 字符。
+
+Shell：启动时自动检测。Linux/macOS 优先 $SHELL，其次系统默认（Linux bash、
+macOS zsh）；Windows 依次检测 pwsh、Windows PowerShell、Git Bash、cmd。
+可用 --shell 指定，交互模式用 /shell 查看或切换。命令被当前 shell 明确判定
+为不认识时，run_command 会按可用顺序尝试备用 shell，并在结果里标注 [fallback]。
 
 安全提示：agent 可以读写工作区文件并执行命令；网页模式没有审批，
 只监听本机并依赖启动时生成的 token。技能脚本以当前用户权限运行。
@@ -90,15 +114,19 @@ import base64
 import binascii
 import copy
 import fnmatch
+import getpass
 import glob as glob_mod
 import json
+import locale
 import os
+import platform
 import re
 import secrets
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -147,6 +175,66 @@ COMPACT_SUMMARY_CHARS = 1_200
 REASONING_LEVELS = ("off", "minimal", "low", "medium", "high", "max")
 WEB_PORT = 8765
 WEB_MAX_BODY = 60 * 1024 * 1024
+CONFIG_VERSION = 1
+CONFIG_FILENAME = "config.json"
+DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_ANTHROPIC_AUTH = "x-api-key"
+PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
+    "deepseek": {
+        "label": "DeepSeek",
+        "formats": ("openai-chat-completions",),
+        "default_format": "openai-chat-completions",
+        "base_urls": {
+            "openai-chat-completions": "https://api.deepseek.com/v1",
+        },
+        "fallback_models": ("deepseek-chat", "deepseek-reasoner"),
+        "anthropic_auth": "x-api-key",
+    },
+    "minimax": {
+        "label": "MiniMax",
+        "formats": API_FORMATS,
+        "default_format": "openai-chat-completions",
+        "base_urls": {
+            "openai-chat-completions": "https://api.minimaxi.com/v1",
+            "openai-responses": "https://api.minimaxi.com/v1",
+            "anthropic-messages": "https://api.minimaxi.com/anthropic",
+        },
+        "fallback_models": (
+            "MiniMax-M3.1-Flash",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7-highspeed",
+        ),
+        "anthropic_auth": "bearer",
+    },
+}
+
+
+class Connection:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_format: str,
+        api_key: str = "",
+        provider: str = "custom",
+        name: str | None = None,
+        anthropic_auth: str = DEFAULT_ANTHROPIC_AUTH,
+        anthropic_version: str = DEFAULT_ANTHROPIC_VERSION,
+        sources: dict[str, str] | None = None,
+    ) -> None:
+        self.base_url = base_url
+        self.model = model
+        self.api_format = api_format
+        self.api_key = api_key
+        self.provider = provider
+        self.name = name
+        self.anthropic_auth = anthropic_auth
+        self.anthropic_version = anthropic_version
+        self.sources = sources or {}
+
+
+def default_config_path() -> str:
+    return os.environ.get("BENBEN_CONFIG") or os.path.join(SESSION_DIR, CONFIG_FILENAME)
 HOME_SKILLS_DIR = os.path.join(SESSION_DIR, "skills")
 CROSS_SKILLS_DIR = os.path.expanduser("~/.agents/skills")
 CLAUDE_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
@@ -167,18 +255,480 @@ SCRIPT_RUNNERS = {
     ".pl": ["perl"],
     ".php": ["php"],
     ".ps1": ["pwsh", "powershell"],
+    ".bat": ["cmd"],
+    ".cmd": ["cmd"],
 }
+ALLOWED_POSIX_SHELLS = ("bash", "zsh", "sh", "ksh", "dash")
 SKIP_DIRS = {
     ".git", ".hg", ".svn", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
     "__pycache__", "node_modules", "venv", ".venv", "dist", "build", "target",
 }
+SKIP_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".pdf",
+    ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+    ".so", ".dll", ".dylib", ".o", ".a", ".class", ".jar", ".pyc", ".pyo",
+    ".wasm", ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".mov",
+    ".avi", ".mkv", ".exe", ".bin",
+}
+MAX_SEARCH_FILES = 20_000
+MAX_SEARCH_BYTES = 200 * 1024 * 1024
+MAX_SEARCH_SECONDS = 10.0
+
+
+# --------------------------------------------------------------------------- #
+# Shell detection and encoding
+# --------------------------------------------------------------------------- #
+
+
+class ShellError(Exception):
+    pass
+
+
+def platform_display_name() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return "macOS"
+    if system == "Windows":
+        return "Windows"
+    if system == "Linux":
+        return "Linux"
+    return system or sys.platform
+
+
+def _shell_encodings(kind: str, name: str) -> tuple[str, tuple[str, ...]]:
+    if kind == "posix":
+        if name == "git-bash":
+            return "utf-8", ("utf-8",)
+        primary = locale.getpreferredencoding(False) or "utf-8"
+        fallbacks = ["utf-8"] if primary.lower() not in ("utf-8", "utf8") else []
+        return primary, tuple(fallbacks)
+
+    fallbacks: list[str] = ["utf-8"]
+    if kind == "powershell":
+        fallbacks.extend(("utf-16", "utf-16-le"))
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            for codepage in (
+                ctypes.windll.kernel32.GetOEMCP(),
+                ctypes.windll.kernel32.GetACP(),
+            ):
+                if codepage:
+                    fallbacks.append(f"cp{codepage}")
+        except (AttributeError, OSError, ValueError):
+            pass
+    local = locale.getpreferredencoding(False)
+    if local:
+        fallbacks.append(local)
+    deduped: list[str] = []
+    for item in fallbacks:
+        if item and item.lower() not in {value.lower() for value in deduped}:
+            deduped.append(item)
+    return "utf-8", tuple(deduped)
+
+
+def decode_output(data: bytes, encodings: list[str] | tuple[str, ...]) -> str:
+    """Decode captured bytes without ever failing; pick the cleanest candidate."""
+    candidates: list[tuple[int, str]] = []
+    for encoding in encodings:
+        if not encoding:
+            continue
+        try:
+            text = data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            try:
+                text = data.decode(encoding, errors="replace")
+            except LookupError:
+                continue
+        score = text.count("\ufffd") + text.count("\x00")
+        candidates.append((score, text))
+    if not candidates:
+        text = data.decode("utf-8", errors="replace")
+    else:
+        text = min(candidates, key=lambda item: item[0])[1]
+    return text.lstrip("\ufeff")
+
+
+class ShellInfo:
+    def __init__(self, path: str, name: str, kind: str, source: str = "auto") -> None:
+        self.path = os.path.abspath(path)
+        self.name = name
+        self.kind = kind
+        self.source = source
+        self.encoding, self.fallback_encodings = _shell_encodings(kind, name)
+
+    def command_argv(self, command: str) -> list[str]:
+        if self.kind == "posix":
+            return [self.path, "-c", command]
+        if self.kind == "powershell":
+            prefix = (
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+                "$OutputEncoding=[Text.Encoding]::UTF8;"
+            )
+            return [
+                self.path,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                prefix + command,
+            ]
+        if self.kind == "cmd":
+            return [self.path, "/d", "/s", "/c", "chcp 65001>nul & " + command]
+        raise ShellError(f"unsupported shell kind: {self.kind}")
+
+    def describe(self) -> str:
+        return f"{self.name} ({self.path}, {self.kind})"
+
+    def to_dict(self) -> dict[str, str]:
+        return {"name": self.name, "path": self.path, "kind": self.kind, "source": self.source}
+
+
+def _is_executable_file(path: str | None) -> bool:
+    if not path or not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    return os.access(path, os.X_OK)
+
+
+def _dedupe_shells(items: list[ShellInfo]) -> list[ShellInfo]:
+    seen: set[str] = set()
+    result: list[ShellInfo] = []
+    for item in items:
+        key = os.path.normcase(os.path.realpath(item.path))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _find_git_bash(which: Callable[[str], str | None], environ: dict[str, str]) -> str | None:
+    candidates: list[str] = []
+    git = which("git")
+    if git:
+        git_dir = os.path.dirname(git)
+        parent = os.path.dirname(git_dir)
+        candidates.extend(
+            [
+                os.path.join(parent, "bin", "bash.exe"),
+                os.path.join(parent, "usr", "bin", "bash.exe"),
+                os.path.join(git_dir, "bash.exe"),
+            ]
+        )
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = environ.get(env_name)
+        if not root:
+            continue
+        candidates.extend(
+            [
+                os.path.join(root, "Git", "bin", "bash.exe"),
+                os.path.join(root, "Programs", "Git", "bin", "bash.exe"),
+                os.path.join(root, "Git", "usr", "bin", "bash.exe"),
+                os.path.join(root, "Programs", "Git", "usr", "bin", "bash.exe"),
+            ]
+        )
+    for candidate in candidates:
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if "\\system32\\" in normalized or "/system32/" in normalized:
+            continue
+        if _is_executable_file(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def _infer_shell(path: str, platform_name: str) -> tuple[str, str]:
+    base = os.path.basename(path).lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    windows = platform_name.startswith("win")
+    if base == "pwsh":
+        return "pwsh", "powershell"
+    if base == "powershell":
+        return "powershell", "powershell"
+    if base == "cmd":
+        if not windows:
+            raise ShellError("cmd.exe is only available on Windows")
+        return "cmd", "cmd"
+    if base == "git-bash":
+        return "git-bash", "posix"
+    if base == "bash":
+        normalized = os.path.normcase(os.path.abspath(path))
+        if windows and ("\\git\\" in normalized or "/git/" in normalized):
+            return "git-bash", "posix"
+        return "bash", "posix"
+    if base in ALLOWED_POSIX_SHELLS:
+        return base, "posix"
+    if not windows:
+        return base, "posix"
+    raise ShellError(f"cannot determine shell type from {path}")
+
+
+def _shell_rank(item: ShellInfo, platform_name: str) -> int:
+    if platform_name.startswith("win"):
+        order = {"pwsh": 0, "powershell": 1, "git-bash": 2, "cmd": 3}
+        return order.get(item.name, 20)
+    if item.source == "fallback":
+        return 99
+    if item.source == "SHELL":
+        return 0
+    if platform_name == "darwin":
+        order = {"zsh": 1, "bash": 2, "sh": 3, "ksh": 4, "dash": 5}
+    else:
+        order = {"bash": 1, "zsh": 2, "sh": 3, "ksh": 4, "dash": 5}
+    return order.get(item.name, 20)
+
+
+def discover_shells(
+    platform_name: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    environ: dict[str, str] | None = None,
+) -> list[ShellInfo]:
+    platform_name = platform_name or sys.platform
+    which = which or shutil.which
+    environ = dict(os.environ) if environ is None else dict(environ)
+    windows = platform_name.startswith("win")
+    found: list[ShellInfo] = []
+
+    def add(path: str | None, name: str, kind: str, source: str) -> None:
+        if not _is_executable_file(path):
+            return
+        found.append(ShellInfo(path, name, kind, source))
+
+    if windows:
+        pwsh_candidates = [
+            which("pwsh"),
+            os.path.join(environ.get("ProgramFiles", ""), "PowerShell", "7", "pwsh.exe"),
+            os.path.join(environ.get("ProgramFiles", ""), "PowerShell", "6", "pwsh.exe"),
+            os.path.join(
+                environ.get("LOCALAPPDATA", ""),
+                "Microsoft",
+                "WindowsApps",
+                "pwsh.exe",
+            ),
+        ]
+        for candidate in pwsh_candidates:
+            if candidate:
+                add(candidate, "pwsh", "powershell", "PATH")
+                break
+        powershell_candidates = [
+            which("powershell"),
+            os.path.join(
+                environ.get("SystemRoot", ""),
+                "System32",
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe",
+            ),
+        ]
+        for candidate in powershell_candidates:
+            if candidate:
+                add(candidate, "powershell", "powershell", "PATH")
+                break
+        add(_find_git_bash(which, environ), "git-bash", "posix", "PATH")
+        cmd_candidates = [
+            environ.get("COMSPEC"),
+            os.path.join(environ.get("SystemRoot", ""), "System32", "cmd.exe"),
+            which("cmd"),
+        ]
+        for candidate in cmd_candidates:
+            if candidate:
+                add(candidate, "cmd", "cmd", "fallback")
+                break
+    else:
+        shell_env = environ.get("SHELL")
+        if shell_env:
+            name = os.path.basename(shell_env).lower()
+            if name in ALLOWED_POSIX_SHELLS:
+                path = shell_env if os.path.isabs(shell_env) else which(shell_env)
+                add(path, name, "posix", "SHELL")
+        for name in ("bash", "zsh", "sh", "ksh", "dash"):
+            add(which(name), name, "posix", "PATH")
+        add(which("pwsh"), "pwsh", "powershell", "PATH")
+        add("/bin/sh", "sh", "posix", "fallback")
+
+    unique = _dedupe_shells(found)
+    unique.sort(key=lambda item: _shell_rank(item, platform_name))
+    return unique
+
+
+def select_shell(
+    preference: str = "auto",
+    *,
+    platform_name: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    environ: dict[str, str] | None = None,
+    existing: list[ShellInfo] | None = None,
+) -> tuple[ShellInfo, list[ShellInfo]]:
+    platform_name = platform_name or sys.platform
+    which = which or shutil.which
+    environ = dict(os.environ) if environ is None else dict(environ)
+    preference = (preference or "auto").strip()
+    windows = platform_name.startswith("win")
+    available = list(existing or [])
+
+    if preference.lower() == "auto":
+        available = discover_shells(platform_name, which, environ)
+        if not available:
+            raise ShellError("no supported shell found")
+        return available[0], available
+
+    if existing:
+        for item in existing:
+            if item.name.lower() == preference.lower() or os.path.normcase(item.path) == os.path.normcase(
+                os.path.abspath(preference)
+            ):
+                return item, existing
+
+    looks_like_path = os.path.isabs(preference) or "/" in preference or "\\" in preference
+    if looks_like_path:
+        path = os.path.abspath(os.path.expanduser(preference))
+        if not _is_executable_file(path):
+            raise ShellError(f"shell not found or not executable: {preference}")
+        name, kind = _infer_shell(path, platform_name)
+        current = ShellInfo(path, name, kind, "explicit")
+        available = _dedupe_shells(
+            [current] + available + discover_shells(platform_name, which, environ)
+        )
+        return current, available
+
+    lowered = preference.lower()
+    if lowered == "git-bash":
+        if not windows:
+            raise ShellError("git-bash is only available on Windows")
+        path = _find_git_bash(which, environ)
+        if not path:
+            raise ShellError("Git Bash not found; install Git for Windows or use --shell cmd")
+        current = ShellInfo(path, "git-bash", "posix", "explicit")
+        available = _dedupe_shells(
+            [current] + available + discover_shells(platform_name, which, environ)
+        )
+        return current, available
+
+    if lowered == "bash" and windows:
+        path = _find_git_bash(which, environ)
+        if not path:
+            raise ShellError(
+                "bash on Windows means Git Bash; no Git Bash found. "
+                "Use --shell git-bash, --shell powershell, or --shell cmd"
+            )
+        current = ShellInfo(path, "git-bash", "posix", "explicit")
+        available = _dedupe_shells(
+            [current] + available + discover_shells(platform_name, which, environ)
+        )
+        return current, available
+
+    if lowered in ("powershell", "cmd") and not windows:
+        raise ShellError(f"{lowered} is only available on Windows")
+
+    path = which(lowered)
+    if path:
+        name, kind = _infer_shell(path, platform_name)
+        current = ShellInfo(path, name, kind, "explicit")
+        available = _dedupe_shells(
+            [current] + available + discover_shells(platform_name, which, environ)
+        )
+        return current, available
+
+    names = ", ".join(item.name for item in discover_shells(platform_name, which, environ))
+    raise ShellError(f"unknown shell: {preference}; available: {names or '(none)'}")
+
+
+class ShellState:
+    def __init__(self, current: ShellInfo, available: list[ShellInfo]) -> None:
+        self.current = current
+        self.available = _dedupe_shells([current] + list(available))
+        self.dirty = False
+
+    def switch(self, preference: str) -> ShellInfo:
+        current, available = select_shell(preference, existing=self.available)
+        self.current = current
+        self.available = available
+        self.dirty = True
+        return current
+
+    def describe(self) -> str:
+        lines = [f"current: {self.current.describe()}"]
+        lines.append("available:")
+        for item in self.available:
+            marker = "*" if item.path == self.current.path else " "
+            lines.append(f"{marker} {item.name}: {item.path} ({item.kind})")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "current": self.current.to_dict(),
+            "available": [item.to_dict() for item in self.available],
+        }
+
+
+def detect_shell_state(
+    preference: str = "auto",
+    *,
+    platform_name: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    environ: dict[str, str] | None = None,
+) -> ShellState:
+    current, available = select_shell(
+        preference,
+        platform_name=platform_name,
+        which=which,
+        environ=environ,
+    )
+    return ShellState(current, available)
+
+
+def shell_prompt_section(state: ShellState | None) -> str:
+    if state is None:
+        return "当前 shell：未检测。"
+    current = state.current
+    names = "、".join(item.name for item in state.available) or current.name
+    lines = [
+        f"当前 shell：{current.name}（{current.path}，{current.kind}）。",
+        f"可用 shell（按优先顺序）：{names}。",
+    ]
+    if current.kind == "posix":
+        if current.name == "git-bash":
+            lines.append(
+                "使用 POSIX 命令；Git Bash 里 Windows 盘符通常写作 /c/...，这不是 WSL。"
+            )
+        elif platform.system() == "Darwin":
+            lines.append(
+                "使用 POSIX 命令；macOS 自带 BSD 工具，注意 sed -i ''、date 等参数与 GNU 不同。"
+            )
+        else:
+            lines.append("优先使用 grep/awk/sed/find/xargs/tail/head 等 POSIX 命令。")
+    elif current.kind == "powershell":
+        lines.append(
+            "优先使用 Get-ChildItem、Get-Content、Select-String、Get-Process、"
+            "Get-Service、Invoke-WebRequest、Invoke-RestMethod 等 PowerShell 命令；"
+            "不要假设 grep/awk/sed/ls 可用。"
+        )
+    elif current.kind == "cmd":
+        lines.append(
+            "使用 dir、type、findstr、tasklist、where、curl 等命令；"
+            "复杂逻辑可用 powershell -Command 调用 PowerShell；"
+            "不要使用 grep/awk/sed/ls 等 Unix 命令。"
+        )
+    lines.append(
+        "用户询问有哪些 shell、当前 shell 或哪个优先时，按上面的列表回答；"
+        "用户要求切换时调用 switch_shell。不要自行切换，除非用户明确要求，"
+        "或当前 shell 明显无法执行任务且你已说明原因。"
+    )
+    return "\n".join(lines)
+
 
 SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你做事认真负责、严谨：先核实再下结论，
 宁可说明不确定，也不编造。
 
-你默认擅长 Linux 运维和问题排查，同时也能回答日常问题、解释概念、写代码、处理文本和闲聊。
+你熟悉 Linux、macOS 和 Windows 终端，能根据当前系统使用合适命令，同时也能回答日常问题、
+解释概念、写代码、处理文本和闲聊。
 
 工作区：{root}
+当前系统：{platform_name}
+{shell_section}
 
 沟通要求：
 - 所有自然语言输出使用简体中文，包括工具调用前的说明、工具输出解释和最终结论；
@@ -190,14 +740,11 @@ SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你
 做事方式：
 - 先弄清问题和现象再动手。排查故障时，从错误码、时间戳、模块或崩溃签名入手。
 - 用工具核实事实，不猜测文件内容或命令输出。
-- 充分利用系统已有命令：grep/awk/sed/sort/uniq 分析日志，tail/head、journalctl/dmesg
-  查看最近事件，ps/top/ss/lsof 查看进程和连接，df/du/free/uptime 查看资源，
-  file/readelf/objdump/strings 与 gdb 分析二进制和 core。用管道组合命令、控制输出量，
-  不要整份倾倒日志。
+- 用当前 shell 的命令和管道组合分析问题，控制输出量，不要整份倾倒日志。
 - 排查时按“找证据、提出假设、验证假设”的顺序推进，最后给出证据（文件:行号或命令
   输出）和下一步建议。
-- 需要实时信息（天气、新闻、股价等）时，先用 run_command 尝试 curl 等命令获取；
-  取不到就说明限制并给出替代建议，不要编造数据。
+- 需要实时信息（天气、新闻、股价等）时，先用 run_command 尝试当前 shell 可用的
+  curl、Invoke-WebRequest 等命令获取；取不到就说明限制并给出替代建议，不要编造数据。
 - 找文件用 glob（支持 ** 通配），按内容搜索用 search（正则），比反复调 shell 更省步骤。
 - 修改已有文件优先用 edit_file，old_string 要带足够上下文保证唯一；只有新建文件或
   确实要整体重写时才用 write_file。
@@ -205,6 +752,9 @@ SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你
 - 工具调用要小而准，读相关行，不要遍历整棵树；路径相对于工作区根目录。
 - 先用只读命令；除非用户明确要求，不要改变系统状态，也不要执行破坏性命令
   （rm -rf、git reset --hard 等）。
+- run_command 在当前 shell 明显不认识命令时会自动尝试其他可用 shell；如果结果出现
+  [fallback] reason，说明所有 shell 都无法识别该命令，向用户解释原因并建议安装工具
+  或更换命令，不要反复重试。
 - 任务完成后给出简短结论，不再调用工具。
 """
 
@@ -444,13 +994,16 @@ class BaseChatClient:
 
     def list_models(self) -> list[str]:
         data = self._request(f"{self._models_root()}/models", timeout=min(self.timeout, 30.0))
-        models = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(models, list):
-            raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
-        return sorted(
-            (item["id"] for item in models if isinstance(item, dict) and item.get("id")),
-            key=_natural_key,
-        )
+        models = extract_model_ids(data)
+        if models:
+            return models
+        if isinstance(data, list):
+            return []
+        if isinstance(data, dict) and any(
+            key in data for key in ("data", "models", "model_list", "items")
+        ):
+            return []
+        raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
 
 
 class ChatClient(BaseChatClient):
@@ -1041,6 +1594,837 @@ class ResponsesClient(BaseChatClient):
 def _natural_key(name: str) -> list[Any]:
     """Sort model names so A7 comes before A10 and GLM-5.2 before GLM-5.3."""
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
+
+
+# --------------------------------------------------------------------------- #
+# Saved connections (~/.benben-agent/config.json)
+# --------------------------------------------------------------------------- #
+
+
+class ConfigError(Exception):
+    pass
+
+
+def empty_config() -> dict[str, Any]:
+    return {"version": CONFIG_VERSION, "active": None, "connections": {}}
+
+
+def _validate_base_url(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("base URL must be a non-empty string")
+    value = value.strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ConfigError(f"invalid base URL: {value}")
+    return value.rstrip("/")
+
+
+def _validate_connection_name(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("connection name must be a non-empty string")
+    value = value.strip()
+    if not re.fullmatch(r"[\w.\-]{1,32}", value, re.UNICODE):
+        raise ConfigError("connection name may only contain letters, digits, Chinese, '.', '_' and '-'")
+    return value
+
+
+def _normalize_profile(name: str, raw: Any) -> dict[str, Any]:
+    name = _validate_connection_name(name)
+    if not isinstance(raw, dict):
+        raise ConfigError(f"connection {name!r} must be a JSON object")
+    base_url = _validate_base_url(raw.get("base_url"))
+    api_format = raw.get("api_format")
+    if api_format not in API_FORMATS:
+        raise ConfigError(
+            f"connection {name!r}: api_format must be one of: {', '.join(API_FORMATS)}"
+        )
+    model = raw.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError(f"connection {name!r}: model must be a non-empty string")
+    provider = raw.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        provider = "custom"
+    provider = provider.strip()
+    api_key = raw.get("api_key", "")
+    if api_key is None:
+        api_key = ""
+    if not isinstance(api_key, str):
+        raise ConfigError(f"connection {name!r}: api_key must be a string")
+    preset = PROVIDER_PRESETS.get(provider, {})
+    auth = raw.get("anthropic_auth")
+    if auth not in ("x-api-key", "bearer"):
+        auth = preset.get("anthropic_auth", DEFAULT_ANTHROPIC_AUTH)
+    version = raw.get("anthropic_version")
+    if not isinstance(version, str) or not version.strip():
+        version = DEFAULT_ANTHROPIC_VERSION
+    return {
+        "provider": provider,
+        "base_url": base_url,
+        "api_format": api_format,
+        "model": model.strip(),
+        "api_key": api_key,
+        "anthropic_auth": auth,
+        "anthropic_version": version.strip(),
+    }
+
+
+def load_config(path: str | None = None) -> dict[str, Any]:
+    path = path or default_config_path()
+    if not os.path.exists(path):
+        return empty_config()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigError(f"{path}: config root must be a JSON object")
+    version = payload.get("version", CONFIG_VERSION)
+    if isinstance(version, int) and version > CONFIG_VERSION:
+        print(
+            f"warning: {path} uses config version {version}; reading it with version {CONFIG_VERSION}",
+            file=sys.stderr,
+        )
+    raw_connections = payload.get("connections", {})
+    if not isinstance(raw_connections, dict):
+        print(f"warning: {path}: connections must be an object; ignoring it", file=sys.stderr)
+        raw_connections = {}
+    connections: dict[str, dict[str, Any]] = {}
+    for name, raw in raw_connections.items():
+        try:
+            clean_name = _validate_connection_name(str(name))
+            connections[clean_name] = _normalize_profile(clean_name, raw)
+        except ConfigError as exc:
+            print(f"warning: {path}: {exc}; ignoring this connection", file=sys.stderr)
+    active = payload.get("active")
+    if isinstance(active, str):
+        try:
+            active = _validate_connection_name(active)
+        except ConfigError:
+            active = None
+    if not isinstance(active, str) or active not in connections:
+        if active:
+            print(f"warning: {path}: active connection {active!r} not found", file=sys.stderr)
+        active = None
+    return {"version": CONFIG_VERSION, "active": active, "connections": connections}
+
+
+def save_config(config: dict[str, Any], path: str | None = None) -> str:
+    path = path or default_config_path()
+    connections: dict[str, dict[str, Any]] = {}
+    for name, raw in (config.get("connections") or {}).items():
+        clean_name = _validate_connection_name(str(name))
+        connections[clean_name] = _normalize_profile(clean_name, raw)
+    active = config.get("active")
+    if isinstance(active, str):
+        try:
+            active = _validate_connection_name(active)
+        except ConfigError:
+            active = None
+    if not isinstance(active, str) or active not in connections:
+        active = None
+    payload = {"version": CONFIG_VERSION, "active": active, "connections": connections}
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        fd, temp_path = tempfile.mkstemp(prefix=".benben-config-", dir=directory, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        raise ConfigError(f"cannot save {path}: {exc}") from exc
+    return path
+
+
+def profile_from_connection(connection: Connection) -> dict[str, Any]:
+    return {
+        "provider": connection.provider,
+        "base_url": connection.base_url,
+        "api_format": connection.api_format,
+        "model": connection.model,
+        "api_key": connection.api_key,
+        "anthropic_auth": connection.anthropic_auth,
+        "anthropic_version": connection.anthropic_version,
+    }
+
+
+def connection_from_profile(
+    name: str,
+    raw: dict[str, Any],
+    *,
+    use_env_fallback: bool = True,
+) -> Connection:
+    normalized = _normalize_profile(name, raw)
+    api_key = normalized["api_key"]
+    key_source = "config"
+    if not api_key and use_env_fallback:
+        env_key = os.environ.get("OPENAI_API_KEY")
+        if env_key:
+            api_key = env_key
+            key_source = "env"
+        elif normalized["base_url"].rstrip("/") == DEFAULT_BASE_URL.rstrip("/"):
+            api_key = DEFAULT_API_KEY
+            key_source = "default"
+        else:
+            key_source = "empty"
+    return Connection(
+        base_url=normalized["base_url"],
+        model=normalized["model"],
+        api_format=normalized["api_format"],
+        api_key=api_key,
+        provider=normalized["provider"],
+        name=name,
+        anthropic_auth=normalized["anthropic_auth"],
+        anthropic_version=normalized["anthropic_version"],
+        sources={
+            "base_url": "config",
+            "model": "config",
+            "api_format": "config",
+            "api_key": key_source,
+        },
+    )
+
+
+def mask_api_key(value: str) -> str:
+    if not value:
+        return "(empty)"
+    if len(value) <= 8:
+        return "****"
+    return f"{value[:3]}****{value[-4:]}"
+
+
+def extract_model_ids(payload: Any) -> list[str]:
+    items: Any = None
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        for key in ("data", "models", "model_list", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+        if items is None and any(key in payload for key in ("id", "name", "model", "model_name")):
+            items = [payload]
+    if not isinstance(items, list):
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = None
+        if isinstance(item, str):
+            value = item
+        elif isinstance(item, dict):
+            for key in ("id", "name", "model", "model_name"):
+                candidate = item.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    value = candidate
+                    break
+        if not value:
+            continue
+        value = value.strip()
+        if value and value not in seen:
+            seen.add(value)
+            ids.append(value)
+    return sorted(ids, key=_natural_key)
+
+
+def build_client(
+    connection: Connection,
+    *,
+    timeout: float = 120.0,
+    max_retries: int = 3,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    reasoning: ReasoningConfig | None = None,
+) -> BaseChatClient:
+    if connection.api_format == "anthropic-messages":
+        return AnthropicClient(
+            connection.base_url,
+            connection.api_key,
+            connection.model,
+            timeout=timeout,
+            max_retries=max_retries,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            anthropic_version=connection.anthropic_version,
+            anthropic_auth=connection.anthropic_auth,
+        )
+    if connection.api_format == "openai-responses":
+        return ResponsesClient(
+            connection.base_url,
+            connection.api_key,
+            connection.model,
+            timeout=timeout,
+            max_retries=max_retries,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    return ChatClient(
+        connection.base_url,
+        connection.api_key,
+        connection.model,
+        timeout=timeout,
+        max_retries=max_retries,
+        temperature=temperature,
+        reasoning=reasoning,
+        max_tokens=max_tokens,
+    )
+
+
+def fetch_model_ids(connection: Connection, timeout: float = 10.0) -> list[str]:
+    probe = build_client(
+        connection,
+        timeout=max(3.0, min(float(timeout), 30.0)),
+        max_retries=1,
+    )
+    return probe.list_models()
+
+
+def resolve_connection(
+    args: Any,
+    config: dict[str, Any],
+    *,
+    use_env: bool = True,
+) -> Connection:
+    connections = config.get("connections") or {}
+    requested = getattr(args, "profile", None)
+    if requested is not None:
+        if not isinstance(requested, str) or not requested:
+            raise ConfigError("--profile must be a non-empty string")
+        if requested not in connections:
+            known = ", ".join(sorted(connections)) or "(none)"
+            raise ConfigError(f"unknown profile {requested!r}; saved connections: {known}")
+        name: str | None = requested
+    else:
+        active = config.get("active")
+        name = active if isinstance(active, str) and active in connections else None
+    raw = connections.get(name, {}) if name else {}
+    provider = raw.get("provider") if isinstance(raw.get("provider"), str) else "custom"
+    preset = PROVIDER_PRESETS.get(provider, {})
+    sources: dict[str, str] = {}
+
+    def pick(field_name: str, env_name: str | None, default: Any) -> Any:
+        cli_value = getattr(args, field_name, None)
+        if cli_value is not None:
+            sources[field_name] = "cli"
+            return cli_value
+        if use_env and env_name:
+            env_value = os.environ.get(env_name)
+            if env_value:
+                sources[field_name] = "env"
+                return env_value
+        profile_value = raw.get(field_name)
+        if profile_value not in (None, ""):
+            sources[field_name] = "config"
+            return profile_value
+        sources[field_name] = "default"
+        return default
+
+    api_format = pick("api_format", None, DEFAULT_API_FORMAT)
+    if api_format not in API_FORMATS:
+        raise ConfigError(f"api_format must be one of: {', '.join(API_FORMATS)}")
+    base_url = pick("base_url", "OPENAI_BASE_URL", DEFAULT_BASE_URL)
+    api_key_default = (
+        DEFAULT_API_KEY
+        if isinstance(base_url, str) and base_url.rstrip("/") == DEFAULT_BASE_URL.rstrip("/")
+        else ""
+    )
+    connection = Connection(
+        base_url=base_url,
+        model=pick("model", "OPENAI_MODEL", DEFAULT_MODEL),
+        api_format=api_format,
+        api_key=pick("api_key", "OPENAI_API_KEY", api_key_default),
+        provider=provider,
+        name=name,
+        anthropic_auth=pick(
+            "anthropic_auth",
+            None,
+            preset.get("anthropic_auth", DEFAULT_ANTHROPIC_AUTH),
+        ),
+        anthropic_version=pick(
+            "anthropic_version",
+            None,
+            DEFAULT_ANTHROPIC_VERSION,
+        ),
+        sources=sources,
+    )
+    return connection
+
+
+def env_override_names(config: dict[str, Any]) -> list[str]:
+    active = config.get("active")
+    connections = config.get("connections") or {}
+    if not isinstance(active, str) or active not in connections:
+        return []
+    raw = connections.get(active) or {}
+    names: list[str] = []
+    for field_name, env_name in (
+        ("base_url", "OPENAI_BASE_URL"),
+        ("model", "OPENAI_MODEL"),
+        ("api_key", "OPENAI_API_KEY"),
+    ):
+        if raw.get(field_name) and os.environ.get(env_name):
+            names.append(env_name)
+    return names
+
+
+def public_connections(
+    config: dict[str, Any],
+    config_path: str,
+    runtime_name: str | None = None,
+) -> dict[str, Any]:
+    active = config.get("active")
+    connections = config.get("connections") or {}
+    items = []
+    for name in sorted(connections):
+        try:
+            connection = connection_from_profile(name, connections[name], use_env_fallback=False)
+        except ConfigError:
+            continue
+        items.append({
+            "name": name,
+            "provider": connection.provider,
+            "base_url": connection.base_url,
+            "api_format": connection.api_format,
+            "model": connection.model,
+            "anthropic_auth": connection.anthropic_auth,
+            "anthropic_version": connection.anthropic_version,
+            "key_hint": mask_api_key(connection.api_key),
+            "has_key": bool(connection.api_key),
+            "active": name == active,
+            "runtime": name == runtime_name,
+        })
+    return {
+        "connections": items,
+        "active": active,
+        "runtime": runtime_name,
+        "config_path": config_path,
+        "protocols": list(API_FORMATS),
+        "presets": copy.deepcopy(PROVIDER_PRESETS),
+        "env_overrides": env_override_names(config),
+    }
+
+
+def _read_secret(prompt: str) -> str:
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    return input(prompt)
+
+
+def _wizard_choice(
+    reader: Callable[[str], str],
+    writer: Callable[[str], None],
+    prompt: str,
+    choices: list[tuple[str, str]],
+    default: str,
+) -> str:
+    while True:
+        writer("")
+        for key, label in choices:
+            suffix = " (默认)" if key == default else ""
+            writer(f"  {key}. {label}{suffix}")
+        answer = reader(prompt).strip()
+        if not answer:
+            return default
+        if answer in {key for key, _label in choices}:
+            return answer
+        writer("输入无效，请重新选择。")
+
+
+def _wizard_summary(connection: Connection, config_path: str) -> str:
+    return (
+        f"  连接: {connection.name or '(未命名)'}\n"
+        f"  服务商: {connection.provider}\n"
+        f"  协议: {connection.api_format}\n"
+        f"  地址: {connection.base_url}\n"
+        f"  模型: {connection.model}\n"
+        f"  Key:  {mask_api_key(connection.api_key)}\n"
+        f"  配置: {config_path}"
+    )
+
+
+def run_connect_wizard(
+    config: dict[str, Any],
+    config_path: str,
+    defaults: Connection | None = None,
+    *,
+    provider: str | None = None,
+    input_fn: Callable[[str], str] | None = None,
+    secret_fn: Callable[[str], str] | None = None,
+    output_fn: Callable[[str], None] | None = None,
+    model_lister: Callable[[Connection], list[str]] | None = None,
+) -> Connection | None:
+    reader = input_fn or input
+    writer = output_fn or print
+    secret = secret_fn or _read_secret
+    lister = model_lister or fetch_model_ids
+    defaults = defaults or Connection(DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_API_FORMAT)
+    draft = copy.deepcopy(config)
+    draft.setdefault("version", CONFIG_VERSION)
+    draft.setdefault("active", None)
+    draft.setdefault("connections", {})
+    connections: dict[str, dict[str, Any]] = draft["connections"]
+    active = draft.get("active")
+
+    try:
+        writer("")
+        if isinstance(active, str) and active in connections:
+            writer(f"当前连接: {active}")
+        writer(f"配置文件: {config_path}")
+
+        if provider is None:
+            choices = [
+                ("1", "DeepSeek"),
+                ("2", "MiniMax"),
+                ("3", "自定义"),
+                ("4", "使用已保存的连接"),
+                ("q", "取消"),
+            ]
+            choice = _wizard_choice(reader, writer, "> ", choices, "1")
+            if choice == "q":
+                return None
+            if choice == "4":
+                if not connections:
+                    writer("没有已保存的连接。")
+                    return None
+                writer("")
+                writer("已保存的连接:")
+                names = sorted(connections)
+                for index, name in enumerate(names, 1):
+                    writer(f"  {index}. {name}")
+                answer = reader("选择编号或名称 [1]: ").strip() or "1"
+                if answer.isdigit():
+                    index = int(answer)
+                    if not 1 <= index <= len(names):
+                        writer("编号超出范围。")
+                        return None
+                    answer = names[index - 1]
+                if answer not in connections:
+                    writer(f"未知连接: {answer}")
+                    return None
+                selected = connection_from_profile(answer, connections[answer])
+                draft["active"] = answer
+                try:
+                    save_config(draft, config_path)
+                except ConfigError as exc:
+                    writer(f"error: {exc}")
+                    return None
+                config.clear()
+                config.update(draft)
+                writer("")
+                writer(f"已切换连接: {answer}")
+                writer(_wizard_summary(selected, config_path))
+                return selected
+            provider = {"1": "deepseek", "2": "minimax", "3": "custom"}[choice]
+        provider = provider.strip().lower()
+        if provider not in PROVIDER_PRESETS and provider != "custom":
+            writer(f"未知服务商: {provider}")
+            return None
+        preset = PROVIDER_PRESETS.get(provider, {})
+        formats = list(preset.get("formats") or API_FORMATS)
+        default_format = preset.get("default_format", DEFAULT_API_FORMAT)
+        writer("")
+        writer("协议:")
+        for index, fmt in enumerate(formats, 1):
+            suffix = " (推荐)" if fmt == default_format else ""
+            writer(f"  {index}. {fmt}{suffix}")
+        while True:
+            answer = reader(f"协议 [{default_format}]: ").strip() or default_format
+            if answer.isdigit() and 1 <= int(answer) <= len(formats):
+                api_format = formats[int(answer) - 1]
+                break
+            if answer in formats:
+                api_format = answer
+                break
+            writer("协议无效，请重新输入。")
+
+        base_default = preset.get("base_urls", {}).get(api_format)
+        if not base_default:
+            base_default = defaults.base_url if provider == "custom" or not preset else DEFAULT_BASE_URL
+        while True:
+            answer = reader(f"Base URL [{base_default}]: ").strip() or base_default
+            try:
+                base_url = _validate_base_url(answer)
+                break
+            except ConfigError as exc:
+                writer(f"错误: {exc}")
+
+        if defaults.name and defaults.provider == provider:
+            default_name = defaults.name
+        else:
+            default_name = provider if provider != "custom" else "custom"
+        while True:
+            name = _validate_connection_name_safe(reader(f"连接名称 [{default_name}]: ").strip() or default_name, writer)
+            if name is not None:
+                break
+        existing = connections.get(name) or {}
+        if existing:
+            writer(f"连接 {name} 已存在，保存会覆盖它。")
+        existing_key = existing.get("api_key", "") if isinstance(existing, dict) else ""
+        if existing_key:
+            key_prompt = "API Key（回车保留现有 key）: "
+        else:
+            key_prompt = "API Key（回车不保存 key，运行时读 OPENAI_API_KEY）: "
+        entered_key = secret(key_prompt).strip()
+        saved_key = entered_key if entered_key else str(existing_key or "")
+        if saved_key:
+            fetch_key = saved_key
+        elif base_url.rstrip("/") == defaults.base_url.rstrip("/"):
+            fetch_key = defaults.api_key
+        else:
+            fetch_key = os.environ.get("OPENAI_API_KEY", "")
+        same_target = (
+            isinstance(existing, dict)
+            and existing.get("provider") == provider
+            and existing.get("api_format") == api_format
+        )
+        auth = existing.get("anthropic_auth") if same_target else None
+        if auth not in ("x-api-key", "bearer"):
+            auth = preset.get("anthropic_auth", DEFAULT_ANTHROPIC_AUTH)
+        if api_format == "anthropic-messages":
+            writer("")
+            writer("Anthropic 认证:")
+            writer("  1. x-api-key")
+            writer("  2. bearer")
+            while True:
+                answer = reader(f"认证方式 [{auth}]: ").strip() or auth
+                if answer.isdigit() and answer in ("1", "2"):
+                    auth = "x-api-key" if answer == "1" else "bearer"
+                    break
+                if answer in ("x-api-key", "bearer"):
+                    auth = answer
+                    break
+                writer("认证方式无效，请重新输入。")
+        version = existing.get("anthropic_version") if isinstance(existing, dict) else None
+        if not isinstance(version, str) or not version.strip():
+            version = DEFAULT_ANTHROPIC_VERSION
+
+        probe = Connection(
+            base_url=base_url,
+            model=defaults.model,
+            api_format=api_format,
+            api_key=fetch_key,
+            provider=provider,
+            anthropic_auth=auth,
+            anthropic_version=version,
+        )
+        models: list[str] = []
+        try:
+            writer("")
+            writer("获取模型列表...")
+            models = lister(probe)
+        except ChatError as exc:
+            writer(f"获取模型列表失败: {exc}")
+        if not models:
+            models = list(preset.get("fallback_models", ()))
+            if models:
+                writer("使用内置候选模型（也可以直接输入模型名）。")
+        if models:
+            writer("")
+            writer("可用模型:")
+            shown = models[:80]
+            for index, model_name in enumerate(shown, 1):
+                marker = "  *" if model_name == defaults.model else ""
+                writer(f"  {index:3d}. {model_name}{marker}")
+            if len(models) > len(shown):
+                writer(f"  ... 共 {len(models)} 个，可直接输入模型名")
+            default_model = defaults.model if defaults.model in models else models[0]
+            while True:
+                answer = reader(f"模型 [编号/名称，回车 {default_model}]: ").strip()
+                if not answer:
+                    model = default_model
+                    break
+                if answer.isdigit():
+                    index = int(answer)
+                    if 1 <= index <= len(shown):
+                        model = shown[index - 1]
+                        break
+                    writer("编号超出范围。")
+                    continue
+                model = answer
+                break
+        else:
+            while True:
+                model = reader("模型名: ").strip()
+                if model:
+                    break
+                writer("模型名不能为空。")
+
+        connection = Connection(
+            base_url=base_url,
+            model=model,
+            api_format=api_format,
+            api_key=saved_key,
+            provider=provider,
+            name=name,
+            anthropic_auth=auth,
+            anthropic_version=version,
+        )
+        writer("")
+        writer("将保存:")
+        writer(_wizard_summary(connection, config_path))
+        if saved_key:
+            writer("API key 会以明文保存，文件权限 0600。")
+        answer = reader("确认保存? [Y/n]: ").strip().lower()
+        if answer in ("n", "no", "q"):
+            writer("已取消。")
+            return None
+        draft["connections"][name] = profile_from_connection(connection)
+        draft["active"] = name
+        try:
+            save_config(draft, config_path)
+        except ConfigError as exc:
+            writer(f"error: {exc}")
+            return None
+        config.clear()
+        config.update(draft)
+        writer("")
+        writer(f"已连接: {name}")
+        writer(_wizard_summary(connection, config_path))
+        return connection_from_profile(name, draft["connections"][name])
+    except (EOFError, KeyboardInterrupt):
+        writer("")
+        writer("已取消。")
+        return None
+
+
+def _validate_connection_name_safe(name: str, writer: Callable[[str], None]) -> str | None:
+    try:
+        return _validate_connection_name(name)
+    except ConfigError as exc:
+        writer(f"错误: {exc}")
+        return None
+
+
+def run_connect_command(
+    argument: str,
+    config: dict[str, Any],
+    config_path: str,
+    defaults: Connection,
+    *,
+    client_factory: Callable[[Connection], BaseChatClient],
+    reasoning: ReasoningConfig | None,
+) -> tuple[BaseChatClient | None, Connection | None]:
+    parts = argument.split(maxsplit=1)
+    action = parts[0].strip().lower() if parts and parts[0].strip() else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if action == "list":
+        print(f"config: {config_path}")
+        active = config.get("active")
+        connections = config.get("connections") or {}
+        if not connections:
+            print("no saved connections")
+            return None, None
+        for name in sorted(connections):
+            raw = connections[name]
+            marker = "*" if name == active else " "
+            try:
+                connection = connection_from_profile(name, raw, use_env_fallback=False)
+            except ConfigError:
+                continue
+            print(
+                f"{marker} {name:<16} {connection.model:<28} "
+                f"{connection.api_format:<24} {connection.base_url}"
+            )
+            print(f"    key: {mask_api_key(raw.get('api_key', ''))}")
+        return None, None
+
+    if action == "use":
+        if not rest:
+            print("usage: /connect use <name>")
+            return None, None
+        connections = config.get("connections") or {}
+        if rest not in connections:
+            print(f"unknown connection: {rest}; use /connect list")
+            return None, None
+        try:
+            connection = connection_from_profile(rest, connections[rest])
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return None, None
+        config["active"] = rest
+        try:
+            save_config(config, config_path)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return None, None
+        client = client_factory(connection)
+        print(f"connected: {rest}")
+        print(_wizard_summary(connection, config_path))
+        if connection.api_format != "openai-chat-completions" and reasoning is not None:
+            print(
+                "warning: --reasoning is only supported by openai-chat-completions; "
+                "it will not be sent with this connection",
+                file=sys.stderr,
+            )
+        return client, connection
+
+    if action == "delete":
+        if not rest:
+            print("usage: /connect delete <name>")
+            return None, None
+        connections = config.get("connections") or {}
+        if rest not in connections:
+            print(f"unknown connection: {rest}; use /connect list")
+            return None, None
+        if config.get("active") == rest or defaults.name == rest:
+            print("cannot delete the active connection; switch to another connection first")
+            return None, None
+        try:
+            answer = input(f"删除连接 {rest}? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\ncancelled")
+            return None, None
+        if answer not in ("y", "yes"):
+            print("cancelled")
+            return None, None
+        del connections[rest]
+        try:
+            save_config(config, config_path)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return None, None
+        print(f"deleted connection: {rest}")
+        return None, None
+
+    provider = action if action in ("deepseek", "minimax", "custom") else None
+    if action and provider is None:
+        print("usage: /connect [list|use <name>|delete <name>|deepseek|minimax|custom]")
+        return None, None
+    connection = run_connect_wizard(config, config_path, defaults, provider=provider)
+    if connection is None:
+        return None, None
+    client = client_factory(connection)
+    if connection.api_format != "openai-chat-completions" and reasoning is not None:
+        print(
+            "warning: --reasoning is only supported by openai-chat-completions; "
+            "it will not be sent with this connection",
+            file=sys.stderr,
+        )
+    return client, connection
 
 
 def _retry_delay(retry_after: str | None, attempt: int) -> float:
@@ -1983,8 +3367,16 @@ def discover_skills(workspace_root: str, only_own: bool = False) -> dict[str, di
     return skills
 
 
-def build_system_prompt(root: str, skills: dict[str, dict[str, Any]]) -> str:
-    prompt = SYSTEM_PROMPT.format(root=root)
+def build_system_prompt(
+    root: str,
+    skills: dict[str, dict[str, Any]],
+    shell_state: ShellState | None = None,
+) -> str:
+    prompt = SYSTEM_PROMPT.format(
+        root=root,
+        platform_name=platform_display_name(),
+        shell_section=shell_prompt_section(shell_state),
+    )
     if not skills:
         return prompt
     lines = ["", "可用技能（任务匹配时先调用 load_skill 读取完整说明）："]
@@ -2057,8 +3449,44 @@ RUN_SKILL_SCRIPT_SCHEMA: dict[str, Any] = {
 }
 
 
+LIST_SHELLS_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "list_shells",
+        "description": "List detected shells and show the current shell with full paths.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+SWITCH_SHELL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "switch_shell",
+        "description": (
+            "Switch the shell used by run_command and skill scripts for the rest of "
+            "this session. Use list_shells first when unsure."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Shell name or absolute path: bash, zsh, sh, ksh, dash, pwsh, "
+                        "powershell, git-bash, cmd, or auto."
+                    ),
+                }
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+
 def tool_schemas(workspace: "Workspace") -> list[dict[str, Any]]:
     tools = list(TOOL_SCHEMAS)
+    tools.append(LIST_SHELLS_SCHEMA)
+    tools.append(SWITCH_SHELL_SCHEMA)
     if not workspace.skills:
         return tools
     tools.append(LOAD_SKILL_SCHEMA)
@@ -2281,12 +3709,14 @@ def _wget_reads_stdout(args: list[str]) -> bool:
     return False
 
 
-def is_read_only_command(command: str) -> bool:
+def is_read_only_command(command: str, shell_kind: str = "posix") -> bool:
     """Conservative check for shell commands that cannot change system state.
 
-    Any unknown command, wrapper, redirection, substitution or unsafe flag is
-    treated as mutating, so the worst case is an unnecessary confirmation.
+    PowerShell and cmd semantics differ too much for a safe allowlist, so any
+    command there is treated as potentially mutating.
     """
+    if shell_kind != "posix":
+        return False
     if not command.strip():
         return False
     if "`" in command or "$" in command or ">" in command or "<<" in command or "<(" in command:
@@ -2339,6 +3769,8 @@ def _capture_process(
     timeout: int,
     env: dict[str, str] | None = None,
     shell: bool = False,
+    encoding: str | None = None,
+    fallback_encodings: tuple[str, ...] | None = None,
 ) -> tuple[int, str, str, bool]:
     """Run a process and cap each output stream at MAX_TOOL_OUTPUT."""
 
@@ -2373,8 +3805,6 @@ def _capture_process(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
             env=env,
         )
     except OSError as exc:
@@ -2399,41 +3829,216 @@ def _capture_process(
         reader.join(1.0)
     if timed_out:
         raise ToolError(f"command timed out after {timeout}s")
+    encodings: list[str] = []
+    if encoding:
+        encodings.append(encoding)
+    encodings.extend(fallback_encodings or ())
+    if not encodings:
+        encodings = [locale.getpreferredencoding(False) or "utf-8", "utf-8"]
+    stdout = decode_output(b"".join(out["parts"]), encodings)[:MAX_TOOL_OUTPUT]
+    stderr = decode_output(b"".join(err["parts"]), encodings)[:MAX_TOOL_OUTPUT]
     return (
         process.returncode,
-        "".join(out["parts"]),
-        "".join(err["parts"]),
+        stdout,
+        stderr,
         bool(out["truncated"] or err["truncated"]),
     )
 
 
-def _script_command(path: str) -> list[str]:
+def _short_error(stderr: str, stdout: str, limit: int = 160) -> str:
+    text = (stderr or stdout or "").strip()
+    if not text:
+        return "no output"
+    line = text.splitlines()[0].strip()
+    return line[:limit]
+
+
+def _shell_mismatch(kind: str, returncode: int, stdout: str, stderr: str) -> bool:
+    """True only when the shell clearly did not recognize the command itself."""
+    text = (stderr + "\n" + stdout).lower()
+    if kind == "posix":
+        # 127 is the standard "command not found" exit code. Require empty
+        # stdout so a real program that intentionally exits 127 is not retried.
+        if returncode != 127:
+            return False
+        return not stdout.strip() or "command not found" in text or ": not found" in text
+    if kind == "cmd":
+        return (
+            returncode == 9009
+            or "is not recognized as an internal or external command" in text
+            or "不是内部或外部命令" in text
+        )
+    if kind == "powershell":
+        return (
+            "is not recognized as the name of a cmdlet" in text
+            or "commandnotfoundexception" in text
+            or ("the term '" in text and "is not recognized" in text)
+            or ("无法将" in text and "识别为" in text)
+        )
+    return False
+
+
+def _script_shell_path(shell_state: ShellState, kind: str) -> str | None:
+    for item in shell_state.available:
+        if item.kind == kind:
+            return item.path
+    return None
+
+
+def _script_command(
+    path: str,
+    shell_state: ShellState | None = None,
+) -> tuple[list[str], str, tuple[str, ...]]:
+    shell_state = shell_state or detect_shell_state()
     try:
         with open(path, "rb") as handle:
             first = handle.readline(256)
     except OSError as exc:
         raise ToolError(str(exc)) from exc
     text = first.decode("utf-8", "replace").strip()
+    ext = os.path.splitext(path)[1].lower()
+    windows = sys.platform.startswith("win")
     if text.startswith("#!"):
-        parts = shlex.split(text[2:].strip())
-        if parts:
-            return parts + [path]
-    candidates = SCRIPT_RUNNERS.get(os.path.splitext(path)[1].lower())
+        parts = shlex.split(text[2:].strip(), posix=not windows)
+        skip_windows_shebang = windows and (
+            ext in (".sh", ".bash", ".py") or (parts and parts[0].startswith("/"))
+        )
+        if parts and not skip_windows_shebang:
+            return (
+                parts + [path],
+                shell_state.current.encoding,
+                shell_state.current.fallback_encodings,
+            )
+
+    if ext == ".ps1":
+        runner = _script_shell_path(shell_state, "powershell")
+        if not runner:
+            runner = shutil.which("pwsh") or shutil.which("powershell")
+        if not runner:
+            raise ToolError("PowerShell not found for .ps1 script")
+        encoding, fallbacks = _shell_encodings("powershell", os.path.basename(runner).lower())
+        return (
+            [runner, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", path],
+            encoding,
+            fallbacks,
+        )
+
+    if ext in (".bat", ".cmd"):
+        if not windows:
+            raise ToolError("Windows batch scripts require cmd.exe")
+        runner = _script_shell_path(shell_state, "cmd")
+        if not runner:
+            runner = os.environ.get("COMSPEC") or shutil.which("cmd")
+        if not runner:
+            raise ToolError("cmd.exe not found for batch script")
+        encoding, fallbacks = _shell_encodings("cmd", "cmd")
+        return [runner, "/d", "/s", "/c", path], encoding, fallbacks
+
+    if ext in (".sh", ".bash"):
+        runner: str | None
+        if shell_state.current.kind == "posix":
+            runner = shell_state.current.path
+        else:
+            runner = (
+                _find_git_bash(shutil.which, os.environ)
+                or shutil.which("bash")
+                or shutil.which("sh")
+                or "/bin/sh"
+            )
+        if not _is_executable_file(runner):
+            raise ToolError(f"shell not found for {ext} script")
+        name, kind = _infer_shell(runner, sys.platform)
+        encoding, fallbacks = _shell_encodings(kind, name)
+        return [runner, path], encoding, fallbacks
+
+    candidates = SCRIPT_RUNNERS.get(ext)
     if candidates:
         for candidate in candidates:
             if os.path.isabs(candidate):
-                if os.access(candidate, os.X_OK):
-                    return [candidate, path]
+                if _is_executable_file(candidate):
+                    return (
+                        [candidate, path],
+                        shell_state.current.encoding,
+                        shell_state.current.fallback_encodings,
+                    )
                 continue
             found = shutil.which(candidate)
             if found:
-                return [found, path]
-        raise ToolError(f"interpreter not found for {os.path.splitext(path)[1]}: {', '.join(candidates)}")
+                return (
+                    [found, path],
+                    shell_state.current.encoding,
+                    shell_state.current.fallback_encodings,
+                )
+        raise ToolError(f"interpreter not found for {ext}: {', '.join(candidates)}")
     if os.access(path, os.X_OK):
-        return [path]
+        return [path], shell_state.current.encoding, shell_state.current.fallback_encodings
     raise ToolError(
         f"cannot determine how to run {os.path.basename(path)}; add a shebang or use a supported extension"
     )
+
+
+def _walk_glob_paths(root: str, pattern: str) -> list[str]:
+    """Walk only the directories the pattern needs, pruning SKIP_DIRS."""
+    parts = [part for part in pattern.replace(os.sep, "/").split("/") if part not in ("", ".")]
+    if not parts:
+        return []
+    results: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path not in seen:
+            seen.add(path)
+            results.append(path)
+
+    def walk(base: str, index: int) -> None:
+        if len(results) >= MAX_GLOB_RESULTS:
+            return
+        if index >= len(parts):
+            add(base)
+            return
+        part = parts[index]
+        last = index == len(parts) - 1
+        try:
+            with os.scandir(base) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name.lower())
+        except OSError:
+            return
+        if part == "**":
+            walk(base, index + 1)
+            for entry in entries:
+                if len(results) >= MAX_GLOB_RESULTS:
+                    return
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir:
+                    if entry.name in SKIP_DIRS:
+                        continue
+                    if last:
+                        add(entry.path)
+                    walk(entry.path, index)
+                elif last:
+                    add(entry.path)
+            return
+        for entry in entries:
+            if len(results) >= MAX_GLOB_RESULTS:
+                return
+            if not fnmatch.fnmatch(entry.name, part):
+                continue
+            if last:
+                add(entry.path)
+                continue
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_dir or entry.name in SKIP_DIRS:
+                continue
+            walk(entry.path, index + 1)
+
+    walk(root, 0)
+    return results
 
 
 class Workspace:
@@ -2444,13 +4049,19 @@ class Workspace:
         allow_shell: bool = True,
         skills: dict[str, dict[str, Any]] | None = None,
         allow_skill_scripts: bool = True,
+        shell_state: ShellState | None = None,
     ) -> None:
         self.root = os.path.realpath(root)
         self.confirm = confirm
         self.allow_shell = allow_shell
         self.skills = skills or {}
         self.allow_skill_scripts = allow_skill_scripts
+        self.shell_state = shell_state or detect_shell_state()
         self.interactive = sys.stdin.isatty()
+
+    @property
+    def shell(self) -> ShellInfo:
+        return self.shell_state.current
 
     # -- helpers ---------------------------------------------------------- #
 
@@ -2514,11 +4125,12 @@ class Workspace:
         limit = max(1, min(int(limit), MAX_FILE_LINES))
         try:
             with open(full, "r", encoding="utf-8", errors="replace") as handle:
-                chunk = list(islice(handle, offset - 1, offset - 1 + limit))
-                more = next(handle, None) is not None
+                lines = list(islice(handle, offset - 1, offset - 1 + limit + 1))
         except OSError as exc:
             raise ToolError(str(exc)) from exc
 
+        more = len(lines) > limit
+        chunk = lines[:limit]
         if not chunk:
             return f"(no lines at offset {offset})"
         if "\x00" in "".join(chunk[:8]):
@@ -2547,17 +4159,38 @@ class Workspace:
         limit = max(1, min(int(max_results), 500))
         name_glob = include.strip() or "*"
         hits: list[str] = []
+        start = time.monotonic()
+        files_scanned = 0
+        bytes_scanned = 0
+        budget_hit = False
         for dirpath, dirnames, filenames in os.walk(full):
             dirnames[:] = sorted(name for name in dirnames if name not in SKIP_DIRS)
             for filename in sorted(filenames):
+                if budget_hit:
+                    break
                 if not fnmatch.fnmatch(filename, name_glob):
+                    continue
+                if os.path.splitext(filename)[1].lower() in SKIP_EXTENSIONS:
                     continue
                 file_path = os.path.join(dirpath, filename)
                 try:
-                    if os.path.getsize(file_path) > MAX_SEARCH_FILE:
-                        continue
+                    size = os.path.getsize(file_path)
+                except OSError:
+                    continue
+                if size > MAX_SEARCH_FILE:
+                    continue
+                if (
+                    files_scanned >= MAX_SEARCH_FILES
+                    or bytes_scanned + size > MAX_SEARCH_BYTES
+                    or time.monotonic() - start > MAX_SEARCH_SECONDS
+                ):
+                    budget_hit = True
+                    break
+                try:
                     if os.path.commonpath([os.path.realpath(file_path), self.root]) != self.root:
                         continue
+                    files_scanned += 1
+                    bytes_scanned += size
                     with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
                         for number, line in enumerate(handle, 1):
                             if "\x00" in line:
@@ -2569,6 +4202,11 @@ class Workspace:
                                     return "\n".join(hits)
                 except (OSError, ValueError):
                     continue
+        if budget_hit:
+            hits.append(
+                f"... (stopped after scan budget: {files_scanned} files, "
+                f"{bytes_scanned // (1024 * 1024)} MB)"
+            )
         return "\n".join(hits) or "(no matches)"
 
     def glob(self, pattern: str, path: str = ".") -> str:
@@ -2577,8 +4215,17 @@ class Workspace:
             raise ToolError(f"not a directory: {path}")
         if not pattern.strip():
             raise ToolError("pattern must not be empty")
+        normalized = pattern.replace(os.sep, "/")
+        if os.path.isabs(pattern) or ".." in normalized.split("/"):
+            candidates = (
+                glob_mod.iglob(pattern, recursive=True)
+                if os.path.isabs(pattern)
+                else glob_mod.iglob(os.path.join(full, pattern), recursive=True)
+            )
+        else:
+            candidates = _walk_glob_paths(full, normalized)
         matches: list[str] = []
-        for match in glob_mod.iglob(os.path.join(full, pattern), recursive=True):
+        for match in candidates:
             real = os.path.realpath(match)
             try:
                 if os.path.commonpath([real, self.root]) != self.root:
@@ -2594,17 +4241,38 @@ class Workspace:
                 break
         return "\n".join(sorted(matches)) or "(no matches)"
 
+    def _write_text(self, full: str, text: str, newline: str | None = None) -> None:
+        """Atomically replace a text file using a sibling temporary file."""
+        parent = os.path.dirname(full)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        directory = parent or "."
+        temp_path = os.path.join(directory, f".benben-{os.getpid()}-{secrets.token_hex(4)}")
+        descriptor = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline=newline) as handle:
+                handle.write(text)
+            try:
+                mode = os.stat(full).st_mode & 0o777
+            except OSError:
+                mode = None
+            if mode is not None:
+                os.chmod(temp_path, mode)
+            os.replace(temp_path, full)
+        except OSError:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
     def write_file(self, path: str, content: str) -> str:
         full = self._resolve(path)
         preview = content if len(content) <= 300 else content[:300] + "..."
         if not self._approve("write_file", f"{self._display(full)}\n{preview}"):
             raise ToolError("permission denied by user")
         try:
-            parent = os.path.dirname(full)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(full, "w", encoding="utf-8") as handle:
-                handle.write(content)
+            self._write_text(full, content)
         except OSError as exc:
             raise ToolError(str(exc)) from exc
         return f"wrote {len(content)} characters to {self._display(full)}"
@@ -2644,8 +4312,7 @@ class Workspace:
         if not self._approve("edit_file", detail):
             raise ToolError("permission denied by user")
         try:
-            with open(full, "w", encoding="utf-8", newline="") as handle:
-                handle.write(updated)
+            self._write_text(full, updated, newline="")
         except OSError as exc:
             raise ToolError(str(exc)) from exc
         return f"edited {self._display(full)} ({replaced} replacement{suffix})"
@@ -2655,11 +4322,7 @@ class Workspace:
         full = os.path.realpath(path if os.path.isabs(path) else os.path.join(self.root, path))
         existed = os.path.exists(full)
         try:
-            parent = os.path.dirname(full)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(full, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(text)
+            self._write_text(full, text, newline="\n")
         except OSError as exc:
             raise ToolError(str(exc)) from exc
         shown = self._display(full)
@@ -2736,7 +4399,7 @@ class Workspace:
             args = []
         if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
             raise ToolError("args must be a list of strings")
-        command = _script_command(full)
+        command, encoding, fallbacks = _script_command(full, self.shell_state)
         preview = f"{name}/{script}" + (" " + " ".join(args[:10]) if args else "")
         if not self._approve("run_skill_script", preview):
             raise ToolError("permission denied by user")
@@ -2745,9 +4408,40 @@ class Workspace:
         env["BENBEN_SKILL_DIR"] = skill["dir"]
         env["BENBEN_WORKSPACE"] = self.root
         returncode, stdout, stderr, truncated = _capture_process(
-            command + args, self.root, timeout, env=env
+            command + args,
+            self.root,
+            timeout,
+            env=env,
+            encoding=encoding,
+            fallback_encodings=fallbacks,
         )
         parts = [f"exit code: {returncode}"]
+        if stdout:
+            parts.append("stdout:\n" + stdout)
+        if stderr:
+            parts.append("stderr:\n" + stderr)
+        output = "\n".join(parts)
+        if truncated or len(output) > MAX_TOOL_OUTPUT:
+            output = output[:MAX_TOOL_OUTPUT] + "\n... (output truncated)"
+        return output
+
+    def _format_command_result(
+        self,
+        shell: ShellInfo,
+        result: tuple[int, str, str, bool],
+        *,
+        fallback_from: ShellInfo | None = None,
+        note: str | None = None,
+    ) -> str:
+        returncode, stdout, stderr, truncated = result
+        parts = [f"exit code: {returncode}", f"shell: {shell.describe()}"]
+        if fallback_from is not None:
+            parts.append(
+                f"[fallback] {fallback_from.name} could not handle the command; "
+                f"retried with {shell.name}; use switch_shell {shell.name} to make it persistent"
+            )
+        if note:
+            parts.append(f"[fallback] {note}")
         if stdout:
             parts.append("stdout:\n" + stdout)
         if stderr:
@@ -2762,19 +4456,93 @@ class Workspace:
             raise ToolError("the run_command tool is disabled")
         if not command.strip():
             raise ToolError("command must not be empty")
-        if not self._approve("run_command", command, read_only=is_read_only_command(command)):
+        current = self.shell_state.current
+        read_only = is_read_only_command(command, current.kind)
+        if not self._approve("run_command", command, read_only=read_only):
             raise ToolError("permission denied by user")
         timeout = max(1, min(int(timeout_seconds), 300))
-        returncode, stdout, stderr, truncated = _capture_process(command, self.root, timeout, shell=True)
-        parts = [f"exit code: {returncode}"]
-        if stdout:
-            parts.append("stdout:\n" + stdout)
-        if stderr:
-            parts.append("stderr:\n" + stderr)
-        output = "\n".join(parts)
-        if truncated or len(output) > MAX_TOOL_OUTPUT:
-            output = output[:MAX_TOOL_OUTPUT] + "\n... (output truncated)"
-        return output
+
+        candidates: list[ShellInfo] = [current]
+        seen = {os.path.normcase(os.path.realpath(current.path))}
+        for item in self.shell_state.available:
+            key = os.path.normcase(os.path.realpath(item.path))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(item)
+
+        attempts: list[tuple[ShellInfo, tuple[int, str, str, bool]]] = []
+        launch_errors: list[tuple[ShellInfo, str]] = []
+        skipped: list[str] = []
+        current_key = os.path.normcase(os.path.realpath(current.path))
+        for candidate in candidates:
+            is_current = os.path.normcase(os.path.realpath(candidate.path)) == current_key
+            if (
+                not is_current
+                and self.confirm
+                and read_only
+                and not is_read_only_command(command, candidate.kind)
+            ):
+                skipped.append(candidate.name)
+                continue
+            try:
+                result = _capture_process(
+                    candidate.command_argv(command),
+                    self.root,
+                    timeout,
+                    encoding=candidate.encoding,
+                    fallback_encodings=candidate.fallback_encodings,
+                )
+            except ToolError as exc:
+                if "timed out" in str(exc):
+                    raise
+                launch_errors.append((candidate, str(exc)))
+                continue
+            attempts.append((candidate, result))
+            if not _shell_mismatch(candidate.kind, result[0], result[1], result[2]):
+                return self._format_command_result(
+                    candidate,
+                    result,
+                    fallback_from=current if not is_current else None,
+                )
+
+        if not attempts and not launch_errors:
+            raise ToolError("command could not be executed")
+        details = [
+            f"{candidate.name}: {_short_error(result[2], result[1])}"
+            for candidate, result in attempts
+        ]
+        details.extend(f"{candidate.name}: {error}" for candidate, error in launch_errors)
+        if attempts:
+            reason = (
+                "no available shell recognized the command; "
+                "it may not be installed, may be misspelled, or may use unsupported syntax"
+            )
+        else:
+            reason = "no available shell could be started; check the shell installation"
+        note = (
+            "tried: "
+            + " | ".join(details)
+            + "; reason: "
+            + reason
+            + "; suggestion: install the missing tool, check spelling, or use switch_shell"
+        )
+        if skipped:
+            note += "; fallback skipped without approval: " + ", ".join(skipped)
+        result = attempts[0][1] if attempts else (1, "", "", False)
+        return self._format_command_result(current, result, note=note)
+
+    def list_shells(self) -> str:
+        return self.shell_state.describe()
+
+    def switch_shell(self, name: str) -> str:
+        if not isinstance(name, str) or not name.strip():
+            raise ToolError("shell name must be a non-empty string")
+        try:
+            current = self.shell_state.switch(name.strip())
+        except ShellError as exc:
+            raise ToolError(str(exc)) from exc
+        return f"switched shell to: {current.describe()}"
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> str:
         handlers = {
@@ -2785,6 +4553,8 @@ class Workspace:
             "write_file": self.write_file,
             "edit_file": self.edit_file,
             "run_command": self.run_command,
+            "list_shells": self.list_shells,
+            "switch_shell": self.switch_shell,
         }
         if self.skills:
             handlers["load_skill"] = self.load_skill
@@ -2841,7 +4611,21 @@ def run_turn(
 
     try:
         for _ in range(max_steps):
-            reply = client.chat(messages, tools if tools is not None else TOOL_SCHEMAS)
+            shell_state = getattr(workspace, "shell_state", None)
+            if (
+                shell_state is not None
+                and shell_state.dirty
+                and messages
+                and isinstance(messages[0], dict)
+                and messages[0].get("role") == "system"
+            ):
+                messages[0]["content"] = build_system_prompt(
+                    workspace.root,
+                    workspace.skills,
+                    shell_state,
+                )
+                shell_state.dirty = False
+            reply = client.chat(messages, tools if tools is not None else tool_schemas(workspace))
             if client.last_reasoning_ignored and not reasoning_warned:
                 reasoning_warned = True
                 label = client.reasoning.label if client.reasoning is not None else "off"
@@ -3148,10 +4932,14 @@ def _print_thinking(text: str) -> None:
 
 
 def print_help() -> None:
-    print("Commands: /help, /reset, /compact [N], /skill [name [question]],")
+    print("Commands: /help, /connect [list|use <name>|delete <name>|provider],")
+    print("          /reset, /compact [N], /skill [name [question]],")
     print("          /image [path|clear], /save [--tool] [--thinking] [file],")
     print("          /confirm on|off, /thinking on|off, /reasoning provider:level,")
-    print("          /model [name|number|list], /exit (Ctrl-D)")
+    print("          /model [name|number|list], /shell [name|path|list|auto],")
+    print("          /exit (Ctrl-D)")
+    print("Connect:  /connect opens the wizard; saved connections live in")
+    print(f"          {default_config_path()}")
     print("Skills: off by default; enable with --skill (dirs: <cwd>/.agents|.claude|.codex/skills,")
     print("        ~/.benben-agent/skills, ~/.agents/skills, ~/.claude/skills, ~/.codex/skills)")
     print(f"Sessions are saved to {SESSION_DIR}; list with --list, resume with -c <id>.")
@@ -3369,6 +5157,27 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .lightbox { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 100; background: rgba(0, 0, 0, 0.82); display: flex; align-items: center; justify-content: center; padding: 24px; cursor: zoom-out; }
 .lightbox[hidden] { display: none; }
 .lightbox img { max-width: 96vw; max-height: 92vh; border-radius: 6px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); }
+.link-button { width: 100%; margin-top: 6px; padding: 5px 8px; border: 1px solid #c9ced6; border-radius: 6px; background: #f9fafb; color: #475467; cursor: pointer; }
+.link-button:hover { background: #f1f3f6; }
+.modal { position: fixed; inset: 0; z-index: 90; background: rgba(15, 23, 42, 0.45); display: flex; align-items: center; justify-content: center; padding: 20px; }
+.modal[hidden] { display: none; }
+.modal-card { width: 520px; max-width: 100%; max-height: 90vh; overflow-y: auto; background: #fff; border-radius: 10px; box-shadow: 0 18px 60px rgba(15, 23, 42, 0.3); padding: 16px 18px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.modal-head .close { border: 0; background: transparent; font-size: 22px; line-height: 1; color: #8a919c; cursor: pointer; }
+.modal-head .close:hover { color: #222; }
+.form-row { margin-bottom: 10px; }
+.form-row label { display: block; color: #667085; font-size: 12px; margin-bottom: 4px; }
+.form-row input, .form-row select { width: 100%; padding: 7px 8px; border: 1px solid #c9ced6; border-radius: 6px; background: #fff; font: inherit; }
+.conn-model-row { display: flex; gap: 6px; }
+.conn-model-row input { flex: 1; min-width: 0; }
+.conn-model-row button { flex: none; padding: 6px 10px; border: 1px solid #c9ced6; border-radius: 6px; background: #f9fafb; cursor: pointer; }
+.modal-actions { display: flex; gap: 8px; margin-top: 14px; }
+.modal-actions button { padding: 6px 12px; border: 1px solid #c9ced6; border-radius: 6px; background: #f9fafb; cursor: pointer; }
+.modal-actions button.primary { background: #4a6cf7; border-color: #4a6cf7; color: #fff; }
+.modal-actions button.danger { color: #d92d20; }
+.modal-actions button:disabled { color: #b0b6c0; cursor: default; }
+.modal-warning { margin-bottom: 10px; padding: 7px 9px; border-radius: 6px; background: #fff7e6; color: #93640b; font-size: 12px; }
+.modal-status { min-height: 18px; color: #667085; font-size: 12px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -3378,6 +5187,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
     <div class="model-row">
       <label for="model">模型</label>
       <select id="model"></select>
+      <button id="connect" class="link-button">连接设置</button>
     </div>
     <button id="new">+ 新会话</button>
     <div id="sessions"></div>
@@ -3396,6 +5206,64 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
       </div>
     </div>
   </main>
+</div>
+<div id="connect-modal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong>连接设置</strong>
+      <button id="connect-close" class="close" type="button" title="关闭">×</button>
+    </div>
+    <div id="connect-env" class="modal-warning" hidden></div>
+    <div class="form-row">
+      <label for="conn-list">已保存连接</label>
+      <select id="conn-list"></select>
+    </div>
+    <div class="form-row">
+      <label for="conn-provider">服务商</label>
+      <select id="conn-provider">
+        <option value="deepseek">DeepSeek</option>
+        <option value="minimax">MiniMax</option>
+        <option value="custom">自定义</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="conn-format">协议</label>
+      <select id="conn-format"></select>
+    </div>
+    <div class="form-row">
+      <label for="conn-base">Base URL</label>
+      <input id="conn-base" autocomplete="off">
+    </div>
+    <div class="form-row">
+      <label for="conn-key">API Key</label>
+      <input id="conn-key" type="password" autocomplete="new-password" placeholder="留空保持原值">
+    </div>
+    <div class="form-row" id="conn-auth-row" hidden>
+      <label for="conn-auth">Anthropic 认证</label>
+      <select id="conn-auth">
+        <option value="x-api-key">x-api-key</option>
+        <option value="bearer">bearer</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="conn-model">模型</label>
+      <div class="conn-model-row">
+        <input id="conn-model" list="conn-model-options" autocomplete="off">
+        <datalist id="conn-model-options"></datalist>
+        <button id="conn-fetch" type="button">获取模型</button>
+      </div>
+    </div>
+    <div class="form-row">
+      <label for="conn-name">连接名称</label>
+      <input id="conn-name" autocomplete="off">
+    </div>
+    <div id="connect-status" class="modal-status"></div>
+    <div class="modal-actions">
+      <button id="conn-save" class="primary" type="button">保存并使用</button>
+      <button id="conn-use" type="button">使用</button>
+      <button id="conn-delete" class="danger" type="button">删除</button>
+    </div>
+  </div>
 </div>
 <div id="lightbox" class="lightbox" hidden>
   <img id="lightbox-img" alt="">
@@ -3419,8 +5287,30 @@ const previewsEl = document.getElementById("previews");
 const modelEl = document.getElementById("model");
 const lightboxEl = document.getElementById("lightbox");
 const lightboxImg = document.getElementById("lightbox-img");
+const connectEl = document.getElementById("connect");
+const connectModalEl = document.getElementById("connect-modal");
+const connectCloseEl = document.getElementById("connect-close");
+const connectEnvEl = document.getElementById("connect-env");
+const connListEl = document.getElementById("conn-list");
+const connProviderEl = document.getElementById("conn-provider");
+const connFormatEl = document.getElementById("conn-format");
+const connBaseEl = document.getElementById("conn-base");
+const connKeyEl = document.getElementById("conn-key");
+const connAuthRowEl = document.getElementById("conn-auth-row");
+const connAuthEl = document.getElementById("conn-auth");
+const connModelEl = document.getElementById("conn-model");
+const connModelOptionsEl = document.getElementById("conn-model-options");
+const connNameEl = document.getElementById("conn-name");
+const connFetchEl = document.getElementById("conn-fetch");
+const connSaveEl = document.getElementById("conn-save");
+const connUseEl = document.getElementById("conn-use");
+const connDeleteEl = document.getElementById("conn-delete");
+const connectStatusEl = document.getElementById("connect-status");
 
 let lightboxObjectUrl = null;
+let connectionsData = null;
+let editingConnection = "";
+let loadingConnectionForm = false;
 
 function openLightbox(src, objectUrl) {
   if (lightboxObjectUrl) {
@@ -3464,7 +5354,12 @@ async function loadStoredImage(id, name) {
 
 lightboxEl.addEventListener("click", closeLightbox);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !lightboxEl.hidden) closeLightbox();
+  if (event.key !== "Escape") return;
+  if (!connectModalEl.hidden) {
+    closeConnectModal();
+  } else if (!lightboxEl.hidden) {
+    closeLightbox();
+  }
 });
 logEl.addEventListener("dblclick", (event) => {
   if (event.target instanceof HTMLImageElement) openLightbox(event.target.src);
@@ -3779,6 +5674,261 @@ async function loadModels() {
   }
 }
 
+function setSelectOptions(element, options, value) {
+  element.textContent = "";
+  for (const item of options) {
+    const option = document.createElement("option");
+    option.value = item.value;
+    option.textContent = item.label;
+    element.appendChild(option);
+  }
+  if (value !== undefined && value !== null) element.value = value;
+}
+
+function connectionPreset(provider) {
+  if (!connectionsData || !connectionsData.presets) return null;
+  return connectionsData.presets[provider] || null;
+}
+
+function fillConnectionFormats(formats, value) {
+  const list = (formats && formats.length) ? formats : ["openai-chat-completions"];
+  setSelectOptions(connFormatEl, list.map(name => ({ value: name, label: name })), value || list[0]);
+}
+
+function applyConnectionPreset(provider, preferredFormat) {
+  const preset = connectionPreset(provider);
+  const formats = preset ? (preset.formats || connectionsData.protocols) : (connectionsData ? connectionsData.protocols : ["openai-chat-completions"]);
+  let format = preferredFormat || (preset ? preset.default_format : formats[0]);
+  if (!formats.includes(format)) format = preset ? preset.default_format : formats[0];
+  fillConnectionFormats(formats, format);
+  if (preset && preset.base_urls && preset.base_urls[format]) connBaseEl.value = preset.base_urls[format];
+  if (preset && preset.anthropic_auth) connAuthEl.value = preset.anthropic_auth;
+  connAuthRowEl.hidden = format !== "anthropic-messages";
+}
+
+function renderConnectionList() {
+  const connections = (connectionsData && connectionsData.connections) || [];
+  const options = [{ value: "", label: "＋ 新建连接" }];
+  for (const item of connections) {
+    const suffix = item.runtime ? " (当前)" : item.active ? " (已保存)" : "";
+    options.push({ value: item.name, label: item.name + suffix });
+  }
+  setSelectOptions(connListEl, options, editingConnection);
+}
+
+function loadConnectionForm(name) {
+  loadingConnectionForm = true;
+  try {
+    editingConnection = name || "";
+    connectStatusEl.textContent = "";
+    connModelOptionsEl.textContent = "";
+    connKeyEl.value = "";
+    if (!name) {
+      connNameEl.value = "";
+      connProviderEl.value = "deepseek";
+      const preset = connectionPreset("deepseek");
+      const format = preset ? preset.default_format : "openai-chat-completions";
+      fillConnectionFormats(preset ? preset.formats : (connectionsData ? connectionsData.protocols : [format]), format);
+      connBaseEl.value = preset && preset.base_urls ? (preset.base_urls[format] || "") : "";
+      connModelEl.value = "";
+      connAuthEl.value = preset && preset.anthropic_auth ? preset.anthropic_auth : "x-api-key";
+      connAuthRowEl.hidden = format !== "anthropic-messages";
+      connKeyEl.placeholder = "留空使用 OPENAI_API_KEY";
+      connUseEl.disabled = true;
+      connDeleteEl.disabled = true;
+      return;
+    }
+    const item = ((connectionsData && connectionsData.connections) || []).find(value => value.name === name);
+    if (!item) {
+      editingConnection = "";
+      loadConnectionForm("");
+      return;
+    }
+    connNameEl.value = item.name;
+    connProviderEl.value = item.provider || "custom";
+    const preset = connectionPreset(connProviderEl.value);
+    const formats = preset && preset.formats && preset.formats.includes(item.api_format)
+      ? preset.formats
+      : (connectionsData ? connectionsData.protocols : [item.api_format]);
+    fillConnectionFormats(formats, item.api_format);
+    connFormatEl.value = item.api_format;
+    connBaseEl.value = item.base_url;
+    connModelEl.value = item.model;
+    connAuthEl.value = item.anthropic_auth || "x-api-key";
+    connAuthRowEl.hidden = item.api_format !== "anthropic-messages";
+    connKeyEl.placeholder = item.has_key ? "留空保持原值" : "留空使用环境变量";
+    connUseEl.disabled = false;
+    connDeleteEl.disabled = Boolean(item.runtime || item.active);
+  } finally {
+    loadingConnectionForm = false;
+  }
+}
+
+async function refreshConnections() {
+  const data = await api("/api/connections");
+  connectionsData = data;
+  if (data.env_overrides && data.env_overrides.length) {
+    connectEnvEl.textContent = "当前环境变量会覆盖保存的连接：" + data.env_overrides.join("、");
+    connectEnvEl.hidden = false;
+  } else {
+    connectEnvEl.hidden = true;
+  }
+  const names = data.connections.map(item => item.name);
+  if (editingConnection && !names.includes(editingConnection)) editingConnection = "";
+  if (!editingConnection) {
+    const runtime = data.connections.find(item => item.runtime) || data.connections.find(item => item.active);
+    if (runtime) editingConnection = runtime.name;
+  }
+  renderConnectionList();
+  loadConnectionForm(editingConnection);
+}
+
+async function openConnectModal() {
+  connectModalEl.hidden = false;
+  connectStatusEl.textContent = "";
+  connKeyEl.value = "";
+  try {
+    await refreshConnections();
+  } catch (err) {
+    connectStatusEl.textContent = String(err);
+  }
+}
+
+function closeConnectModal() {
+  connectModalEl.hidden = true;
+}
+
+async function fetchConnectionModels() {
+  const payload = {
+    provider: connProviderEl.value,
+    base_url: connBaseEl.value.trim(),
+    api_format: connFormatEl.value,
+    model: connModelEl.value.trim(),
+    anthropic_auth: connAuthEl.value,
+  };
+  if (editingConnection) payload.name = editingConnection;
+  if (connKeyEl.value) payload.api_key = connKeyEl.value;
+  connFetchEl.disabled = true;
+  connectStatusEl.textContent = "正在获取模型列表…";
+  try {
+    const data = await api("/api/connections/models", payload);
+    connModelOptionsEl.textContent = "";
+    for (const name of data.models || []) {
+      const option = document.createElement("option");
+      option.value = name;
+      connModelOptionsEl.appendChild(option);
+    }
+    if (!connModelEl.value && data.models && data.models.length) connModelEl.value = data.models[0];
+    connectStatusEl.textContent = "找到 " + ((data.models || []).length) + " 个模型";
+  } catch (err) {
+    connectStatusEl.textContent = "获取失败: " + String(err);
+  } finally {
+    connFetchEl.disabled = false;
+  }
+}
+
+async function saveConnection() {
+  const name = connNameEl.value.trim();
+  if (!name) {
+    connectStatusEl.textContent = "请填写连接名称";
+    connNameEl.focus();
+    return;
+  }
+  if (!connModelEl.value.trim()) {
+    connectStatusEl.textContent = "请填写或选择模型";
+    connModelEl.focus();
+    return;
+  }
+  const payload = {
+    name: name,
+    provider: connProviderEl.value,
+    base_url: connBaseEl.value.trim(),
+    api_format: connFormatEl.value,
+    model: connModelEl.value.trim(),
+    anthropic_auth: connAuthEl.value,
+    make_active: true,
+  };
+  if (connKeyEl.value) payload.api_key = connKeyEl.value;
+  connSaveEl.disabled = true;
+  connectStatusEl.textContent = "正在保存…";
+  try {
+    const data = await api("/api/connections/save", payload);
+    editingConnection = name;
+    currentModel = data.connection.model;
+    setModelOptions([currentModel], currentModel);
+    let message = "已保存并切换: " + name;
+    if (data.reasoning_warning) message += "；" + data.reasoning_warning;
+    await refreshConnections();
+    connectStatusEl.textContent = message;
+    await loadModels();
+  } catch (err) {
+    connectStatusEl.textContent = "保存失败: " + String(err);
+  } finally {
+    connSaveEl.disabled = false;
+  }
+}
+
+async function useConnection() {
+  if (!editingConnection) return;
+  connUseEl.disabled = true;
+  connectStatusEl.textContent = "正在切换…";
+  try {
+    const data = await api("/api/connections/use", { name: editingConnection });
+    currentModel = data.model;
+    setModelOptions([currentModel], currentModel);
+    let message = "已切换: " + editingConnection;
+    if (data.reasoning_warning) message += "；" + data.reasoning_warning;
+    await refreshConnections();
+    connectStatusEl.textContent = message;
+    await loadModels();
+  } catch (err) {
+    connectStatusEl.textContent = "切换失败: " + String(err);
+  } finally {
+    connUseEl.disabled = false;
+  }
+}
+
+async function deleteConnection() {
+  if (!editingConnection) return;
+  if (!window.confirm("删除连接 " + editingConnection + "？")) return;
+  connDeleteEl.disabled = true;
+  connectStatusEl.textContent = "正在删除…";
+  try {
+    await api("/api/connections/delete", { name: editingConnection });
+    editingConnection = "";
+    await refreshConnections();
+    connectStatusEl.textContent = "已删除连接";
+  } catch (err) {
+    connDeleteEl.disabled = false;
+    connectStatusEl.textContent = "删除失败: " + String(err);
+  }
+}
+
+connListEl.onchange = () => loadConnectionForm(connListEl.value);
+connProviderEl.onchange = () => {
+  if (loadingConnectionForm) return;
+  const preset = connectionPreset(connProviderEl.value);
+  applyConnectionPreset(connProviderEl.value, preset ? preset.default_format : connFormatEl.value);
+};
+connFormatEl.onchange = () => {
+  if (loadingConnectionForm) return;
+  const preset = connectionPreset(connProviderEl.value);
+  if (preset && preset.base_urls && preset.base_urls[connFormatEl.value]) {
+    connBaseEl.value = preset.base_urls[connFormatEl.value];
+  }
+  if (preset && preset.anthropic_auth) connAuthEl.value = preset.anthropic_auth;
+  connAuthRowEl.hidden = connFormatEl.value !== "anthropic-messages";
+};
+connFetchEl.onclick = fetchConnectionModels;
+connSaveEl.onclick = saveConnection;
+connUseEl.onclick = useConnection;
+connDeleteEl.onclick = deleteConnection;
+connectEl.onclick = openConnectModal;
+connectCloseEl.onclick = closeConnectModal;
+connectModalEl.addEventListener("click", (event) => {
+  if (event.target === connectModalEl) closeConnectModal();
+});
+
 modelEl.onchange = async () => {
   const name = modelEl.value;
   try {
@@ -3881,10 +6031,50 @@ filesEl.onchange = () => {
   }
 };
 
+function formatShellState(data) {
+  const current = data.current || {};
+  const lines = [
+    "current shell: " + (current.name || "?") + " (" + (current.path || "?") + ", " + (current.kind || "?") + ")",
+    "available:",
+  ];
+  for (const item of data.available || []) {
+    const marker = item.path === current.path ? "*" : " ";
+    lines.push(marker + " " + item.name + ": " + item.path + " (" + item.kind + ")");
+  }
+  return lines.join("\n");
+}
+
+async function handleShellCommand(argument) {
+  const value = (argument || "").trim();
+  try {
+    if (!value || value.toLowerCase() === "list") {
+      const data = await api("/api/shells");
+      addLine("tool", formatShellState(data));
+      return;
+    }
+    const data = await api("/api/shell", { name: value });
+    addLine("tool", "shell switched: " + formatShellState(data).split("\n")[0]);
+    statusEl.textContent = "shell: " + data.current.name;
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
+}
+
 async function send() {
   const text = inputEl.value.trim();
   if ((!text && uploads.length === 0) || reading > 0 || sendEl.disabled) return;
   if (!token) { statusEl.textContent = "缺少 token"; return; }
+  const shellMatch = text.match(/^\/shell(?:\s+(.*))?$/);
+  if (shellMatch) {
+    inputEl.value = "";
+    handleShellCommand(shellMatch[1] || "");
+    return;
+  }
+  if (/^\/connect(?:\s+.*)?$/.test(text)) {
+    inputEl.value = "";
+    openConnectModal();
+    return;
+  }
   const compactMatch = text.match(/^\/compact(?:\s+(\d+))?$/);
   if (compactMatch) {
     inputEl.value = "";
@@ -3990,14 +6180,25 @@ def run_web(
     port: int,
     workspace: Workspace,
     client: BaseChatClient,
+    connection: Connection,
+    config_path: str,
+    config: dict[str, Any],
+    client_factory: Callable[[Connection], BaseChatClient],
     max_steps: int,
     show_thinking: bool,
+    reasoning_config: ReasoningConfig | None = None,
 ) -> int:
     token = secrets.token_urlsafe(16)
     token_bytes = token.encode("utf-8")
     lock = threading.Lock()
-    system_message = {"role": "system", "content": build_system_prompt(workspace.root, workspace.skills)}
+    config_lock = threading.Lock()
+    system_message = {
+        "role": "system",
+        "content": build_system_prompt(workspace.root, workspace.skills, workspace.shell_state),
+    }
     state: dict[str, Any] = {"messages": [system_message], "session": None}
+    runtime: dict[str, Any] = {"client": client, "connection": connection}
+    config_state: dict[str, Any] = {"config": config}
     tools = tool_schemas(workspace)
 
     class Handler(BaseHTTPRequestHandler):
@@ -4096,6 +6297,7 @@ def run_web(
 
             events: list[dict[str, str]] = []
             with lock:
+                active_client = runtime["client"]
                 if not message.strip() and not loaded:
                     self._error(400, "empty message")
                     return
@@ -4106,7 +6308,7 @@ def run_web(
                     return
                 if state["session"] is None:
                     try:
-                        state["session"] = create_session(client.model, workspace.root)
+                        state["session"] = create_session(active_client.model, workspace.root)
                     except SessionError as exc:
                         self._error(500, str(exc))
                         return
@@ -4122,7 +6324,7 @@ def run_web(
 
                 try:
                     ok = run_turn(
-                        client,
+                        active_client,
                         workspace,
                         state["messages"],
                         max_steps,
@@ -4140,8 +6342,8 @@ def run_web(
                             "type": "done",
                             "session": state["session"].uuid,
                             "ok": False,
-                            "usage": client.last_turn_usage,
-                            "truncated": client.last_turn_truncated,
+                            "usage": active_client.last_turn_usage,
+                            "truncated": active_client.last_turn_truncated,
                         })
                     else:
                         self._error(502, detail)
@@ -4150,8 +6352,8 @@ def run_web(
                 result = {
                     "session": state["session"].uuid,
                     "ok": ok,
-                    "usage": client.last_turn_usage,
-                    "truncated": client.last_turn_truncated,
+                    "usage": active_client.last_turn_usage,
+                    "truncated": active_client.last_turn_truncated,
                 }
                 if stream:
                     self._sse({"type": "done", **result})
@@ -4217,19 +6419,44 @@ def run_web(
                 self._json(200, {"sessions": session_summaries()})
                 return
             if parsed.path == "/api/models":
+                with config_lock:
+                    active_client = runtime["client"]
                 try:
-                    models = client.list_models()
+                    models = active_client.list_models()
                 except ChatError as exc:
                     self._error(502, str(exc))
                     return
-                self._json(200, {"models": models, "current": client.model})
+                self._json(200, {"models": models, "current": active_client.model})
+                return
+            if parsed.path == "/api/connections":
+                with config_lock:
+                    self._json(
+                        200,
+                        public_connections(
+                            config_state["config"],
+                            config_path,
+                            runtime["connection"].name,
+                        ),
+                    )
+                return
+            if parsed.path == "/api/shells":
+                with lock:
+                    self._json(200, workspace.shell_state.to_dict())
                 return
             if parsed.path == "/api/state":
+                with config_lock:
+                    active_client = runtime["client"]
+                    active_connection = runtime["connection"]
                 with lock:
                     current = state["session"]
                     self._json(200, {
                         "session": current.uuid if current else None,
-                        "model": client.model,
+                        "model": active_client.model,
+                        "connection": active_connection.name,
+                        "base_url": active_connection.base_url,
+                        "api_format": active_connection.api_format,
+                        "config_path": config_path,
+                        "shell": workspace.shell_state.to_dict(),
                         "messages": history_view(state["messages"], lazy_images=True),
                     })
                 return
@@ -4307,11 +6534,241 @@ def run_web(
                 if not isinstance(model, str) or not model.strip():
                     self._error(400, "model must be a non-empty string")
                     return
-                with lock:
-                    client.model = model.strip()
-                    current = client.model
-                    warning = reasoning_model_warning(client.reasoning, client.model)
+                with config_lock:
+                    active_client = runtime["client"]
+                    active_client.model = model.strip()
+                    current = active_client.model
+                    warning = reasoning_model_warning(active_client.reasoning, active_client.model)
                 self._json(200, {"model": current, "reasoning_warning": warning})
+                return
+
+            if parsed.path == "/api/shell":
+                name = payload.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._error(400, "name must be a non-empty string")
+                    return
+                with lock:
+                    try:
+                        workspace.switch_shell(name.strip())
+                    except ToolError as exc:
+                        self._error(400, str(exc))
+                        return
+                    if state["messages"] and state["messages"][0].get("role") == "system":
+                        state["messages"][0]["content"] = build_system_prompt(
+                            workspace.root,
+                            workspace.skills,
+                            workspace.shell_state,
+                        )
+                    workspace.shell_state.dirty = False
+                    self._json(200, workspace.shell_state.to_dict())
+                return
+
+            if parsed.path == "/api/connections/models":
+                connections = config_state["config"].get("connections") or {}
+                raw_name = payload.get("name")
+                existing = connections.get(raw_name) if isinstance(raw_name, str) else {}
+                if not isinstance(existing, dict):
+                    existing = {}
+                base_url = payload.get("base_url") or existing.get("base_url")
+                api_format = payload.get("api_format") or existing.get("api_format") or DEFAULT_API_FORMAT
+                provider = payload.get("provider") or existing.get("provider") or "custom"
+                model = payload.get("model") or existing.get("model") or DEFAULT_MODEL
+                api_key = payload.get("api_key", existing.get("api_key", ""))
+                if api_key is None:
+                    api_key = existing.get("api_key", "")
+                if not isinstance(api_key, str):
+                    self._error(400, "api_key must be a string")
+                    return
+                if not isinstance(provider, str) or not provider.strip():
+                    provider = "custom"
+                if not isinstance(model, str) or not model.strip():
+                    model = DEFAULT_MODEL
+                auth = (
+                    payload.get("anthropic_auth")
+                    or existing.get("anthropic_auth")
+                    or PROVIDER_PRESETS.get(provider, {}).get(
+                        "anthropic_auth", DEFAULT_ANTHROPIC_AUTH
+                    )
+                )
+                version = (
+                    payload.get("anthropic_version")
+                    or existing.get("anthropic_version")
+                    or DEFAULT_ANTHROPIC_VERSION
+                )
+                try:
+                    if api_format not in API_FORMATS:
+                        raise ConfigError(
+                            f"api_format must be one of: {', '.join(API_FORMATS)}"
+                        )
+                    base_url = _validate_base_url(base_url)
+                    if not api_key:
+                        api_key = os.environ.get("OPENAI_API_KEY", "")
+                        if (
+                            not api_key
+                            and base_url.rstrip("/") == DEFAULT_BASE_URL.rstrip("/")
+                        ):
+                            api_key = DEFAULT_API_KEY
+                    probe_connection = Connection(
+                        base_url=base_url,
+                        model=model,
+                        api_format=api_format,
+                        api_key=api_key,
+                        provider=provider,
+                        anthropic_auth=auth,
+                        anthropic_version=version,
+                    )
+                    models = fetch_model_ids(probe_connection)
+                except ConfigError as exc:
+                    self._error(400, str(exc))
+                    return
+                except ChatError as exc:
+                    self._error(502, str(exc))
+                    return
+                self._json(200, {"models": models})
+                return
+
+            if parsed.path == "/api/connections/save":
+                try:
+                    name = _validate_connection_name(payload.get("name"))
+                except ConfigError as exc:
+                    self._error(400, str(exc))
+                    return
+                with config_lock:
+                    cfg = config_state["config"]
+                    connections = cfg.get("connections") or {}
+                    existing = connections.get(name) or {}
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    raw = {
+                        "provider": payload.get("provider") or existing.get("provider") or "custom",
+                        "base_url": payload.get("base_url") or existing.get("base_url"),
+                        "api_format": payload.get("api_format")
+                        or existing.get("api_format")
+                        or DEFAULT_API_FORMAT,
+                        "model": payload.get("model") or existing.get("model"),
+                        "api_key": payload.get("api_key", existing.get("api_key", "")),
+                        "anthropic_auth": payload.get("anthropic_auth")
+                        or existing.get("anthropic_auth"),
+                        "anthropic_version": payload.get("anthropic_version")
+                        or existing.get("anthropic_version"),
+                    }
+                    if raw["api_key"] is None:
+                        raw["api_key"] = existing.get("api_key", "")
+                    try:
+                        normalized = _normalize_profile(name, raw)
+                        saved_connection = connection_from_profile(name, normalized)
+                    except ConfigError as exc:
+                        self._error(400, str(exc))
+                        return
+                    make_active = payload.get("make_active", True)
+                    if not isinstance(make_active, bool):
+                        self._error(400, "make_active must be a boolean")
+                        return
+                    draft = copy.deepcopy(cfg)
+                    draft.setdefault("connections", {})
+                    draft["connections"][name] = normalized
+                    if make_active:
+                        draft["active"] = name
+                    try:
+                        save_config(draft, config_path)
+                    except ConfigError as exc:
+                        self._error(500, str(exc))
+                        return
+                    config_state["config"] = draft
+                    warning = None
+                    if make_active:
+                        runtime["client"] = client_factory(saved_connection)
+                        runtime["connection"] = saved_connection
+                        if (
+                            saved_connection.api_format != "openai-chat-completions"
+                            and reasoning_config is not None
+                        ):
+                            warning = (
+                                "--reasoning is only supported by openai-chat-completions; "
+                                "it will not be sent with this connection"
+                            )
+                    self._json(200, {
+                        "connection": {
+                            "name": name,
+                            "provider": normalized["provider"],
+                            "base_url": normalized["base_url"],
+                            "api_format": normalized["api_format"],
+                            "model": normalized["model"],
+                            "key_hint": mask_api_key(normalized["api_key"]),
+                            "has_key": bool(normalized["api_key"]),
+                            "active": draft.get("active") == name,
+                        },
+                        "active": draft.get("active"),
+                        "reasoning_warning": warning,
+                    })
+                return
+
+            if parsed.path == "/api/connections/use":
+                name = payload.get("name")
+                if not isinstance(name, str) or not name:
+                    self._error(400, "name must be a non-empty string")
+                    return
+                with config_lock:
+                    cfg = config_state["config"]
+                    connections = cfg.get("connections") or {}
+                    if name not in connections:
+                        self._error(404, f"unknown connection: {name}")
+                        return
+                    try:
+                        selected = connection_from_profile(name, connections[name])
+                    except ConfigError as exc:
+                        self._error(400, str(exc))
+                        return
+                    draft = copy.deepcopy(cfg)
+                    draft["active"] = name
+                    try:
+                        save_config(draft, config_path)
+                    except ConfigError as exc:
+                        self._error(500, str(exc))
+                        return
+                    config_state["config"] = draft
+                    runtime["client"] = client_factory(selected)
+                    runtime["connection"] = selected
+                    warning = None
+                    if (
+                        selected.api_format != "openai-chat-completions"
+                        and reasoning_config is not None
+                    ):
+                        warning = (
+                            "--reasoning is only supported by openai-chat-completions; "
+                            "it will not be sent with this connection"
+                        )
+                    self._json(200, {
+                        "active": name,
+                        "model": selected.model,
+                        "api_format": selected.api_format,
+                        "reasoning_warning": warning,
+                    })
+                return
+
+            if parsed.path == "/api/connections/delete":
+                name = payload.get("name")
+                if not isinstance(name, str) or not name:
+                    self._error(400, "name must be a non-empty string")
+                    return
+                with config_lock:
+                    cfg = config_state["config"]
+                    connections = cfg.get("connections") or {}
+                    if name not in connections:
+                        self._error(404, f"unknown connection: {name}")
+                        return
+                    if cfg.get("active") == name or runtime["connection"].name == name:
+                        self._error(400, "cannot delete the active connection")
+                        return
+                    draft = copy.deepcopy(cfg)
+                    del draft["connections"][name]
+                    try:
+                        save_config(draft, config_path)
+                    except ConfigError as exc:
+                        self._error(500, str(exc))
+                        return
+                    config_state["config"] = draft
+                    self._json(200, {"deleted": name, "active": draft.get("active")})
                 return
 
             if parsed.path == "/api/compact":
@@ -4324,7 +6781,7 @@ def run_web(
                         self._error(400, "nothing to compact (start a conversation first)")
                         return
                     try:
-                        stats = compact_history(client, state["messages"], state["session"], keep)
+                        stats = compact_history(runtime["client"], state["messages"], state["session"], keep)
                     except CompactError as exc:
                         self._error(400, str(exc))
                         return
@@ -4355,12 +6812,16 @@ def run_web(
     bound_port = server.server_address[1]
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     print(f"web ui: http://{display_host}:{bound_port}/?token={token}", flush=True)
-    if isinstance(client, AnthropicClient):
-        print("[web] api: anthropic-messages", file=sys.stderr)
-    elif isinstance(client, ResponsesClient):
-        print("[web] api: openai-responses", file=sys.stderr)
-    if client.reasoning is not None:
-        print(f"[web] reasoning: {client.reasoning.label}", file=sys.stderr)
+    active_client = runtime["client"]
+    active_connection = runtime["connection"]
+    print(
+        f"[web] connection: {active_connection.name or 'custom'} | "
+        f"model: {active_client.model} | api: {active_connection.api_format}",
+        file=sys.stderr,
+    )
+    print(f"[web] shell: {workspace.shell_state.current.describe()}", file=sys.stderr)
+    if active_client.reasoning is not None:
+        print(f"[web] reasoning: {active_client.reasoning.label}", file=sys.stderr)
     if workspace.allow_shell:
         print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr)
     if workspace.allow_skill_scripts and any(
@@ -4385,19 +6846,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("prompt", nargs="*", help="task to run; omit for interactive mode")
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("OPENAI_BASE_URL", DEFAULT_BASE_URL),
-        help="API base URL, e.g. http://localhost:8000/v1 (default: %(default)s)",
+        default=None,
+        help="API base URL, e.g. http://localhost:8000/v1 (default: saved connection, $OPENAI_BASE_URL, then built-in)",
     )
     parser.add_argument(
         "--api-key",
-        default=os.environ.get("OPENAI_API_KEY") or DEFAULT_API_KEY,
-        help="API key (default: $OPENAI_API_KEY)",
+        default=None,
+        help="API key (default: saved connection, $OPENAI_API_KEY, then built-in)",
     )
     parser.add_argument(
         "-m",
         "--model",
-        default=os.environ.get("OPENAI_MODEL", DEFAULT_MODEL),
-        help="model name (default: %(default)s)",
+        default=None,
+        help="model name (default: saved connection, $OPENAI_MODEL, then built-in)",
     )
     parser.add_argument("--temperature", type=float, default=None, help="sampling temperature (omitted by default)")
     parser.add_argument(
@@ -4409,24 +6870,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--api-format",
         choices=API_FORMATS,
-        default=DEFAULT_API_FORMAT,
+        default=None,
         help=(
-            "wire protocol (default: %(default)s). "
+            "wire protocol (default: saved connection, then %s). "
             "openai-chat-completions: POST /chat/completions; "
             "openai-responses: POST /responses; "
-            "anthropic-messages: POST /v1/messages"
+            "anthropic-messages: POST /v1/messages" % DEFAULT_API_FORMAT
         ),
     )
     parser.add_argument(
         "--anthropic-version",
-        default="2023-06-01",
-        help="Anthropic API version header (default: %(default)s)",
+        default=None,
+        help="Anthropic API version header (default: saved connection, then 2023-06-01)",
     )
     parser.add_argument(
         "--anthropic-auth",
         choices=("x-api-key", "bearer"),
-        default="x-api-key",
-        help="Anthropic authentication header style (default: x-api-key)",
+        default=None,
+        help="Anthropic authentication header style (default: saved connection, preset, then x-api-key)",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="use a saved connection by name (does not change the saved active connection)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="config file path (default: $BENBEN_CONFIG or ~/.benben-agent/config.json)",
+    )
+    parser.add_argument("--no-config", action="store_true", help="ignore the saved config at startup")
+    parser.add_argument(
+        "--no-env",
+        action="store_true",
+        help="ignore OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL",
+    )
+    parser.add_argument(
+        "--connect",
+        action="store_true",
+        help="open the connection wizard before starting (exits when no prompt/web is given)",
     )
     parser.add_argument("--max-steps", type=int, default=100, help="max model calls per turn (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds (default: %(default)s)")
@@ -4447,6 +6930,15 @@ def main(argv: list[str] | None = None) -> int:
         help="never ask; auto-approve writes and commands (default, alias: --yes)",
     )
     parser.add_argument("--no-shell", action="store_true", help="disable the run_command tool")
+    parser.add_argument(
+        "--shell",
+        default=None,
+        metavar="NAME|PATH",
+        help=(
+            "shell for run_command/skill scripts: auto, pwsh, powershell, git-bash, "
+            "cmd, bash, zsh, sh, or an absolute path (default: auto)"
+        ),
+    )
     parser.add_argument("--plain", action="store_true", help="print raw Markdown instead of terminal rendering")
     parser.add_argument(
         "-i",
@@ -4512,8 +7004,6 @@ def main(argv: list[str] | None = None) -> int:
         help="with --skill, only load ~/.benben-agent/skills; ignore other directories",
     )
     args = parser.parse_args(argv)
-    if args.api_format not in API_FORMATS:
-        parser.error(f"DEFAULT_API_FORMAT must be one of: {', '.join(API_FORMATS)}")
 
     # `-c` may be followed by a prompt; only an 8-hex value is a session id.
     if args.resume is not None and args.resume and not re.fullmatch(r"[0-9a-f]{8}", args.resume):
@@ -4534,18 +7024,112 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_tokens is not None and args.max_tokens <= 0:
         print("error: --max-tokens must be greater than 0", file=sys.stderr)
         return 2
-    if args.api_format != "openai-chat-completions" and reasoning is not None:
+
+    config_path = args.config or default_config_path()
+    config = empty_config()
+    if os.path.exists(config_path):
+        try:
+            config = load_config(config_path)
+        except ConfigError as exc:
+            print(f"warning: {exc}; using CLI/environment/defaults", file=sys.stderr)
+            config = empty_config()
+    # --no-config ignores saved values for startup, but still keeps the file
+    # available to /connect and the web settings panel so a save does not
+    # silently drop other connections.
+    startup_config = empty_config() if args.no_config else config
+
+    reasoning_state: dict[str, Any] = {"config": reasoning}
+
+    def make_client(active_connection: Connection) -> BaseChatClient:
+        active_reasoning = (
+            reasoning_state["config"]
+            if active_connection.api_format == "openai-chat-completions"
+            else None
+        )
+        return build_client(
+            active_connection,
+            timeout=args.timeout,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            reasoning=active_reasoning,
+        )
+
+    connection: Connection | None = None
+    if args.connect:
+        try:
+            defaults = resolve_connection(args, startup_config, use_env=not args.no_env)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        connection = run_connect_wizard(config, config_path, defaults)
+        if connection is None:
+            return 0
+        overrides = env_override_names(config)
+        if overrides and not args.no_env:
+            print(
+                "warning: "
+                + ", ".join(overrides)
+                + " is set and will override the saved connection at next startup "
+                "(unset it or use --no-env)",
+                file=sys.stderr,
+            )
+        if not args.prompt and not args.image and not args.web:
+            return 0
+
+    if connection is None:
+        try:
+            connection = resolve_connection(args, startup_config, use_env=not args.no_env)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if connection.api_format != "openai-chat-completions" and reasoning is not None:
+            print(
+                "error: --reasoning is not supported with --api-format "
+                f"{connection.api_format} yet; use openai-chat-completions",
+                file=sys.stderr,
+            )
+            return 2
+        profile_values = (
+            startup_config.get("connections", {}).get(connection.name, {})
+            if connection.name
+            else {}
+        )
+        env_names = [
+            env_name
+            for field_name, env_name in (
+                ("base_url", "OPENAI_BASE_URL"),
+                ("model", "OPENAI_MODEL"),
+                ("api_key", "OPENAI_API_KEY"),
+            )
+            if connection.sources.get(field_name) == "env"
+            and profile_values.get(field_name)
+        ]
+        if env_names and not args.no_env:
+            print(
+                "warning: "
+                + ", ".join(env_names)
+                + " takes precedence over the saved connection "
+                f"{connection.name!r} (use --no-env to ignore it)",
+                file=sys.stderr,
+            )
+    elif connection.api_format != "openai-chat-completions" and reasoning is not None:
         print(
-            "error: --reasoning is not supported with --api-format "
-            f"{args.api_format} yet; use openai-chat-completions",
+            "warning: --reasoning is only supported by openai-chat-completions; "
+            "it will not be sent with this connection",
             file=sys.stderr,
         )
+
+    try:
+        shell_state = detect_shell_state(args.shell or "auto")
+    except ShellError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     workspace = Workspace(
         args.cwd,
         confirm=False if args.web else args.confirm,
         allow_shell=not args.no_shell,
+        shell_state=shell_state,
     )
     workspace.skills = (
         discover_skills(workspace.root, only_own=args.only_own_skills) if args.skills else {}
@@ -4553,38 +7137,8 @@ def main(argv: list[str] | None = None) -> int:
     workspace.allow_skill_scripts = args.skills and not args.no_skill_scripts
     tools = tool_schemas(workspace)
     render_output = not args.plain and sys.stdout.isatty()
-    client: BaseChatClient
-    if args.api_format == "anthropic-messages":
-        client = AnthropicClient(
-            args.base_url,
-            args.api_key,
-            args.model,
-            timeout=args.timeout,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            anthropic_version=args.anthropic_version,
-            anthropic_auth=args.anthropic_auth,
-        )
-    elif args.api_format == "openai-responses":
-        client = ResponsesClient(
-            args.base_url,
-            args.api_key,
-            args.model,
-            timeout=args.timeout,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-        )
-    else:
-        client = ChatClient(
-            args.base_url,
-            args.api_key,
-            args.model,
-            timeout=args.timeout,
-            temperature=args.temperature,
-            reasoning=reasoning,
-            max_tokens=args.max_tokens,
-        )
-    if reasoning is not None:
+    client: BaseChatClient = make_client(connection)
+    if reasoning is not None and client.reasoning is not None:
         warning = reasoning_model_warning(reasoning, client.model)
         if warning:
             print(f"warning: {warning}", file=sys.stderr)
@@ -4593,9 +7147,24 @@ def main(argv: list[str] | None = None) -> int:
             print("[web] prompt/image arguments are ignored in web mode", file=sys.stderr)
         if args.resume is not None:
             print("[web] -c is ignored in web mode", file=sys.stderr)
-        return run_web(args.host, args.port, workspace, client, args.max_steps, args.thinking)
+        return run_web(
+            args.host,
+            args.port,
+            workspace,
+            client,
+            connection,
+            config_path,
+            config,
+            make_client,
+            args.max_steps,
+            args.thinking,
+            reasoning,
+        )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt(workspace.root, workspace.skills)}
+        {
+            "role": "system",
+            "content": build_system_prompt(workspace.root, workspace.skills, workspace.shell_state),
+        }
     ]
     session = None
     if args.resume is not None:
@@ -4620,7 +7189,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             if session is None:
                 try:
-                    session = create_session(args.model, workspace.root)
+                    session = create_session(client.model, workspace.root)
                 except SessionError as exc:
                     print(f"error: {exc}", file=sys.stderr)
                     return 1
@@ -4633,7 +7202,13 @@ def main(argv: list[str] | None = None) -> int:
 
         show_thinking = args.thinking
         pending_images: list[str] = []
-        print(f"AI agent | model: {args.model} | api: {args.api_format} | workspace: {workspace.root}")
+        connection_label = connection.name or "custom"
+        connection_source = connection.sources.get("base_url", "default")
+        print(
+            f"AI agent | connection: {connection_label} [{connection_source}] | "
+            f"model: {client.model} | api: {connection.api_format} | workspace: {workspace.root}"
+        )
+        print(f"shell: {shell_state.current.describe()}")
         reasoning_label = client.reasoning.label if client.reasoning is not None else "default"
         print(f"confirm: {'on' if workspace.confirm else 'off'} | thinking: {'on' if show_thinking else 'off'} | skills: {'on' if args.skills else 'off'} | reasoning: {reasoning_label}")
         print_help()
@@ -4658,6 +7233,48 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if user_input == "/help":
                 print_help()
+                continue
+            if user_input == "/connect" or user_input.startswith("/connect "):
+                argument = user_input[len("/connect"):].strip()
+                new_client, new_connection = run_connect_command(
+                    argument,
+                    config,
+                    config_path,
+                    connection,
+                    client_factory=make_client,
+                    reasoning=reasoning_state["config"],
+                )
+                if new_client is not None and new_connection is not None:
+                    client = new_client
+                    connection = new_connection
+                    reasoning_label = (
+                        client.reasoning.label if client.reasoning is not None else "default"
+                    )
+                    print(
+                        f"current connection: {connection.name or 'custom'} | "
+                        f"model: {client.model} | api: {connection.api_format} | "
+                        f"reasoning: {reasoning_label}"
+                    )
+                continue
+            if user_input == "/shell" or user_input.startswith("/shell "):
+                argument = user_input[len("/shell"):].strip()
+                if not argument or argument.lower() == "list":
+                    print(workspace.shell_state.describe())
+                    print("usage: /shell <name|path> | /shell auto")
+                    continue
+                try:
+                    workspace.shell_state.switch(argument)
+                except ShellError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    continue
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = build_system_prompt(
+                        workspace.root,
+                        workspace.skills,
+                        workspace.shell_state,
+                    )
+                workspace.shell_state.dirty = False
+                print(f"shell switched to: {workspace.shell_state.current.describe()}")
                 continue
             if (
                 user_input in ("/skill", "/skills")
@@ -4787,16 +7404,18 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if argument.lower() in ("clear", "default", "reset", "off"):
                     client.reasoning = None
+                    reasoning_state["config"] = None
                     print("reasoning: cleared (no extra fields)")
                     continue
                 try:
-                    config = _parse_reasoning(argument)
+                    reasoning_config = _parse_reasoning(argument)
                 except ReasoningError as exc:
                     print(f"error: {exc}", file=sys.stderr)
                     continue
-                client.reasoning = config
-                print(f"reasoning: {config.label}")
-                warning = reasoning_model_warning(config, client.model)
+                reasoning_state["config"] = reasoning_config
+                client.reasoning = reasoning_config
+                print(f"reasoning: {reasoning_config.label}")
+                warning = reasoning_model_warning(reasoning_config, client.model)
                 if warning:
                     print(f"warning: {warning}", file=sys.stderr)
                 continue
@@ -4919,7 +7538,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if session is None:
                 try:
-                    session = create_session(args.model, workspace.root)
+                    session = create_session(client.model, workspace.root)
                 except SessionError as exc:
                     print(f"error: {exc}", file=sys.stderr)
                     continue
@@ -4951,3 +7570,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

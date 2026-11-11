@@ -88,7 +88,7 @@ for _ in range(100):
 check("web started", url is not None, open(log_path, encoding="utf-8").read()[-300:])
 
 if url:
-    base = url.split("?", 1)[0].rstrip("/")
+    base = url.split("?", 1)[0]
     token = url.rsplit("token=", 1)[1]
     headers = {"Content-Type": "application/json", "X-Token": token}
 

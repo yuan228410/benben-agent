@@ -245,7 +245,8 @@ server.shutdown()
 
 # disabled skills: no scanning, no tools
 empty_ws = agent.Workspace(workspace, skills={})
-check("no skill tools when disabled", {t["function"]["name"] for t in agent.tool_schemas(empty_ws)} == {t["function"]["name"] for t in agent.TOOL_SCHEMAS})
+empty_tools = {t["function"]["name"] for t in agent.tool_schemas(empty_ws)}
+check("no skill tools when disabled", not ({"load_skill", "read_skill_resource", "run_skill_script"} & empty_tools))
 check("no skill in prompt when disabled", "可用技能" not in agent.build_system_prompt(workspace, {}))
 
 shutil.rmtree(base)

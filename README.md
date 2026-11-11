@@ -37,6 +37,8 @@ you> /model list      # 按名称排序列出网关可用模型（带编号，* 
 you> /model 2         # 按编号切换
 you> /model deepseek-reasoner  # 或直接写模型名
 you> /model           # 查看当前模型
+you> /shell           # 查看当前和可用 shell
+you> /shell zsh       # 切换 shell
 ...
 you> /exit
 ```
@@ -61,7 +63,136 @@ python3 benben-agent.py --no-shell "..."
 python3 benben-agent.py --cwd /path/to/project "..."
 ```
 
-> 不要把 API key 提交到仓库；通过 `OPENAI_API_KEY` 环境变量或 `--api-key` 传入。
+## 连接配置（`/connect`）
+
+第一次使用可以直接运行向导：
+
+```bash
+python3 benben-agent.py --connect
+```
+
+保存后下次启动自动使用。配置文件在：
+
+```text
+~/.benben-agent/config.json
+```
+
+交互模式里也可以管理连接：
+
+```text
+/connect                    打开配置向导
+/connect list               列出已保存的连接
+/connect use <name>         切换连接，并设为 active
+/connect delete <name>      删除连接（不能删除当前连接）
+/connect deepseek           直接进入 DeepSeek 预设
+/connect minimax            直接进入 MiniMax 预设
+/connect custom             自定义 base URL、协议和模型
+```
+
+内置预设：
+
+| 服务商 | 协议 | 地址 |
+| --- | --- | --- |
+| DeepSeek | `openai-chat-completions` | `https://api.deepseek.com/v1` |
+| MiniMax | `openai-chat-completions` | `https://api.minimaxi.com/v1` |
+| MiniMax | `openai-responses` | `https://api.minimaxi.com/v1` |
+| MiniMax | `anthropic-messages` | `https://api.minimaxi.com/anthropic` |
+
+向导会尝试通过 `/models` 拉取模型列表；接口不支持时可以直接输入模型名。MiniMax 默认使用 `bearer` 认证，其他 Anthropic 连接默认 `x-api-key`。
+
+配置优先级：
+
+```text
+显式 CLI 参数 > 环境变量 > active 连接 > 内置默认值
+```
+
+因此 shell 里已有的 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` 会覆盖保存的连接。启动时会打印提示；不想被环境变量覆盖时加 `--no-env`：
+
+```bash
+python3 benben-agent.py --no-env
+python3 benben-agent.py --profile work       # 临时使用指定连接
+python3 benben-agent.py --no-config          # 启动时忽略配置文件
+python3 benben-agent.py --config /path/to/config.json
+```
+
+`--no-config` 只影响启动时的连接选择；`/connect` 和 Web 连接设置仍会读取原文件，保存时不会丢掉其他连接。
+
+`--connect` 还可以配置后继续启动网页或执行一次任务：
+
+```bash
+python3 benben-agent.py --connect --web
+python3 benben-agent.py --connect "检查当前目录"
+```
+
+Web 界面侧边栏的“连接设置”提供同样的能力：选择/新建连接、切换服务商、协议、Base URL、模型、API key。API key 不会回传到浏览器。
+
+> 配置文件权限为 `0600`，但 API key 默认以明文保存。也可以把 key 留空，运行时读取 `OPENAI_API_KEY`。不要把配置文件提交到仓库。
+
+## Shell 自动检测
+
+启动时自动选择当前系统可用的 shell，`run_command` 和技能脚本都会使用它。
+
+| 系统 | 自动检测顺序 |
+| --- | --- |
+| Linux | `$SHELL` → `bash` → `zsh` → `sh` → `/bin/sh` |
+| macOS | `$SHELL` → `zsh` → `bash` → `sh` → `/bin/sh` |
+| Windows | `pwsh` → `powershell` → Git Bash → `cmd` |
+
+- `$SHELL` 只接受 `bash`、`zsh`、`sh`、`ksh`、`dash`；`fish`、`tcsh` 不自动选。
+- Windows 下忽略 `$SHELL`，避免把 Git Bash 的 `/usr/bin/bash` 当成原生路径。
+- Git Bash 只认 Git 安装目录下的 `bash.exe`，不会自动选 `System32\bash.exe`（WSL）。
+- 用户显式指定永远优先：
+
+```bash
+python3 benben-agent.py --shell zsh
+python3 benben-agent.py --shell git-bash
+python3 benben-agent.py --shell "C:\Program Files\PowerShell\7\pwsh.exe"
+```
+
+交互模式：
+
+```text
+/shell                 查看当前和可用 shell
+/shell list            同上
+/shell zsh             切换
+/shell auto            重新自动检测
+```
+
+模型也能回答“有哪些 shell”“当前用哪个”，并在用户要求时通过 `switch_shell` 工具切换。Web 聊天框输入 `/shell` 也可以查看或切换。
+
+执行方式：
+
+- POSIX / Git Bash：`shell -c <command>`
+- PowerShell：`pwsh -NoLogo -NoProfile -NonInteractive -Command <command>`
+- cmd：`cmd /d /s /c "chcp 65001>nul & <command>"`
+
+Windows 乱码处理：
+
+- PowerShell 自动设置 `[Console]::OutputEncoding` 和 `$OutputEncoding` 为 UTF-8。
+- cmd 自动执行 `chcp 65001`。
+- Python 捕获字节后按 UTF-8 解码，失败时回退到 UTF-16、OEM/ANSI 代码页和系统 locale。
+- 非法字节用替换字符处理，不会因为编码异常中断工具调用。
+- 少数老程序仍可能忽略代码页；可以改用 PowerShell 7 或 Git Bash。
+
+### 自动回退
+
+`run_command` 只在命令被当前 shell 明确判定为“不认识”，或当前 shell 无法启动时尝试备用 shell，例如：
+
+- POSIX：exit 127 + `command not found`
+- PowerShell：`is not recognized as the name of a cmdlet`
+- cmd：exit 9009 + `is not recognized as an internal or external command`
+
+行为：
+
+- 按当前可用 shell 的顺序尝试，成功时在结果里标注 `[fallback]`。
+- 回退只对本次命令生效，不改变当前 shell；需要持久切换用 `/shell` 或 `switch_shell`。
+- 所有 shell 都不认识时，结果会给出 `[fallback] reason`、每个 shell 的简短错误，以及安装工具/更换命令的建议。
+- 普通失败（权限、文件不存在、语法错误等）不会触发回退，避免重复执行。
+
+### 只读判断
+
+- POSIX / Git Bash：保留命令白名单判断。
+- PowerShell / cmd：一律视为可能修改状态。开启 `--confirm` 时所有命令都需要确认。
 
 ## 参数
 
@@ -82,6 +213,7 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `-i, --image` | 无 | 给任务附加图片，可重复，最多 4 张、单张 10 MB |
 | `--confirm` / `--no-confirm` | 关 | 是否在写文件和会修改状态的命令前询问；只读命令从不询问，`--yes` 是 `--no-confirm` 的别名 |
 | `--no-shell` | 关 | 禁用 `run_command` |
+| `--shell` | `auto` | shell：`auto`、`pwsh`、`powershell`、`git-bash`、`cmd`、`bash`、`zsh`、`sh` 或绝对路径 |
 | `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
@@ -93,6 +225,13 @@ python3 benben-agent.py --cwd /path/to/project "..."
 | `--web` | 关 | 启动浏览器界面；网页模式强制免确认 |
 | `--host` | `127.0.0.1` | 网页监听地址 |
 | `--port` | `8765` | 网页端口，`0` 表示由系统分配 |
+| `--connect` | 关 | 打开连接配置向导；没有 prompt/`--web` 时配置完退出 |
+| `--profile NAME` | 无 | 使用指定保存连接，不修改配置里的 active |
+| `--config PATH` | `$BENBEN_CONFIG` 或 `~/.benben-agent/config.json` | 配置文件路径 |
+| `--no-config` | 关 | 启动时忽略配置文件 |
+| `--no-env` | 关 | 忽略 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` |
+
+> 有 active 保存连接时，`--base-url`、`--api-key`、`-m`、`--api-format` 的默认值来自保存连接；环境变量和显式参数会按上节优先级覆盖它。
 
 ## 思考参数
 
@@ -322,7 +461,8 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - `429`、`5xx` 和网络错误会按指数退避重试（最多 3 次），遵守 `Retry-After`。
 - 模型返回的工具调用参数如果不是合法 JSON，错误会作为工具结果回传给模型，让它自行修正。
 - 工具结果超过 20000 字符会截断；`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 400 行。
-- `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，不跟随符号链接逃出工作区；`search` 默认只扫描 2 MB 以内的文件。
+- `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，不跟随符号链接逃出工作区；`glob` 在遍历阶段就剪枝，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
+- `write_file`、`edit_file` 和 `/save` 使用同目录临时文件 + `os.replace` 原子替换，中断时不会留下半个文件。
 - 文件路径经过 `realpath` 规范化，符号链接也无法逃逸出 `--cwd`。
 - 交互模式会自动开启 Linux 终端的 `IUTF8` 标志，并容错解码输入，避免中文退格留下残缺字节导致 `UnicodeDecodeError`。
 
@@ -351,3 +491,4 @@ python3 tests/run_all.py
 ## 许可
 
 本项目基于 [MIT License](LICENSE) 开源。
+

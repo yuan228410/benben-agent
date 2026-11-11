@@ -272,7 +272,7 @@ for _ in range(100):
     time.sleep(0.1)
 check("web started", url is not None, open(log_path, encoding="utf-8").read()[-300:])
 if url:
-    base = url.split("?", 1)[0].rstrip("/")
+    base = url.split("?", 1)[0]
     token = url.rsplit("token=", 1)[1]
     req = urllib.request.Request(
         base + "/api/chat", data=json.dumps({"message": "hi", "images": []}).encode(),

@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -8,10 +10,15 @@ def main() -> int:
     if not tests:
         print("no tests found")
         return 1
+    isolated_config = os.path.join(
+        tempfile.mkdtemp(prefix="benben-tests-"),
+        "config.json",
+    )
+    env = dict(os.environ, BENBEN_CONFIG=isolated_config)
     failed = []
     for test in tests:
         print(f"\n=== {test.name} ===", flush=True)
-        result = subprocess.run([sys.executable, str(test)])
+        result = subprocess.run([sys.executable, str(test)], env=env)
         if result.returncode:
             failed.append(test.name)
     print()

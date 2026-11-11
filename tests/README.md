@@ -13,11 +13,16 @@ python3 tests/test_usage.py
 python3 tests/test_reasoning.py
 python3 tests/test_anthropic.py
 python3 tests/test_responses.py
+python3 tests/test_config.py
+python3 tests/test_connect.py
+python3 tests/test_web_connections.py
+python3 tests/test_shell.py
 ```
 
 测试会：
 
 - 使用临时 `HOME`，不会读写真实的 `~/.benben-agent/`；
+- 通过 `BENBEN_CONFIG` 使用临时配置文件，`run_all.py` 会统一隔离；
 - 使用临时工作区，不会修改项目目录；
 - 启动本地假 HTTP 服务模拟 OpenAI Chat、Anthropic Messages 和 OpenAI Responses；
 - 失败时以非 0 退出码结束。
@@ -35,3 +40,7 @@ python3 tests/test_responses.py
 | `test_sessions.py` | 会话列表统计、compact 计数、缓存失效 |
 | `test_web_images.py` | 图片懒加载、`/api/image`、token 校验 |
 | `test_robustness.py` | 协议响应容错、畸形工具调用容错 |
+| `test_config.py` | 配置读写、权限、校验、优先级、模型解析、client 工厂 |
+| `test_connect.py` | `/connect` 向导、预设、切换/删除、`--profile`、`--no-env` |
+| `test_web_connections.py` | Web 连接设置接口、key 隐藏、热切换、Anthropic 预设 |
+| `test_shell.py` | shell 检测顺序、`$SHELL` 优先、Windows 编码、工具切换、自动回退、系统提示 |
