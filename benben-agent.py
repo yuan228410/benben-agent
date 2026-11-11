@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import copy
 import fnmatch
 import glob as glob_mod
@@ -438,6 +439,19 @@ class BaseChatClient:
             print(f"[retry] {error}; retrying in {delay:.1f}s", file=sys.stderr)
             time.sleep(delay)
 
+    def _models_root(self) -> str:
+        return self.base_url
+
+    def list_models(self) -> list[str]:
+        data = self._request(f"{self._models_root()}/models", timeout=min(self.timeout, 30.0))
+        models = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
+        return sorted(
+            (item["id"] for item in models if isinstance(item, dict) and item.get("id")),
+            key=_natural_key,
+        )
+
 
 class ChatClient(BaseChatClient):
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
@@ -468,6 +482,11 @@ class ChatClient(BaseChatClient):
             raise ChatError(f"Unexpected API response: {json.dumps(data)[:1000]}") from exc
         if not isinstance(message, dict):
             raise ChatError(f"Unexpected API response: {json.dumps(data)[:1000]}")
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = _plain_text(content)
+        elif content is None:
+            message["content"] = ""
         usage = data.get("usage")
         self.last_usage = usage if isinstance(usage, dict) else {}
         finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
@@ -481,16 +500,6 @@ class ChatClient(BaseChatClient):
             ):
                 self.last_reasoning_ignored = True
         return message
-
-    def list_models(self) -> list[str]:
-        data = self._request(f"{self.base_url}/models", timeout=min(self.timeout, 30.0))
-        models = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(models, list):
-            raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
-        return sorted(
-            (item["id"] for item in models if isinstance(item, dict) and item.get("id")),
-            key=_natural_key,
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -652,6 +661,8 @@ def _anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _anthropic_response(data: dict[str, Any]) -> tuple[dict[str, Any], str | None, dict[str, Any]]:
     content = data.get("content")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
     if not isinstance(content, list):
         raise ChatError(f"Unexpected Anthropic response: {json.dumps(data)[:1000]}")
     texts: list[str] = []
@@ -722,6 +733,9 @@ class AnthropicClient(BaseChatClient):
     def _root(self) -> str:
         return self._v1_root()
 
+    def _models_root(self) -> str:
+        return self._root()
+
     def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
@@ -775,16 +789,6 @@ class AnthropicClient(BaseChatClient):
             self.last_usage["completion_tokens_details"] = {"reasoning_tokens": thinking_tokens}
         self.last_finish_reason = ANTHROPIC_STOP_REASONS.get(stop_reason or "", "stop")
         return message
-
-    def list_models(self) -> list[str]:
-        data = self._request(f"{self._root()}/models", timeout=min(self.timeout, 30.0))
-        models = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(models, list):
-            raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
-        return sorted(
-            (item["id"] for item in models if isinstance(item, dict) and item.get("id")),
-            key=_natural_key,
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -907,8 +911,14 @@ def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _responses_response(data: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, Any]]:
     output = data.get("output")
+    if isinstance(output, str):
+        output = [{"type": "message", "content": [{"type": "output_text", "text": output}]}]
     if not isinstance(output, list):
-        raise ChatError(f"Unexpected Responses response: {json.dumps(data)[:1000]}")
+        output_text = data.get("output_text")
+        if isinstance(output_text, str):
+            output = [{"type": "message", "content": [{"type": "output_text", "text": output_text}]}]
+        else:
+            raise ChatError(f"Unexpected Responses response: {json.dumps(data)[:1000]}")
     texts: list[str] = []
     thinking_texts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
@@ -998,6 +1008,9 @@ class ResponsesClient(BaseChatClient):
         )
         self.supports_reasoning_config = False
 
+    def _models_root(self) -> str:
+        return self._v1_root()
+
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         try:
             instructions, input_items = _to_responses_input(messages)
@@ -1023,16 +1036,6 @@ class ResponsesClient(BaseChatClient):
         self.last_usage = usage
         self.last_finish_reason = finish_reason
         return message
-
-    def list_models(self) -> list[str]:
-        data = self._request(f"{self._v1_root()}/models", timeout=min(self.timeout, 30.0))
-        models = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(models, list):
-            raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
-        return sorted(
-            (item["id"] for item in models if isinstance(item, dict) and item.get("id")),
-            key=_natural_key,
-        )
 
 
 def _natural_key(name: str) -> list[Any]:
@@ -1070,20 +1073,39 @@ def merge_usage(total: dict[str, int], usage: Any) -> None:
 
 def clean_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
     """Keep only fields that chat completions accepts on the next request."""
-    cleaned: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
+    content = message.get("content")
+    if isinstance(content, list):
+        content = _plain_text(content)
+    if content is None:
+        content = ""
+    elif not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    cleaned: dict[str, Any] = {"role": "assistant", "content": content}
     tool_calls = message.get("tool_calls")
-    if tool_calls:
-        cleaned["tool_calls"] = [
-            {
-                "id": call.get("id") or f"call_{index}",
+    if isinstance(tool_calls, list):
+        cleaned_calls: list[dict[str, Any]] = []
+        for index, call in enumerate(tool_calls):
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                function = {}
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                name = "unknown"
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+            call_id = call.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                call_id = f"call_{index}"
+            cleaned_calls.append({
+                "id": call_id,
                 "type": "function",
-                "function": {
-                    "name": call["function"]["name"],
-                    "arguments": call["function"].get("arguments") or "{}",
-                },
-            }
-            for index, call in enumerate(tool_calls)
-        ]
+                "function": {"name": name, "arguments": arguments},
+            })
+        if cleaned_calls:
+            cleaned["tool_calls"] = cleaned_calls
     thinking_blocks = message.get("_thinking_blocks")
     if isinstance(thinking_blocks, list) and thinking_blocks:
         # Anthropic requires signed thinking blocks to be sent back with tool results.
@@ -1206,9 +1228,9 @@ def _message_text(content: Any) -> str:
     return "[图片]" if isinstance(content, list) else ""
 
 
-def history_view(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def history_view(messages: list[dict[str, Any]], lazy_images: bool = False) -> list[dict[str, Any]]:
     view = []
-    for message in messages:
+    for message_index, message in enumerate(messages):
         if message.get("_compact"):
             raw = message.get("content")
             if isinstance(raw, str):
@@ -1235,7 +1257,10 @@ def history_view(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         content = message.get("content")
         texts = []
-        images = []
+        images: list[Any] = []
+        image_names = message.get("_images")
+        if not isinstance(image_names, list):
+            image_names = []
         if isinstance(content, str):
             texts.append(content)
         elif isinstance(content, list):
@@ -1247,7 +1272,18 @@ def history_view(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 elif part.get("type") == "image_url":
                     url = (part.get("image_url") or {}).get("url")
                     if isinstance(url, str):
-                        images.append(url)
+                        if lazy_images:
+                            image_index = len(images)
+                            name = (
+                                image_names[image_index]
+                                if image_index < len(image_names)
+                                else f"图片 {image_index + 1}"
+                            )
+                            if not isinstance(name, str) or not name:
+                                name = f"图片 {image_index + 1}"
+                            images.append({"id": f"{message_index}:{image_index}", "name": name})
+                        else:
+                            images.append(url)
         text = "\n".join(texts).strip("\n")
         if not text and not images:
             continue
@@ -1426,51 +1462,92 @@ def delete_session(uuid: str) -> None:
         raise SessionError(str(exc)) from exc
 
 
+_SESSION_SUMMARY_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+_SESSION_SUMMARY_LOCK = threading.Lock()
+
+
+def _session_meta(path: str) -> tuple[str, str]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return "?", "?"
+    try:
+        record = json.loads(first)
+    except json.JSONDecodeError:
+        return "?", "?"
+    if isinstance(record, dict) and record.get("_type") == "meta":
+        return record.get("model") or "?", record.get("workspace") or "?"
+    return "?", "?"
+
+
+def _session_title(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if '"role"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("role") == "user" and not record.get("_compact"):
+                    return _message_text(record.get("content")) or "(无文字)"
+    except OSError:
+        pass
+    return "(无文字)"
+
+
+def _session_count(path: str) -> int:
+    offset = _last_compact_offset(path)
+    count = 0
+    try:
+        with open(path, "rb") as handle:
+            if offset:
+                handle.seek(offset)
+            for record in _iter_session_records(handle):
+                if record.get("_type") == "compact":
+                    count = 1  # the synthetic summary message
+                    continue
+                if record.get("role"):
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
 def session_summaries() -> list[dict[str, Any]]:
     rows = []
     for path in _session_files():
         match = re.match(r"(\d+)-(\d{8})-([0-9a-f]{8})\.jsonl$", os.path.basename(path))
         if not match:
             continue
-        sequence, date, uuid = int(match.group(1)), match.group(2), match.group(3)
-        model = workspace = "?"
-        title = ""
-        count = 0
         try:
-            with open(path, encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(record, dict):
-                        continue
-                    if record.get("_type") == "meta":
-                        model = record.get("model") or "?"
-                        workspace = record.get("workspace") or "?"
-                        continue
-                    if record.get("_type") == "compact":
-                        count = 1  # the synthetic summary message
-                        continue
-                    if not record.get("role"):
-                        continue
-                    count += 1
-                    if not title and record.get("role") == "user":
-                        title = _message_text(record.get("content"))
+            stat = os.stat(path)
         except OSError:
             continue
-        rows.append({
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+        with _SESSION_SUMMARY_LOCK:
+            cached = _SESSION_SUMMARY_CACHE.get(path)
+        if cached is not None and cached[0] == cache_key:
+            rows.append(dict(cached[1]))
+            continue
+        sequence, date, uuid = int(match.group(1)), match.group(2), match.group(3)
+        model, workspace = _session_meta(path)
+        row = {
             "uuid": uuid,
             "sequence": sequence,
             "date": date,
-            "count": count,
+            "count": _session_count(path),
             "model": model,
             "workspace": workspace,
-            "title": title or "(无文字)",
-        })
+            "title": _session_title(path),
+        }
+        with _SESSION_SUMMARY_LOCK:
+            _SESSION_SUMMARY_CACHE[path] = (cache_key, dict(row))
+        rows.append(row)
     rows.sort(key=lambda row: row["sequence"], reverse=True)
     return rows
 
@@ -2792,19 +2869,34 @@ def run_turn(
             if not tool_calls:
                 return True
 
-            for call in tool_calls:
-                name = call["function"]["name"]
-                raw_arguments = call["function"].get("arguments") or "{}"
+            for index, call in enumerate(tool_calls):
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    function = {}
+                name = function.get("name")
+                if not isinstance(name, str) or not name:
+                    name = "unknown"
+                raw_arguments = function.get("arguments")
+                if not isinstance(raw_arguments, str):
+                    raw_arguments = json.dumps(
+                        raw_arguments if raw_arguments is not None else {},
+                        ensure_ascii=False,
+                    )
+                call_id = call.get("id")
+                if not isinstance(call_id, str) or not call_id:
+                    call_id = f"call_{index}"
                 report("tool", f"[{name}] {_one_line(raw_arguments, 120)}")
                 try:
                     arguments = json.loads(raw_arguments)
                     if not isinstance(arguments, dict):
                         raise TypeError("arguments must be a JSON object")
                     result = workspace.dispatch(name, arguments)
-                except (json.JSONDecodeError, ToolError, TypeError, ValueError) as exc:
+                except (json.JSONDecodeError, ToolError, TypeError, ValueError, KeyError) as exc:
                     result = f"error: {exc}"
 
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
         print(f"[stopped] reached the limit of {max_steps} model calls without a final answer", file=sys.stderr)
         return False
@@ -3269,6 +3361,8 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .msg.assistant hr { border: 0; border-top: 1px solid #e3e6ea; margin: 10px 0; }
 .msg.assistant img { max-width: 100%; border-radius: 6px; margin: 6px 0; }
 .msg.user img.upload { display: block; max-width: 260px; max-height: 200px; margin-top: 6px; border-radius: 6px; border: 1px solid #c9ced6; }
+.lazy-image { display: block; margin-top: 6px; padding: 6px 10px; border: 1px dashed #c9ced6; border-radius: 6px; background: #f9fafb; color: #475467; cursor: pointer; font: inherit; font-size: 12px; text-align: left; }
+.lazy-image:hover { background: #f1f3f6; }
 .previews { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .previews img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; border: 1px solid #c9ced6; }
 .msg img, .previews img { cursor: zoom-in; }
@@ -3326,7 +3420,14 @@ const modelEl = document.getElementById("model");
 const lightboxEl = document.getElementById("lightbox");
 const lightboxImg = document.getElementById("lightbox-img");
 
-function openLightbox(src) {
+let lightboxObjectUrl = null;
+
+function openLightbox(src, objectUrl) {
+  if (lightboxObjectUrl) {
+    URL.revokeObjectURL(lightboxObjectUrl);
+    lightboxObjectUrl = null;
+  }
+  lightboxObjectUrl = objectUrl || null;
   lightboxImg.src = src;
   lightboxEl.hidden = false;
 }
@@ -3334,6 +3435,31 @@ function openLightbox(src) {
 function closeLightbox() {
   lightboxEl.hidden = true;
   lightboxImg.removeAttribute("src");
+  if (lightboxObjectUrl) {
+    URL.revokeObjectURL(lightboxObjectUrl);
+    lightboxObjectUrl = null;
+  }
+}
+
+async function loadStoredImage(id, name) {
+  if (!token) { statusEl.textContent = "缺少 token"; return; }
+  statusEl.textContent = "加载图片…";
+  try {
+    const response = await fetch("/api/image?id=" + encodeURIComponent(id), {
+      headers: { "X-Token": token }
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || response.statusText);
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    openLightbox(objectUrl, objectUrl);
+    lightboxImg.alt = name || "图片";
+    statusEl.textContent = "";
+  } catch (err) {
+    statusEl.textContent = "图片加载失败: " + String(err);
+  }
 }
 
 lightboxEl.addEventListener("click", closeLightbox);
@@ -3522,7 +3648,7 @@ function addMarkdown(text) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function addUserMessage(text, images) {
+function addUserMessage(text, images, lazy) {
   const div = document.createElement("div");
   div.className = "msg user";
   if (text) {
@@ -3531,9 +3657,18 @@ function addUserMessage(text, images) {
     div.appendChild(paragraph);
   }
   for (const image of images) {
+    if (lazy && image.id) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "lazy-image";
+      button.textContent = "🖼 " + (image.name || "图片") + " · 点击加载";
+      button.onclick = () => loadStoredImage(image.id, image.name);
+      div.appendChild(button);
+      continue;
+    }
     const element = document.createElement("img");
     element.className = "upload";
-    element.src = image.data_url;
+    element.src = image.data_url || image.src || "";
     element.alt = image.name;
     element.title = image.name;
     div.appendChild(element);
@@ -3559,11 +3694,13 @@ function renderHistory(messages) {
     } else if (message.role === "assistant") {
       addMarkdown(message.text);
     } else {
-      const images = (message.images || []).map((url, index) => ({
-        data_url: url,
-        name: "图片 " + (index + 1)
-      }));
-      addUserMessage(message.text, images);
+      const images = (message.images || []).map((item, index) => {
+        if (typeof item === "string") {
+          return { data_url: item, name: "图片 " + (index + 1) };
+        }
+        return item;
+      });
+      addUserMessage(message.text, images, true);
     }
   }
 }
@@ -3890,6 +4027,21 @@ def run_web(
         def _json(self, code: int, payload: Any) -> None:
             self._send(code, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
 
+        def _send_bytes(self, code: int, data: bytes, content_type: str, cache_control: str = "") -> None:
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                if cache_control:
+                    self.send_header("Cache-Control", cache_control)
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         def _error(self, code: int, message: str) -> None:
             self._json(code, {"error": message})
 
@@ -4027,6 +4179,44 @@ def run_web(
                 return
             if not self._check_token():
                 return
+            if parsed.path == "/api/image":
+                raw_id = (parse_qs(parsed.query).get("id") or [""])[0]
+                match = re.fullmatch(r"(\d+):(\d+)", raw_id)
+                if not match:
+                    self._error(400, "invalid image id")
+                    return
+                message_index, image_index = int(match.group(1)), int(match.group(2))
+                data_url = None
+                with lock:
+                    if message_index < len(state["messages"]):
+                        message = state["messages"][message_index]
+                        content = message.get("content")
+                        if isinstance(content, list):
+                            urls = [
+                                (part.get("image_url") or {}).get("url")
+                                for part in content
+                                if isinstance(part, dict) and part.get("type") == "image_url"
+                            ]
+                            if image_index < len(urls) and isinstance(urls[image_index], str):
+                                data_url = urls[image_index]
+                if data_url is None:
+                    self._error(404, "image not found")
+                    return
+                prefix, separator, payload = data_url.partition(",")
+                if not separator or not prefix.startswith("data:image/") or not prefix.endswith(";base64"):
+                    self._error(404, "image is not stored locally")
+                    return
+                media_type = prefix[len("data:"):-len(";base64")]
+                if not re.fullmatch(r"image/[A-Za-z0-9.+-]+", media_type):
+                    self._error(400, "invalid image type")
+                    return
+                try:
+                    data = base64.b64decode(payload, validate=False)
+                except (binascii.Error, ValueError, TypeError):
+                    self._error(400, "invalid image data")
+                    return
+                self._send_bytes(200, data, media_type, "private, max-age=3600")
+                return
             if parsed.path == "/api/sessions":
                 self._json(200, {"sessions": session_summaries()})
                 return
@@ -4044,7 +4234,7 @@ def run_web(
                     self._json(200, {
                         "session": current.uuid if current else None,
                         "model": client.model,
-                        "messages": history_view(state["messages"]),
+                        "messages": history_view(state["messages"], lazy_images=True),
                     })
                 return
             self._error(404, "not found")
@@ -4113,7 +4303,7 @@ def run_web(
                         return
                     state["messages"] = messages
                     state["session"] = session
-                    self._json(200, {"session": session.uuid, "messages": history_view(messages)})
+                    self._json(200, {"session": session.uuid, "messages": history_view(messages, lazy_images=True)})
                 return
 
             if parsed.path == "/api/model":
@@ -4150,7 +4340,7 @@ def run_web(
                         return
                     self._json(200, {
                         "session": state["session"].uuid,
-                        "messages": history_view(state["messages"]),
+                        "messages": history_view(state["messages"], lazy_images=True),
                         **stats,
                     })
                 return
@@ -4170,19 +4360,19 @@ def run_web(
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     print(f"web ui: http://{display_host}:{bound_port}/?token={token}", flush=True)
     if isinstance(client, AnthropicClient):
-        print("[web] api: anthropic-messages", file=sys.stderr)
+        print("[web] api: anthropic-messages", file=sys.stderr, flush=True)
     elif isinstance(client, ResponsesClient):
-        print("[web] api: openai-responses", file=sys.stderr)
+        print("[web] api: openai-responses", file=sys.stderr, flush=True)
     if client.reasoning is not None:
-        print(f"[web] reasoning: {client.reasoning.label}", file=sys.stderr)
+        print(f"[web] reasoning: {client.reasoning.label}", file=sys.stderr, flush=True)
     if workspace.allow_shell:
-        print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr)
+        print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr, flush=True)
     if workspace.allow_skill_scripts and any(
         skill["has_scripts"] for skill in workspace.skills.values()
     ):
-        print("[web] warning: skill scripts can run without approval", file=sys.stderr)
+        print("[web] warning: skill scripts can run without approval", file=sys.stderr, flush=True)
     if host not in ("127.0.0.1", "localhost", "::1"):
-        print(f"[web] warning: listening on {host}; anyone who can reach this port can use the agent", file=sys.stderr)
+        print(f"[web] warning: listening on {host}; anyone who can reach this port can use the agent", file=sys.stderr, flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4765,3 +4955,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
