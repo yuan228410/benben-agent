@@ -3734,10 +3734,6 @@ async function loadSessions() {
       button.appendChild(title);
       button.appendChild(meta);
       button.onclick = () => openSession(s.uuid);
-      button.oncontextmenu = (event) => {
-        event.preventDefault();
-        removeSession(s.uuid, s.title);
-      };
       const remove = document.createElement("button");
       remove.className = "delete";
       remove.textContent = "×";
@@ -4360,19 +4356,19 @@ def run_web(
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     print(f"web ui: http://{display_host}:{bound_port}/?token={token}", flush=True)
     if isinstance(client, AnthropicClient):
-        print("[web] api: anthropic-messages", file=sys.stderr, flush=True)
+        print("[web] api: anthropic-messages", file=sys.stderr)
     elif isinstance(client, ResponsesClient):
-        print("[web] api: openai-responses", file=sys.stderr, flush=True)
+        print("[web] api: openai-responses", file=sys.stderr)
     if client.reasoning is not None:
-        print(f"[web] reasoning: {client.reasoning.label}", file=sys.stderr, flush=True)
+        print(f"[web] reasoning: {client.reasoning.label}", file=sys.stderr)
     if workspace.allow_shell:
-        print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr, flush=True)
+        print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr)
     if workspace.allow_skill_scripts and any(
         skill["has_scripts"] for skill in workspace.skills.values()
     ):
-        print("[web] warning: skill scripts can run without approval", file=sys.stderr, flush=True)
+        print("[web] warning: skill scripts can run without approval", file=sys.stderr)
     if host not in ("127.0.0.1", "localhost", "::1"):
-        print(f"[web] warning: listening on {host}; anyone who can reach this port can use the agent", file=sys.stderr, flush=True)
+        print(f"[web] warning: listening on {host}; anyone who can reach this port can use the agent", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4955,4 +4951,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
