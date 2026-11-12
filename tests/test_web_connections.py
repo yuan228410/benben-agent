@@ -142,6 +142,12 @@ try:
     check("web html preset select", 'id="conn-provider"' in html)
     check("web html slash connect", "openConnectModal()" in html)
     check("web html slash shell", "handleShellCommand" in html)
+    check("web html slash status", "handleStatusCommand" in html)
+    check("web html slash session", "handleSessionCommand" in html)
+    check("web html session menu", 'id="session-menu"' in html and 'id="session-rename"' in html)
+    check("web html thinking toggle", 'id="thinking-toggle"' in html)
+    check("web html reasoning select", 'id="reasoning"' in html)
+    check("web html stop button", 'id="stop"' in html)
 
     data = api_json("/api/connections")
     check("initial no connections", data["connections"] == [])
@@ -185,6 +191,40 @@ try:
     check("state connection", state["connection"] == "work")
     check("state model", state["model"] == "model-a")
     check("state base", state["base_url"] == model_base)
+    check("state workspace", state["workspace"] == os.path.realpath("."), state.get("workspace"))
+
+    # Runtime toggles: show thinking and reasoning level.
+    runtime = api_json("/api/runtime")
+    check("runtime thinking default", runtime["show_thinking"] is False, runtime)
+    check("runtime reasoning initial", runtime["reasoning"]["label"] == "deepseek:low", runtime)
+    check("runtime reasoning supported", runtime["reasoning"]["supported"] is True, runtime)
+    thinking = api_json("/api/thinking", {"show": True})
+    check("thinking enabled", thinking["show_thinking"] is True, thinking)
+    check("thinking in runtime", api_json("/api/runtime")["show_thinking"] is True)
+    reasoning = api_json("/api/reasoning", {"value": "kimi:low"})
+    check("reasoning changed", reasoning["reasoning"]["label"] == "kimi:low", reasoning)
+    check("reasoning in runtime", api_json("/api/runtime")["reasoning"]["label"] == "kimi:low")
+    cleared = api_json("/api/reasoning", {"value": ""})
+    check("reasoning cleared", cleared["reasoning"]["label"] == "", cleared)
+    code, text = api("/api/reasoning", {"value": "qwen:low"}, expect_error=True)
+    check("reasoning invalid rejected", code == 400, code)
+    api_json("/api/reasoning", {"value": "deepseek:low"})
+    stopped = api_json("/api/chat/stop", {})
+    check("stop idle request", stopped["stopping"] is False, stopped)
+
+    # Create a session, then rename it through the title API.
+    code, text = api("/api/chat", {"message": "hello", "images": []})
+    chat = json.loads(text)
+    check("chat created session", bool(chat.get("session")), chat)
+    session_uuid = chat["session"]
+    title_data = api_json("/api/session/title", {
+        "session": session_uuid,
+        "title": "自定义标题",
+    })
+    check("web title updated", title_data["title"] == "自定义标题", title_data)
+    sessions = api_json("/api/sessions")["sessions"]
+    title_row = next(item for item in sessions if item["uuid"] == session_uuid)
+    check("web title in list", title_row["title"] == "自定义标题", title_row)
 
     data = api_json("/api/connections")
     check("saved listed", [item["name"] for item in data["connections"]] == ["work"])
@@ -256,6 +296,17 @@ try:
     check("minimax auth bearer", config["connections"]["mm"]["anthropic_auth"] == "bearer")
     state = api_json("/api/state")
     check("anthropic state", state["api_format"] == "anthropic-messages")
+    runtime = api_json("/api/runtime")
+    check("anthropic reasoning supported", runtime["reasoning"]["supported"] is True, runtime)
+    check("anthropic runtime format", runtime["api_format"] == "anthropic-messages", runtime)
+    code, text = api("/api/reasoning", {"value": "deepseek:low"}, expect_error=True)
+    check("anthropic wrong provider rejected", code == 400, code)
+    anthropic_reasoning = api_json("/api/reasoning", {"value": "anthropic:low"})
+    check(
+        "anthropic reasoning set",
+        anthropic_reasoning["reasoning"]["label"] == "anthropic:low",
+        anthropic_reasoning,
+    )
 
     # Validation errors.
     code, text = api("/api/connections/save", {

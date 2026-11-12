@@ -81,6 +81,10 @@ check("kimi off", payload("kimi:off") == {"thinking": {"type": "disabled"}})
 check("kimi low", payload("kimi:low") == {"reasoning_effort": "low"})
 check("minimax minimal", payload("minimax:minimal") == {"reasoning_effort": "low"})
 check("minimax max", payload("minimax:max") == {"reasoning_effort": "max"})
+check("openai minimal", payload("openai:minimal") == {"reasoning_effort": "low"})
+check("openai max", payload("openai:max") == {"reasoning_effort": "high"})
+check("openai off", payload("openai:off") == {})
+check("anthropic parse", parse("anthropic:high").label == "anthropic:high")
 check("none alias", payload("kimi:none") == {"thinking": {"type": "disabled"}})
 for value in ("minimax:off", "minimax:none"):
     try:

@@ -40,6 +40,11 @@ handler_names = set(ws.dispatch.__code__.co_consts[1]) if False else None
 for name in schema_names:
     check(f"schema {name} dispatchable", hasattr(ws, name))
 
+no_shell_ws = agent.Workspace(base, allow_shell=False)
+no_shell_tools = {t["function"]["name"] for t in agent.tool_schemas(no_shell_ws)}
+check("run_command hidden when no shell", "run_command" not in no_shell_tools, no_shell_tools)
+check("list_shells kept when no shell", "list_shells" in no_shell_tools, no_shell_tools)
+
 # ---------- edit_file ----------
 write("edit/a.txt", "alpha\nbeta\ngamma\n")
 check("edit unique", ws.edit_file("edit/a.txt", "beta", "BETA") == "edited edit/a.txt (1 replacement)")
@@ -224,6 +229,46 @@ messages = [{"role": "user", "content": "go"}]
 ok = agent.run_turn(client, ws, messages, 3)
 check("run_turn with edit_file", ok and "GAMMA" in open(os.path.join(base, "edit/a.txt")).read(), messages[-1])
 check("all 9 tools sent", messages[-1]["content"] == "done:list_dir,read_file,search,glob,write_file,edit_file,run_command,list_shells,switch_shell", messages[-1])
+
+
+class CancelClient:
+    last_turn_usage = {}
+    last_turn_truncated = False
+    last_usage = {}
+    last_finish_reason = None
+    last_reasoning_ignored = False
+
+    def chat(self, messages, tools):
+        raise AssertionError("cancelled turn must not call the model")
+
+
+cancel_event = threading.Event()
+cancel_event.set()
+cancel_messages = [{"role": "user", "content": "go"}]
+cancel_ok = agent.run_turn(
+    CancelClient(), ws, cancel_messages, 3, cancel_event=cancel_event
+)
+check("cancel stops before model", cancel_ok is False)
+
+
+class CancelAfterClient:
+    last_turn_usage = {}
+    last_turn_truncated = False
+    last_usage = {}
+    last_finish_reason = None
+    last_reasoning_ignored = False
+
+    def chat(self, messages, tools):
+        cancel_event.set()
+        return {"role": "assistant", "content": "should be discarded"}
+
+
+cancel_event = threading.Event()
+cancel_messages = [{"role": "user", "content": "go"}]
+cancel_ok = agent.run_turn(
+    CancelAfterClient(), ws, cancel_messages, 3, cancel_event=cancel_event
+)
+check("cancel after model discards reply", cancel_ok is False and cancel_messages[-1]["role"] == "user")
 
 server.shutdown()
 shutil.rmtree(base)

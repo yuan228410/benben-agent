@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -22,8 +23,8 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-os.makedirs(agent.SESSION_DIR, exist_ok=True)
-path = os.path.join(agent.SESSION_DIR, "001-20261111-a1b2c3d4.jsonl")
+os.makedirs(agent.SESSIONS_DIR, exist_ok=True)
+path = os.path.join(agent.SESSIONS_DIR, "001-20261111-a1b2c3d4.jsonl")
 records = [
     {"_type": "meta", "version": 1, "uuid": "a1b2c3d4", "sequence": 1,
      "created": "2026-11-11T10:00:00", "model": "m", "workspace": "/tmp/ws"},
@@ -69,6 +70,89 @@ with open(path, "a", encoding="utf-8") as handle:
 rows2 = agent.session_summaries()
 check("cache invalidated", len(calls) == 2, calls)
 check("new count", rows2[0]["count"] == 4, rows2[0])
+
+new_session = agent.create_session("m", "/tmp/ws")
+check("new sessions subdir", os.path.dirname(new_session.path) == agent.SESSIONS_DIR, new_session.path)
+os.remove(new_session.path)
+
+legacy_name = "002-20261111-b2c3d4e5.jsonl"
+legacy_path = os.path.join(agent.SESSION_DIR, legacy_name)
+with open(legacy_path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "_type": "meta", "version": 1, "uuid": "b2c3d4e5", "sequence": 2,
+        "created": "2026-11-11T10:00:00", "model": "m", "workspace": "/tmp/ws",
+    }, ensure_ascii=False) + "\n")
+moved = agent.migrate_legacy_sessions()
+check("legacy session moved", moved == 1, moved)
+check("legacy source removed", not os.path.exists(legacy_path))
+check("legacy target exists", os.path.exists(os.path.join(agent.SESSIONS_DIR, legacy_name)))
+
+# ---------- command helpers ----------
+rows = agent.session_summaries()
+check("two sessions listed", len(rows) == 2, rows)
+lines = agent.format_session_list(rows, "a1b2c3d4")
+check("list has header", lines[0].startswith("  #"), lines)
+check("list marks current", any(line.startswith("*") and "a1b2c3d4" in line for line in lines), lines)
+check("resolve by number", agent.resolve_session_ref("1", rows)["uuid"] == rows[0]["uuid"])
+check("resolve by uuid", agent.resolve_session_ref("a1b2c3d4", rows)["uuid"] == "a1b2c3d4")
+try:
+    agent.resolve_session_ref("99", rows)
+    check("resolve out of range", False)
+except agent.SessionError:
+    check("resolve out of range", True)
+
+# ---------- titles ----------
+session_obj = agent.Session(path, "a1b2c3d4", 1)
+check("set title", session_obj.set_title("自定义标题") == "自定义标题")
+check("title marker read", agent._session_title(path) == "自定义标题")
+rows = agent.session_summaries()
+row = next(item for item in rows if item["uuid"] == "a1b2c3d4")
+check("summary custom title", row["title"] == "自定义标题", row)
+agent.set_session_title("b2c3d4e5", "另一个标题")
+rows = agent.session_summaries()
+row = next(item for item in rows if item["uuid"] == "b2c3d4e5")
+check("title by uuid", row["title"] == "另一个标题", row)
+check("title marker latest wins", session_obj.set_title("第二个标题") == "第二个标题" and agent._session_title(path) == "第二个标题")
+try:
+    session_obj.set_title("  ")
+    check("empty title rejected", False)
+except agent.SessionError:
+    check("empty title rejected", True)
+loaded_title = []
+agent.load_session("a1b2c3d4", loaded_title)
+check(
+    "title marker not a message",
+    bool(loaded_title) and all(item.get("role") and not item.get("_type") for item in loaded_title),
+    loaded_title,
+)
+
+# ---------- CLI /session ----------
+env = dict(os.environ, HOME=HOME, BENBEN_CONFIG=os.path.join(HOME, "config.json"))
+result = subprocess.run(
+    [sys.executable, AGENT, "--shell", "auto"],
+    input=(
+        "/session\n"
+        "/session use 1\n"
+        "/session rename 我的会话\n"
+        "/session info\n"
+        "/session delete 2\n"
+        "y\n"
+        "/session\n"
+        "/exit\n"
+    ),
+    text=True,
+    capture_output=True,
+    env=env,
+    timeout=30,
+)
+check("cli session exit", result.returncode == 0, result.stderr[-500:])
+check("cli session list", "sessions in" in result.stdout, result.stdout[-800:])
+check("cli session use", "resumed session" in result.stdout, result.stdout[-800:])
+check("cli session rename", "session title updated: 我的会话" in result.stdout, result.stdout[-800:])
+check("cli session info", "current session" in result.stdout and "我的会话" in result.stdout, result.stdout[-800:])
+check("cli session delete", "deleted session" in result.stdout, result.stdout[-800:])
+check("cli delete removed file", not os.path.exists(path))
+check("cli kept other file", os.path.exists(os.path.join(agent.SESSIONS_DIR, legacy_name)))
 
 shutil.rmtree(HOME, ignore_errors=True)
 print()

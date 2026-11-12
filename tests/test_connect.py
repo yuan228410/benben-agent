@@ -43,6 +43,14 @@ def run_wizard(config, path, inputs, secret="sk-test-abcdef", models=None, provi
 
 root = tempfile.mkdtemp(prefix="connect-test-")
 
+# ---------- masked input ----------
+chars = iter(list("abc\x7f\n"))
+writes = []
+masked = agent._masked_line(lambda: next(chars), writes.append)
+check("masked line value", masked == "ab", masked)
+check("masked line stars", writes.count("*") == 3, writes)
+check("masked line backspace", "\b \b" in writes, writes)
+
 # ---------- custom wizard ----------
 path = os.path.join(root, "custom.json")
 config = agent.empty_config()
@@ -111,7 +119,7 @@ agent.save_config(config, path)
 connection, output = run_wizard(
     config,
     path,
-    ["", "", "ds", "1", "y"],
+    ["", "", "ds", "", "1", "y"],
     secret="",
     models=["deepseek-chat", "deepseek-reasoner"],
     provider="deepseek",
@@ -119,6 +127,45 @@ connection, output = run_wizard(
 check("keep key", connection.api_key == "sk-old-key")
 check("keep key config", config["connections"]["ds"]["api_key"] == "sk-old-key")
 check("keep warning", "已存在" in output)
+check("keep summary", "保留现有" in output, output[-500:])
+
+# ---------- clear existing key ----------
+path = os.path.join(root, "clear.json")
+config = agent.empty_config()
+config["connections"]["ds"] = {
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_format": "openai-chat-completions",
+    "model": "deepseek-chat",
+    "api_key": "sk-old-key",
+}
+config["active"] = "ds"
+agent.save_config(config, path)
+connection, output = run_wizard(
+    config,
+    path,
+    ["", "", "ds", "2", "1", "y"],
+    secret="",
+    models=["deepseek-chat", "deepseek-reasoner"],
+    provider="deepseek",
+)
+check("clear key", connection.api_key == "")
+check("clear key config", config["connections"]["ds"]["api_key"] == "")
+check("clear summary", "已清空" in output, output[-500:])
+
+# ---------- new connection without key ----------
+path = os.path.join(root, "nokey.json")
+config = agent.empty_config()
+connection, output = run_wizard(
+    config,
+    path,
+    ["3", "1", "http://127.0.0.1:9/v1", "nokey", "1", "y"],
+    secret="",
+    models=["model-a"],
+)
+check("new blank key", connection.api_key == "")
+check("new blank key config", config["connections"]["nokey"]["api_key"] == "")
+check("new blank summary", "未保存" in output, output[-500:])
 
 # ---------- model fetch failure -> manual ----------
 path = os.path.join(root, "manual.json")

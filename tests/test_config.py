@@ -61,6 +61,8 @@ check("roundtrip active", loaded["active"] == "deepseek")
 check("roundtrip key", loaded["connections"]["deepseek"]["api_key"] == "sk-test-123456")
 check("roundtrip auth", loaded["connections"]["mm"]["anthropic_auth"] == "bearer")
 check("roundtrip version", loaded["connections"]["mm"]["anthropic_version"] == "2023-06-01")
+check("openai omits auth", "anthropic_auth" not in loaded["connections"]["deepseek"])
+check("openai omits version", "anthropic_version" not in loaded["connections"]["deepseek"])
 check(
     "atomic temp cleaned",
     not [name for name in os.listdir(config_dir) if name.startswith(".benben-config-")],

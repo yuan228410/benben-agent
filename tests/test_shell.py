@@ -224,9 +224,25 @@ check(
 
 posix_state = agent.ShellState(posix_info, [posix_info])
 prompt = agent.build_system_prompt(root, {}, posix_state)
-check("prompt current shell", "当前 shell：sh" in prompt)
+check("prompt startup shell", "启动时 shell：sh" in prompt)
 check("prompt available", "可用 shell（按优先顺序）：sh" in prompt)
+check("prompt static note", "系统提示只在启动时生成" in prompt)
+check("prompt startup date", "启动日期：" in prompt)
 check("prompt posix commands", "grep/awk/sed" in prompt)
+check("prompt no fabrication", "不要编造" in prompt)
+check("prompt online lookup", "curl" in prompt and "Invoke-WebRequest" in prompt)
+check("prompt timeliness", "时效性" in prompt and "发布日期" in prompt)
+check("prompt plan first", "复杂任务" in prompt and "确认后再执行" in prompt)
+check("prompt progress updates", "阶段性汇报" in prompt and "不要长时间没有任何反馈" in prompt)
+check("prompt self verify", "先自己验证" in prompt)
+check("prompt interactive mode", "交互模式" in prompt)
+one_shot_prompt = agent.build_system_prompt(root, {}, posix_state, "one_shot")
+check("prompt one-shot mode", "一次性任务" in one_shot_prompt)
+web_prompt = agent.build_system_prompt(root, {}, posix_state, "web")
+check("prompt web no approval", "网页模式没有工具审批" in web_prompt)
+check("prompt completion report", "改了什么" in web_prompt)
+check("prompt loop guard", "连续失败两次" in web_prompt)
+check("prompt network privacy", "不可信 URL" in web_prompt)
 
 powershell_state = agent.ShellState(powershell_info, [powershell_info])
 ps_prompt = agent.build_system_prompt(root, {}, powershell_state)
@@ -247,7 +263,6 @@ check("workspace shell result", "shell: sh (" in out, out)
 check("workspace list_shells", ws.list_shells().startswith("current: sh"))
 switched = ws.switch_shell("sh")
 check("workspace switch", "switched shell to: sh" in switched, switched)
-check("workspace dirty", ws.shell_state.dirty)
 tool_names = {tool["function"]["name"] for tool in agent.tool_schemas(ws)}
 check("shell tools advertised", {"list_shells", "switch_shell"} <= tool_names, tool_names)
 check("dispatch list_shells", ws.dispatch("list_shells", {}).startswith("current: sh"))
@@ -299,6 +314,14 @@ normal_fail_ws = agent.Workspace(
 out = normal_fail_ws.run_command("anything")
 check("normal failure no fallback", "fallback-ok" not in out and "syntax error" in out, out)
 
+no_fallback_ws = agent.Workspace(
+    tempfile.mkdtemp(prefix="fallback-ws-"),
+    shell_state=agent.ShellState(shell_fail1, [shell_fail1, shell_good]),
+    shell_fallback=False,
+)
+out = no_fallback_ws.run_command("definitely-missing")
+check("fallback disabled", "fallback-ok" not in out and "reason:" in out, out)
+
 missing_shell = agent.ShellInfo("/definitely/not/a/shell", "missing", "posix")
 launch_ws = agent.Workspace(
     tempfile.mkdtemp(prefix="fallback-ws-"),
@@ -330,11 +353,12 @@ class FakeClient:
 
 
 fake = FakeClient()
-messages = [{"role": "system", "content": "old"}, {"role": "user", "content": "hi"}]
-ws.shell_state.dirty = True
+static_prompt = "old"
+messages = [{"role": "system", "content": static_prompt}, {"role": "user", "content": "hi"}]
+ws.switch_shell("sh")
 check("run_turn ok", agent.run_turn(fake, ws, messages, 2))
-check("prompt refreshed", "当前 shell" in messages[0]["content"], messages[0])
-check("dirty cleared", ws.shell_state.dirty is False)
+check("system prompt stable", messages[0]["content"] == static_prompt, messages[0])
+check("live shell after switch", "current: sh" in ws.list_shells())
 
 # ---------- CLI ----------
 home = tempfile.mkdtemp(prefix="shell-cli-")
@@ -358,6 +382,19 @@ result = subprocess.run(
     timeout=30,
 )
 check("cli shell banner", "shell: sh (" in result.stdout, result.stdout[-500:])
+
+result = subprocess.run(
+    [sys.executable, AGENT, "--shell", "sh"],
+    input="/status\n/exit\n",
+    text=True,
+    capture_output=True,
+    env=env,
+    timeout=30,
+)
+status_out = result.stdout
+check("cli status exit", result.returncode == 0, result.returncode)
+for label in ("connection:", "model:", "api:", "base_url:", "shell:", "workspace:", "session:", "config:"):
+    check(f"cli status {label}", label in status_out, status_out[-800:])
 
 shutil.rmtree(root, ignore_errors=True)
 shutil.rmtree(ws_root, ignore_errors=True)

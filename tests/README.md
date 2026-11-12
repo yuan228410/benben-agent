@@ -37,10 +37,10 @@ python3 tests/test_shell.py
 | `test_reasoning.py` | `--reasoning` 映射和请求字段 |
 | `test_anthropic.py` | Anthropic 协议转换、工具循环、Web |
 | `test_responses.py` | Responses 协议转换、工具循环、Web |
-| `test_sessions.py` | 会话列表统计、compact 计数、缓存失效 |
+| `test_sessions.py` | 会话列表统计、compact 计数、缓存失效、标题修改、`/session` CLI、迁移 |
 | `test_web_images.py` | 图片懒加载、`/api/image`、token 校验 |
 | `test_robustness.py` | 协议响应容错、畸形工具调用容错 |
 | `test_config.py` | 配置读写、权限、校验、优先级、模型解析、client 工厂 |
 | `test_connect.py` | `/connect` 向导、预设、切换/删除、`--profile`、`--no-env` |
-| `test_web_connections.py` | Web 连接设置接口、key 隐藏、热切换、Anthropic 预设 |
+| `test_web_connections.py` | Web 连接设置、key 隐藏、热切换、会话标题、思考/停止控件 |
 | `test_shell.py` | shell 检测顺序、`$SHELL` 优先、Windows 编码、工具切换、自动回退、系统提示 |

@@ -39,6 +39,12 @@ you> /model deepseek-reasoner  # 或直接写模型名
 you> /model           # 查看当前模型
 you> /shell           # 查看当前和可用 shell
 you> /shell zsh       # 切换 shell
+you> /status          # 查看连接、模型、shell、会话和工作区
+you> /session         # 列出最近会话
+you> /session use 1   # 切换到第 1 个会话
+you> /session new     # 开始新会话
+you> /session info    # 查看当前会话
+you> /session delete 2  # 删除非当前会话
 ...
 you> /exit
 ```
@@ -126,6 +132,13 @@ python3 benben-agent.py --connect "检查当前目录"
 
 Web 界面侧边栏的“连接设置”提供同样的能力：选择/新建连接、切换服务商、协议、Base URL、模型、API key。API key 不会回传到浏览器。
 
+`/connect` 的 API Key 输入：
+
+- 提示只有 `API Key: `，输入时用 `*` 回显，不显示明文。
+- 输入了 key → 保存到配置文件。
+- 新建连接直接回车 → 不保存 key，运行时读取 `OPENAI_API_KEY`。
+- 已有 key 时直接回车 → 询问“保留现有 key”还是“清空已保存的 key”。
+
 > 配置文件权限为 `0600`，但 API key 默认以明文保存。也可以把 key 留空，运行时读取 `OPENAI_API_KEY`。不要把配置文件提交到仓库。
 
 ## Shell 自动检测
@@ -159,6 +172,8 @@ python3 benben-agent.py --shell "C:\Program Files\PowerShell\7\pwsh.exe"
 ```
 
 模型也能回答“有哪些 shell”“当前用哪个”，并在用户要求时通过 `switch_shell` 工具切换。Web 聊天框输入 `/shell` 也可以查看或切换。
+
+系统提示词只在启动时生成一次，切换 shell 后不会重写，避免破坏 prompt 缓存。模型通过 `list_shells`、`switch_shell` 和 `run_command` 返回的 `shell:` 行获取实时 shell。
 
 执行方式：
 
@@ -214,6 +229,7 @@ Windows 乱码处理：
 | `--confirm` / `--no-confirm` | 关 | 是否在写文件和会修改状态的命令前询问；只读命令从不询问，`--yes` 是 `--no-confirm` 的别名 |
 | `--no-shell` | 关 | 禁用 `run_command` |
 | `--shell` | `auto` | shell：`auto`、`pwsh`、`powershell`、`git-bash`、`cmd`、`bash`、`zsh`、`sh` 或绝对路径 |
+| `--no-shell-fallback` | 关 | 当前 shell 不认识命令时，不自动尝试其他 shell |
 | `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
@@ -241,6 +257,9 @@ Windows 乱码处理：
 python3 benben-agent.py --reasoning deepseek:off "..."
 python3 benben-agent.py --reasoning kimi:low "..."
 python3 benben-agent.py --reasoning minimax:low "..."
+python3 benben-agent.py --reasoning openai:high "..."       # Chat/Responses
+python3 benben-agent.py --api-format anthropic-messages \
+  --reasoning anthropic:medium "..."                        # Claude extended thinking
 ```
 
 | provider | `off` | 级别 | 实际发送 |
@@ -248,13 +267,20 @@ python3 benben-agent.py --reasoning minimax:low "..."
 | `deepseek` | `thinking: {"type":"disabled"}` | `minimal`→low，`low/medium/high`，`max`→high | `thinking` / `reasoning_effort` |
 | `kimi` | `thinking: {"type":"disabled"}` | 同 DeepSeek | `thinking` / `reasoning_effort` |
 | `minimax` | **不支持，启动报错** | `minimal`→low，`low/medium/high/max` | `reasoning_effort` |
+| `openai` | 不发送 | `minimal/low`→low，`medium`→medium，`high/max`→high | Chat：`reasoning_effort`；Responses：`reasoning.effort` |
+| `anthropic` | 不发送 | 按级别映射 `budget_tokens` | `thinking: {"type":"enabled","budget_tokens":...}` |
 
 - 不设置 `--reasoning` 时不发送任何思考字段，使用模型默认值；MiniMax-M3.1-Flash 默认是 `max`。
 - DeepSeek/Kimi 的 `off` 实测能把 reasoning token 归零；MiniMax-M3.1-Flash 强制 adaptive thinking，不能关闭。
 - `none` 可以作为 `off` 的别名，但 `minimax:none` 同样会报错。
 - 交互模式用 `/reasoning provider:level` 设置，`/reasoning clear` 清除，`/reasoning` 查看当前值。
 - 如果网关忽略了 `off`，运行时会打印一次警告。
-- `qwen`、`glm`、`claude`、`openai/codex`、`gemini`、`grok` 暂不支持；指定这些 provider 会直接报错，避免误以为生效。
+- `qwen`、`glm`、`claude`、`gemini`、`grok` 暂不支持；指定这些 provider 会直接报错，避免误以为生效。
+- Provider 要和协议匹配：
+  - `openai-chat-completions`：deepseek / kimi / minimax / openai
+  - `anthropic-messages`：anthropic
+  - `openai-responses`：openai
+- Anthropic 的 `budget_tokens` 会根据 `--max-tokens` 自动限制，确保小于输出上限。
 - 切换模型时如果 provider 与模型名明显不匹配，会给出警告，但不会自动清除配置。
 - `/compact` 的摘要调用复用同一份配置，`off` 时摘要也更省 token。
 
@@ -274,8 +300,7 @@ python3 benben-agent.py \
 - 默认认证是 `x-api-key` + `anthropic-version: 2023-06-01`；只认 Bearer 的兼容网关用 `--anthropic-auth bearer`；
 - Anthropic 必须传 `max_tokens`，默认 8192，可用 `--max-tokens` 调整；
 - 支持文本、工具调用、PNG/JPEG/GIF/WEBP 图片；BMP 会直接报错；
-- 非流式；暂不支持 Claude extended thinking、prompt caching、PDF；
-- `--reasoning` 只用于 OpenAI 兼容的 deepseek/kimi/minimax，Anthropic 模式会报错；
+- 非流式；支持 extended thinking（`--reasoning anthropic:low/medium/high`），不支持 prompt caching、PDF；
 - 内网 A 系列本身走 OpenAI 兼容接口，不需要加 `--api-format anthropic-messages`。
 
 ## Responses 协议
@@ -298,18 +323,19 @@ python3 benben-agent.py \
 - `max_output_tokens` 默认 8192，可用 `--max-tokens` 调整；
 - 支持 PNG/JPEG/GIF/WEBP 图片，BMP 会报错；
 - `store` 固定为 `false`；
-- 暂不支持流式、内置工具（web_search/file_search/computer_use）和 `reasoning.effort` 映射；
-- `--reasoning` 与 `responses` 同时使用会启动报错；
+- 支持 `reasoning.effort` 映射（`--reasoning openai:low/medium/high`）；
+- 暂不支持流式、内置工具（web_search/file_search/computer_use）；
 - 内网网关也支持 `/v1/responses`，可以直接用 `--api-format openai-responses`。
 
 ## 会话持久化
 
-每个会话保存为 `~/.benben-agent/` 下的 JSONL 文件，一行一条消息：
+每个会话保存为 `~/.benben-agent/sessions/` 下的 JSONL 文件，一行一条消息：
 
 ```text
-~/.benben-agent/001-20260911-a1b2c3d4.jsonl
+~/.benben-agent/sessions/001-20260911-a1b2c3d4.jsonl
 ```
 
+- 旧版本放在 `~/.benben-agent/*.jsonl` 的会话会在启动时自动移动到 `sessions/`；
 - 文件名：全局递增序号 + 日期 + 8 位 uuid；
 - 目录权限 `0700`，文件 `0600`；
 - system prompt 不保存，启动时按当前配置重新生成；
@@ -330,7 +356,21 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 
 `--list` 显示 uuid、日期、消息数、模型、工作区和首条用户消息，按序号倒序。恢复只带回消息历史；模型仍由 `-m`/默认值决定，工具根目录仍是当前 `--cwd`。
 
-交互模式里 `/reset` 会清空上下文并结束当前会话文件，下一条消息写入新文件，旧文件保留可随时 `-c` 恢复。删除会话目前只在网页入口提供（带确认弹框），CLI 没有删除命令。
+交互模式里用 `/session` 管理会话：
+
+```text
+/session                    列出最近会话
+/session list all           列出全部会话
+/session list <关键词>      按标题/UUID/模型过滤
+/session use <编号|uuid>    切换会话
+/session new                开始新会话（同 /reset）
+/session info               查看当前会话
+/session info <编号|uuid>   查看指定会话
+/session rename <新标题>    修改当前会话标题
+/session delete <编号|uuid> 删除会话（不能删除当前会话）
+```
+
+`/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏也提供会话列表、新建和删除；右键会话可以修改名称，聊天框输入 `/session` 也可以管理。
 
 ### 压缩上下文
 
@@ -407,7 +447,10 @@ python3 benben-agent.py --web
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
 - 页面支持对话、新建/切换/删除历史会话（删除有确认弹框）、上传图片，左侧下拉框可以切换模型（等价于 CLI 的 `/model`，切换后立即生效）；
-- 输入框下方有「压缩」按钮，等价于 `/compact`；在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
+- 会话列表支持右键菜单修改名称；聊天框输入 `/session` 也可以管理会话；
+- 输入框下方有「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级只对 `openai-chat-completions` 生效；
+- 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；
+- 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
 - 历史会话里的图片默认只显示「点击加载」占位，点击后才请求 `/api/image` 并打开灯箱，避免首屏传输大量 base64；刚上传的图片仍直接显示本地预览；
 - 网页模式强制免确认，`run_command` 是否可用仍由 `--no-shell` 决定；shell 开启时启动会打印提醒；
@@ -483,7 +526,7 @@ python3 tests/run_all.py
 - MiniMax-M3.1-Flash 不能关闭思考，只能降低 `reasoning_effort`；Qwen、GLM、Claude、OpenAI/Codex、Gemini、Grok 未纳入思考映射。
 - Anthropic 协议目前是非流式的，不支持 Claude extended thinking、prompt caching 和 PDF 输入。
 - Responses 协议目前是非流式、无状态的，不支持内置工具（web_search/file_search/computer_use）和 `reasoning.effort` 映射。
-- 会话文件默认只增不减，`/compact` 也只在末尾追加压缩记录，不删除原历史；文件包含完整对话内容，注意 `~/.benben-agent/` 的访问权限。
+- 会话文件默认只增不减，`/compact` 也只在末尾追加压缩记录，不删除原历史；文件包含完整对话内容，注意 `~/.benben-agent/sessions/` 的访问权限。
 - 交互模式下网络/API 错误只打印原因并保留历史，不会退出；可以直接重试，或 `/exit` 后用 `-c` 恢复。
 - 网页使用步骤级 SSE，长回答仍要等单次模型请求返回；只适合本机单用户使用，不做多用户隔离。
 - 网页里 assistant 输出的远程 `https` 图片会直接加载，会向图片服务器暴露本机 IP；上传的图片以 base64 写入会话文件，带图会话会明显变大。

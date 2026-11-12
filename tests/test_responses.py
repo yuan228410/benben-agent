@@ -228,6 +228,15 @@ check("cli instructions", "instructions" in sent, sent.keys())
 check("cli auth", Handler.headers[-1].get("authorization") == "Bearer t", Handler.headers[-1])
 
 result = subprocess.run(
+    [sys.executable, AGENT, "--api-format", "openai-responses", "--base-url", BASE,
+     "--api-key", "t", "-m", "resp-test", "--reasoning", "openai:high", "hi"],
+    capture_output=True, text=True, timeout=60, env=env,
+)
+check("responses reasoning exit", result.returncode == 0, result.stderr[-300:])
+sent = Handler.requests[-1]
+check("responses reasoning effort", sent.get("reasoning") == {"effort": "high"}, sent.get("reasoning"))
+
+result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "openai-responses", "--reasoning", "deepseek:low", "hi"],
     capture_output=True, text=True, timeout=30, env=env,
 )
