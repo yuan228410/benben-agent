@@ -234,6 +234,7 @@ Windows 乱码处理：
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
 | `--plain` | 关 | 不渲染 Markdown，直接输出原始文本 |
+| `--verbose-tools` | 关 | 显示完整工具参数和工具结果（最多 20000 字符） |
 | `--thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`（网关返回该字段时）；交互模式可用 `/thinking on\|off` 切换 |
 | `--reasoning` | 不发送 | 思考控制，格式 `provider:level`；provider 支持 `deepseek`/`kimi`/`minimax`，level 支持 `off/minimal/low/medium/high/max`；详见下文 |
 | `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
@@ -366,11 +367,15 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 /session new                开始新会话（同 /reset）
 /session info               查看当前会话
 /session info <编号|uuid>   查看指定会话
+/session export <编号|uuid> [--tool] [--thinking] [文件]
+                            导出 Markdown
 /session rename <新标题>    修改当前会话标题
 /session delete <编号|uuid> 删除会话（不能删除当前会话）
 ```
 
-`/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏也提供会话列表、新建和删除；右键会话可以修改名称，聊天框输入 `/session` 也可以管理。
+`/session export` 默认只导出对话正文；`--tool` 同时导出工具调用和工具结果，`--thinking` 导出思考内容。不指定文件时写入当前工作区的 `session-<uuid>.md`。
+
+`/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏也提供会话列表、新建和删除；右键会话可以修改名称或导出 Markdown，聊天框输入 `/session` 也可以管理。
 
 ### 压缩上下文
 
@@ -447,8 +452,9 @@ python3 benben-agent.py --web
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
 - 页面支持对话、新建/切换/删除历史会话（删除有确认弹框）、上传图片，左侧下拉框可以切换模型（等价于 CLI 的 `/model`，切换后立即生效）；
-- 会话列表支持右键菜单修改名称；聊天框输入 `/session` 也可以管理会话；
-- 输入框下方有「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级只对 `openai-chat-completions` 生效；
+- 会话列表支持右键菜单修改名称、导出 Markdown；聊天框输入 `/session` 也可以管理会话；
+- 工具调用显示为可展开块，默认折叠；展开后可查看完整参数和工具结果，历史会话也会回放；
+- 输入框下方有「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级按协议显示 DeepSeek/Kimi/MiniMax/OpenAI/Anthropic 选项；
 - 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；
 - 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；

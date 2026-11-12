@@ -231,6 +231,32 @@ check("run_turn with edit_file", ok and "GAMMA" in open(os.path.join(base, "edit
 check("all 9 tools sent", messages[-1]["content"] == "done:list_dir,read_file,search,glob,write_file,edit_file,run_command,list_shells,switch_shell", messages[-1])
 
 
+history_messages = [
+    {"role": "user", "content": "go"},
+    {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+        }],
+    },
+    {"role": "tool", "tool_call_id": "c1", "content": "file body"},
+]
+history_with_tools = agent.history_view(history_messages, include_tools=True)
+check(
+    "history tool roles",
+    [item["role"] for item in history_with_tools] == ["user", "tool_call", "tool_result"],
+    history_with_tools,
+)
+check("history tool args", "a.txt" in history_with_tools[1]["arguments"], history_with_tools)
+check("history tool result", history_with_tools[2]["text"] == "file body", history_with_tools)
+check("history tools off", len(agent.history_view(history_messages)) == 1)
+clipped = agent._clip_tool_text("x" * 30000)
+check("clip tool text", len(clipped) < 30000 and "truncated" in clipped)
+
+
 class CancelClient:
     last_turn_usage = {}
     last_turn_truncated = False

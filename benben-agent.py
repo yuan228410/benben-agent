@@ -40,6 +40,7 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
                             bash、zsh、sh 或绝对路径（默认 auto）
     --no-shell-fallback     当前 shell 不认识命令时，不自动尝试其他 shell
     --plain                 不渲染终端 Markdown，直接输出原文
+    --verbose-tools         显示完整工具参数和工具结果（最多 20000 字符）
     -i, --image PATH        给任务附加图片，可重复，最多 4 张、单张 10 MB
     --thinking              打印模型的 reasoning_content（默认关闭）
     --reasoning PROVIDER:LEVEL
@@ -72,6 +73,8 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /session use <number|uuid>    切换会话
     /session new                  开始新会话
     /session info [number|uuid]   查看当前或指定会话
+    /session export <number|uuid> [--tool] [--thinking] [file]
+                                  导出会话 Markdown
     /session rename <title>       修改当前会话标题
     /session delete <number|uuid> 删除会话（不能删除当前会话）
     /reset                        清空上下文，下一条消息开新会话文件
@@ -2857,7 +2860,11 @@ def _message_text(content: Any) -> str:
     return "[图片]" if isinstance(content, list) else ""
 
 
-def history_view(messages: list[dict[str, Any]], lazy_images: bool = False) -> list[dict[str, Any]]:
+def history_view(
+    messages: list[dict[str, Any]],
+    lazy_images: bool = False,
+    include_tools: bool = False,
+) -> list[dict[str, Any]]:
     view = []
     for message_index, message in enumerate(messages):
         if message.get("_compact"):
@@ -2882,6 +2889,16 @@ def history_view(messages: list[dict[str, Any]], lazy_images: bool = False) -> l
             view.append({"role": "notice", "text": label, "summary": summary})
             continue
         role = message.get("role")
+        if role == "tool":
+            if include_tools:
+                raw = message.get("content")
+                text = raw if isinstance(raw, str) else _message_text(raw)
+                view.append({
+                    "role": "tool_result",
+                    "text": _clip_tool_text(text),
+                    "tool_call_id": message.get("tool_call_id"),
+                })
+            continue
         if role not in ("user", "assistant"):
             continue
         content = message.get("content")
@@ -2914,12 +2931,32 @@ def history_view(messages: list[dict[str, Any]], lazy_images: bool = False) -> l
                         else:
                             images.append(url)
         text = "\n".join(texts).strip("\n")
-        if not text and not images:
+        tool_calls = message.get("tool_calls") if role == "assistant" else None
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+        if not text and not images and not (include_tools and tool_calls):
             continue
-        item: dict[str, Any] = {"role": role, "text": text}
-        if images:
-            item["images"] = images
-        view.append(item)
+        if text or images:
+            item: dict[str, Any] = {"role": role, "text": text}
+            if images:
+                item["images"] = images
+            view.append(item)
+        if include_tools:
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    function = {}
+                arguments = function.get("arguments")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments or {}, ensure_ascii=False)
+                view.append({
+                    "role": "tool_call",
+                    "name": function.get("name") or "unknown",
+                    "arguments": _clip_tool_text(arguments),
+                    "call_id": call.get("id"),
+                })
     return view
 
 
@@ -4956,6 +4993,7 @@ def run_turn(
     emit: "Callable[[str, str], None] | None" = None,
     tools: list[dict[str, Any]] | None = None,
     cancel_event: "threading.Event | None" = None,
+    verbose_tools: bool = False,
 ) -> bool:
     """Let the model call tools until it produces a final answer. Returns True if it did."""
 
@@ -4969,6 +5007,9 @@ def run_turn(
                 print(f"{_agent_prefix()}{text.rstrip(chr(10) + chr(13))}", flush=True)
         elif kind == "tool":
             print(_style(f"  {text}", DIM, supports_color()), flush=True)
+        elif kind == "tool_result":
+            indented = (text or "(empty)").replace("\n", "\n  ")
+            print(_style(f"  [result] {indented}", DIM, supports_color()), flush=True)
         elif kind == "usage":
             print(_style(f"  {text}", DIM, supports_color()), file=sys.stderr, flush=True)
         elif kind == "warning":
@@ -5044,7 +5085,10 @@ def run_turn(
                         "content": "cancelled by user",
                     })
                     continue
-                report("tool", f"[{name}] {_one_line(raw_arguments, 120)}")
+                if verbose_tools:
+                    report("tool", f"[{name}] {_clip_tool_text(raw_arguments)}")
+                else:
+                    report("tool", f"[{name}] {_one_line(raw_arguments, 120)}")
                 try:
                     arguments = json.loads(raw_arguments)
                     if not isinstance(arguments, dict):
@@ -5054,6 +5098,8 @@ def run_turn(
                     result = f"error: {exc}"
 
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+                if verbose_tools:
+                    report("tool_result", _clip_tool_text(result))
 
         print(f"[stopped] reached the limit of {max_steps} model calls without a final answer", file=sys.stderr)
         return False
@@ -5081,6 +5127,13 @@ def run_turn(
 def _one_line(text: str, limit: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _clip_tool_text(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"\n... (truncated at {limit} characters)"
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -5310,7 +5363,7 @@ def print_help() -> None:
     print("          /image [path|clear], /save [--tool] [--thinking] [file],")
     print("          /confirm on|off, /thinking on|off, /reasoning provider:level,")
     print("          /model [name|number|list], /shell [name|path|list|auto],")
-    print("          /session [list|new|use <id>|rename <title>|delete <id>|info],")
+    print("          /session [list|new|use <id>|export <id>|rename|delete|info],")
     print("          /status,")
     print("          /exit (Ctrl-D)")
     print("Connect:  /connect opens the wizard; saved connections live in")
@@ -5437,6 +5490,12 @@ def render_history(
     return "\n".join(lines).strip() + "\n"
 
 
+def session_export_filename(uuid: str, title: str) -> str:
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "-", title or "")
+    safe = safe.strip(" .-")[:60]
+    return f"{uuid}-{safe or 'session'}.md"
+
+
 class InterruptGuard:
     """Require two consecutive Ctrl+C presses within a short window."""
 
@@ -5490,6 +5549,10 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .msg.user { align-self: flex-end; background: #dcebff; }
 .msg.assistant { align-self: flex-start; background: #fff; border: 1px solid #e3e6ea; white-space: normal; }
 .tool { align-self: flex-start; color: #8a919c; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
+.tool-detail { align-self: flex-start; width: 100%; max-width: 820px; margin: -6px 0 10px; color: #667085; font-size: 12px; }
+.tool-detail summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tool-detail pre { white-space: pre-wrap; word-break: break-word; background: #f9fafb; border: 1px solid #e3e6ea; border-radius: 6px; padding: 8px; margin: 6px 0 0; max-height: 320px; overflow: auto; font-size: 12px; }
+.tool-detail pre.tool-result { background: #fff; }
 .warning { align-self: flex-start; color: #d92d20; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
 .compact { align-self: stretch; margin: -2px 0 12px; padding: 8px 12px; border: 1px dashed #c9ced6; border-radius: 8px; background: #fafbfc; color: #667085; font-size: 12px; white-space: normal; }
 .compact summary { cursor: pointer; }
@@ -5555,6 +5618,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .form-row { margin-bottom: 10px; }
 .form-row label { display: block; color: #667085; font-size: 12px; margin-bottom: 4px; }
 .form-row input, .form-row select { width: 100%; padding: 7px 8px; border: 1px solid #c9ced6; border-radius: 6px; background: #fff; font: inherit; }
+.form-row input[type="checkbox"] { width: auto; margin-right: 6px; }
 .conn-model-row { display: flex; gap: 6px; }
 .conn-model-row input { flex: 1; min-width: 0; }
 .conn-model-row button { flex: none; padding: 6px 10px; border: 1px solid #c9ced6; border-radius: 6px; background: #f9fafb; cursor: pointer; }
@@ -5682,6 +5746,26 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 </div>
 <div id="session-menu" class="session-menu" hidden>
   <button id="session-rename" type="button">修改名称</button>
+  <button id="session-export" type="button">导出会话</button>
+</div>
+<div id="export-modal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong id="export-title">导出会话</strong>
+      <button id="export-close" class="close" type="button" title="关闭">×</button>
+    </div>
+    <div class="form-row">
+      <label><input id="export-thinking" type="checkbox" checked> 包含思考内容</label>
+    </div>
+    <div class="form-row">
+      <label><input id="export-tools" type="checkbox" checked> 包含工具调用和结果</label>
+    </div>
+    <div id="export-status" class="modal-status"></div>
+    <div class="modal-actions">
+      <button id="export-start" class="primary" type="button">导出 Markdown</button>
+      <button id="export-cancel" type="button">取消</button>
+    </div>
+  </div>
 </div>
 <div id="lightbox" class="lightbox" hidden>
   <img id="lightbox-img" alt="">
@@ -5694,6 +5778,8 @@ let currentReasoning = "";
 let uploads = [];
 let reading = 0;
 let chatController = null;
+let lastToolDetail = null;
+let exportSession = null;
 
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
@@ -5708,6 +5794,15 @@ const filesLabel = document.getElementById("files-label");
 const sessionsEl = document.getElementById("sessions");
 const sessionMenuEl = document.getElementById("session-menu");
 const sessionRenameEl = document.getElementById("session-rename");
+const sessionExportEl = document.getElementById("session-export");
+const exportModalEl = document.getElementById("export-modal");
+const exportTitleEl = document.getElementById("export-title");
+const exportCloseEl = document.getElementById("export-close");
+const exportThinkingEl = document.getElementById("export-thinking");
+const exportToolsEl = document.getElementById("export-tools");
+const exportStartEl = document.getElementById("export-start");
+const exportCancelEl = document.getElementById("export-cancel");
+const exportStatusEl = document.getElementById("export-status");
 const previewsEl = document.getElementById("previews");
 const modelEl = document.getElementById("model");
 const lightboxEl = document.getElementById("lightbox");
@@ -5781,7 +5876,9 @@ async function loadStoredImage(id, name) {
 lightboxEl.addEventListener("click", closeLightbox);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (!connectModalEl.hidden) {
+  if (!exportModalEl.hidden) {
+    closeExportModal();
+  } else if (!connectModalEl.hidden) {
     closeConnectModal();
   } else if (!lightboxEl.hidden) {
     closeLightbox();
@@ -5813,6 +5910,50 @@ function addLine(cls, text) {
   div.textContent = text;
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+function addToolDetail(text, callId) {
+  const details = document.createElement("details");
+  details.className = "tool-detail";
+  if (callId) details.dataset.callId = callId;
+  const summary = document.createElement("summary");
+  const firstLine = String(text || "(empty)").split("\n")[0];
+  summary.textContent = firstLine.length > 140 ? firstLine.slice(0, 137) + "..." : firstLine;
+  const pre = document.createElement("pre");
+  pre.textContent = String(text || "(empty)");
+  details.appendChild(summary);
+  details.appendChild(pre);
+  logEl.appendChild(details);
+  logEl.scrollTop = logEl.scrollHeight;
+  lastToolDetail = details;
+}
+
+function addToolResult(text, callId) {
+  let target = null;
+  if (callId) {
+    target = Array.from(logEl.querySelectorAll(".tool-detail")).find(
+      element => element.dataset.callId === callId
+    ) || null;
+  }
+  if (!target) target = lastToolDetail;
+  if (!target) {
+    target = document.createElement("details");
+    target.className = "tool-detail";
+    const summary = document.createElement("summary");
+    summary.textContent = "[tool result]";
+    target.appendChild(summary);
+    logEl.appendChild(target);
+    lastToolDetail = target;
+  }
+  const pre = document.createElement("pre");
+  pre.className = "tool-result";
+  pre.textContent = "结果:\n" + String(text || "(empty)");
+  target.appendChild(pre);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function formatToolCall(message) {
+  return "[" + (message.name || "tool") + "] " + (message.arguments || "");
 }
 
 function escapeHtml(text) {
@@ -6000,6 +6141,7 @@ function addUserMessage(text, images, lazy) {
 
 function renderHistory(messages) {
   logEl.textContent = "";
+  lastToolDetail = null;
   for (const message of messages) {
     if (message.role === "notice") {
       const details = document.createElement("details");
@@ -6012,6 +6154,10 @@ function renderHistory(messages) {
       details.appendChild(summary);
       details.appendChild(body);
       logEl.appendChild(details);
+    } else if (message.role === "tool_call") {
+      addToolDetail(formatToolCall(message), message.call_id);
+    } else if (message.role === "tool_result") {
+      addToolResult(message.text || "", message.tool_call_id);
     } else if (message.role === "assistant") {
       addMarkdown(message.text);
     } else {
@@ -6075,10 +6221,65 @@ async function renameSessionFromMenu() {
   }
 }
 
+function openExportModal(session) {
+  if (!session) return;
+  exportSession = session;
+  exportTitleEl.textContent = "导出会话：" + session.uuid;
+  exportThinkingEl.checked = true;
+  exportToolsEl.checked = true;
+  exportStatusEl.textContent = "";
+  exportModalEl.hidden = false;
+}
+
+function closeExportModal() {
+  exportModalEl.hidden = true;
+  exportSession = null;
+}
+
+async function exportSessionMarkdown() {
+  if (!exportSession) return;
+  exportStartEl.disabled = true;
+  exportStatusEl.textContent = "正在导出…";
+  try {
+    const data = await api("/api/session/export", {
+      session: exportSession.uuid,
+      include_thinking: exportThinkingEl.checked,
+      include_tools: exportToolsEl.checked,
+    });
+    const blob = new Blob([data.markdown], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = data.filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    exportStatusEl.textContent = "已导出: " + data.filename;
+    statusEl.textContent = "已导出: " + data.filename;
+  } catch (err) {
+    exportStatusEl.textContent = "导出失败: " + String(err);
+  } finally {
+    exportStartEl.disabled = false;
+  }
+}
+
 sessionRenameEl.onclick = (event) => {
   event.stopPropagation();
   renameSessionFromMenu();
 };
+sessionExportEl.onclick = (event) => {
+  event.stopPropagation();
+  const session = menuSession;
+  hideSessionMenu();
+  openExportModal(session);
+};
+exportCloseEl.onclick = closeExportModal;
+exportCancelEl.onclick = closeExportModal;
+exportStartEl.onclick = exportSessionMarkdown;
+exportModalEl.addEventListener("click", (event) => {
+  if (event.target === exportModalEl) closeExportModal();
+});
 document.addEventListener("click", () => {
   if (!sessionMenuEl.hidden) hideSessionMenu();
 });
@@ -6826,6 +7027,7 @@ async function send() {
   filesLabel.textContent = "";
   renderPreviews();
   sendEl.disabled = true;
+  lastToolDetail = null;
   const controller = new AbortController();
   chatController = controller;
   stopEl.hidden = false;
@@ -6860,7 +7062,8 @@ async function send() {
         if (!line) continue;
         const event = JSON.parse(line.slice(6));
         if (event.type === "content") addMarkdown(event.text);
-        else if (event.type === "tool") addLine("tool", event.text);
+        else if (event.type === "tool") addToolDetail(event.text);
+        else if (event.type === "tool_result") addToolResult(event.text);
         else if (event.type === "thinking") addLine("tool", "思考: " + event.text);
         else if (event.type === "usage") addLine("tool", event.text);
         else if (event.type === "warning") addLine("warning", "⚠ " + event.text);
@@ -7140,6 +7343,7 @@ def run_web(
                         emit=emit,
                         tools=tools,
                         cancel_event=chat_state["cancel"],
+                        verbose_tools=True,
                     )
                 except ChatError as exc:
                     detail = f"model request failed: {exc}"
@@ -7276,7 +7480,7 @@ def run_web(
                             "level": active_reasoning.level if active_reasoning else "",
                             "supported": bool(active_client.supports_reasoning_config),
                         },
-                        "messages": history_view(state["messages"], lazy_images=True),
+                        "messages": history_view(state["messages"], lazy_images=True, include_tools=True),
                     })
                 return
             if parsed.path == "/api/runtime":
@@ -7358,6 +7562,45 @@ def run_web(
                     self._json(200, {"session": target, "title": normalized})
                 return
 
+            if parsed.path == "/api/session/export":
+                session_id = payload.get("session")
+                if not isinstance(session_id, str) or not session_id:
+                    self._error(400, "session must be a non-empty string")
+                    return
+                include_thinking = payload.get("include_thinking", True)
+                include_tools = payload.get("include_tools", True)
+                if not isinstance(include_thinking, bool) or not isinstance(include_tools, bool):
+                    self._error(400, "include_thinking/include_tools must be booleans")
+                    return
+                rows = session_summaries()
+                row = next(
+                    (item for item in rows if item.get("uuid") == session_id),
+                    None,
+                )
+                if row is None:
+                    self._error(404, f"session not found: {session_id}")
+                    return
+                messages: list[dict[str, Any]] = []
+                try:
+                    load_session(session_id, messages)
+                except SessionError as exc:
+                    self._error(400, str(exc))
+                    return
+                markdown = render_history(
+                    messages,
+                    str(row.get("model") or "?"),
+                    str(row.get("workspace") or "?"),
+                    include_tools=include_tools,
+                    include_thinking=include_thinking,
+                )
+                self._json(200, {
+                    "filename": session_export_filename(
+                        session_id, str(row.get("title") or "")
+                    ),
+                    "markdown": markdown,
+                })
+                return
+
             if parsed.path == "/api/delete":
                 uuid = payload.get("session")
                 if not isinstance(uuid, str):
@@ -7393,7 +7636,7 @@ def run_web(
                         return
                     state["messages"] = messages
                     state["session"] = session
-                    self._json(200, {"session": session.uuid, "messages": history_view(messages, lazy_images=True)})
+                    self._json(200, {"session": session.uuid, "messages": history_view(messages, lazy_images=True, include_tools=True)})
                 return
 
             if parsed.path == "/api/model":
@@ -7711,7 +7954,7 @@ def run_web(
                         return
                     self._json(200, {
                         "session": state["session"].uuid,
-                        "messages": history_view(state["messages"], lazy_images=True),
+                        "messages": history_view(state["messages"], lazy_images=True, include_tools=True),
                         **stats,
                     })
                 return
@@ -7871,6 +8114,11 @@ def main(argv: list[str] | None = None) -> int:
         help="do not retry a command in other shells when the current shell does not recognize it",
     )
     parser.add_argument("--plain", action="store_true", help="print raw Markdown instead of terminal rendering")
+    parser.add_argument(
+        "--verbose-tools",
+        action="store_true",
+        help="print full tool arguments and tool results (up to 20000 characters)",
+    )
     parser.add_argument(
         "-i",
         "--image",
@@ -8144,6 +8392,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if run_turn(
                 client, workspace, messages, args.max_steps, render_output, args.thinking, session,
                 tools=tools,
+                verbose_tools=args.verbose_tools,
             ) else 1
 
         show_thinking = args.thinking
@@ -8419,6 +8668,59 @@ def main(argv: list[str] | None = None) -> int:
                         print(line)
                     continue
 
+                if action == "export":
+                    if not rest:
+                        print("usage: /session export <number|uuid> [--tool] [--thinking] [file]")
+                        continue
+                    try:
+                        tokens = shlex.split(
+                            rest,
+                            posix=not sys.platform.startswith("win"),
+                        )
+                    except ValueError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
+                    if not tokens:
+                        print("usage: /session export <number|uuid> [--tool] [--thinking] [file]")
+                        continue
+                    include_tools = False
+                    include_thinking = False
+                    path_parts: list[str] = []
+                    for token in tokens[1:]:
+                        if token in ("--tool", "--tools"):
+                            include_tools = True
+                        elif token == "--thinking":
+                            include_thinking = True
+                        else:
+                            path_parts.append(token)
+                    rows = session_summaries()
+                    try:
+                        row = resolve_session_ref(tokens[0], rows)
+                    except SessionError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
+                    messages_to_export: list[dict[str, Any]] = []
+                    try:
+                        load_session(row["uuid"], messages_to_export)
+                    except SessionError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
+                    markdown = render_history(
+                        messages_to_export,
+                        str(row.get("model") or "?"),
+                        str(row.get("workspace") or "?"),
+                        include_tools=include_tools,
+                        include_thinking=include_thinking,
+                    )
+                    output_path = " ".join(path_parts).strip() or f"session-{row['uuid']}.md"
+                    try:
+                        saved = workspace.save_text(output_path, markdown)
+                    except ToolError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
+                    print(f"exported session {row['uuid']} to {saved}")
+                    continue
+
                 if action in ("rename", "title"):
                     if not rest:
                         print("usage: /session rename <new title>")
@@ -8468,13 +8770,14 @@ def main(argv: list[str] | None = None) -> int:
                 if action == "help":
                     print(
                         "usage: /session [list [all|keyword]|new|use <id|number>|"
-                        "info [id|number]|rename <title>|delete <id|number>]"
+                        "info [id|number]|export <id|number> [--tool] [--thinking] [file]|"
+                        "rename <title>|delete <id|number>]"
                     )
                     continue
 
                 print(
-                    "usage: /session [list|new|use <id>|rename <title>|"
-                    "delete <id>|info|help]"
+                    "usage: /session [list|new|use <id>|export <id> [--tool] [--thinking] [file]|"
+                    "rename <title>|delete <id>|info|help]"
                 )
                 continue
             if user_input == "/reset":
@@ -8703,6 +9006,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_turn(
                     client, workspace, messages, args.max_steps, render_output, show_thinking, session,
                     tools=tools,
+                    verbose_tools=args.verbose_tools,
                 )
             except ChatError as exc:
                 print(f"error: {exc}", file=sys.stderr)

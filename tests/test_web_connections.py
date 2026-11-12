@@ -145,6 +145,8 @@ try:
     check("web html slash status", "handleStatusCommand" in html)
     check("web html slash session", "handleSessionCommand" in html)
     check("web html session menu", 'id="session-menu"' in html and 'id="session-rename"' in html)
+    check("web html export", 'id="session-export"' in html and 'id="export-modal"' in html)
+    check("web html tool details", "addToolDetail" in html and "tool-detail" in html)
     check("web html thinking toggle", 'id="thinking-toggle"' in html)
     check("web html reasoning select", 'id="reasoning"' in html)
     check("web html stop button", 'id="stop"' in html)
@@ -225,6 +227,37 @@ try:
     sessions = api_json("/api/sessions")["sessions"]
     title_row = next(item for item in sessions if item["uuid"] == session_uuid)
     check("web title in list", title_row["title"] == "自定义标题", title_row)
+
+    # Export a synthetic session with thinking and tools.
+    sessions_dir = os.path.join(home, ".benben-agent", "sessions")
+    os.makedirs(sessions_dir, exist_ok=True)
+    export_path = os.path.join(sessions_dir, "099-20261112-deadbeef.jsonl")
+    export_records = [
+        {"_type": "meta", "version": 1, "uuid": "deadbeef", "sequence": 99,
+         "created": "2026-11-12T10:00:00", "model": "m", "workspace": "/tmp/ws"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "answer", "_thinking": "secret thought",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "tool output"},
+    ]
+    with open(export_path, "w", encoding="utf-8") as handle:
+        for record in export_records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    exported = api_json("/api/session/export", {
+        "session": "deadbeef",
+        "include_thinking": True,
+        "include_tools": True,
+    })
+    check("export filename", exported["filename"].startswith("deadbeef-"), exported)
+    check("export thinking", "secret thought" in exported["markdown"], exported["markdown"][:500])
+    check("export tools", "tool output" in exported["markdown"] and "read_file" in exported["markdown"])
+    minimal = api_json("/api/session/export", {
+        "session": "deadbeef",
+        "include_thinking": False,
+        "include_tools": False,
+    })
+    check("export minimal", "secret thought" not in minimal["markdown"] and "tool output" not in minimal["markdown"])
 
     data = api_json("/api/connections")
     check("saved listed", [item["name"] for item in data["connections"]] == ["work"])

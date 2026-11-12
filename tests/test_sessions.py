@@ -128,6 +128,7 @@ check(
 
 # ---------- CLI /session ----------
 env = dict(os.environ, HOME=HOME, BENBEN_CONFIG=os.path.join(HOME, "config.json"))
+export_path = os.path.join(HOME, "session-export.md")
 result = subprocess.run(
     [sys.executable, AGENT, "--shell", "auto"],
     input=(
@@ -135,6 +136,7 @@ result = subprocess.run(
         "/session use 1\n"
         "/session rename 我的会话\n"
         "/session info\n"
+        f"/session export 2 --tool --thinking {export_path}\n"
         "/session delete 2\n"
         "y\n"
         "/session\n"
@@ -150,6 +152,10 @@ check("cli session list", "sessions in" in result.stdout, result.stdout[-800:])
 check("cli session use", "resumed session" in result.stdout, result.stdout[-800:])
 check("cli session rename", "session title updated: 我的会话" in result.stdout, result.stdout[-800:])
 check("cli session info", "current session" in result.stdout and "我的会话" in result.stdout, result.stdout[-800:])
+check("cli session export", "exported session" in result.stdout and os.path.exists(export_path), result.stdout[-800:])
+if os.path.exists(export_path):
+    exported_text = open(export_path, encoding="utf-8").read()
+    check("cli export markdown", "# 会话记录" in exported_text and "## 用户" in exported_text, exported_text[:300])
 check("cli session delete", "deleted session" in result.stdout, result.stdout[-800:])
 check("cli delete removed file", not os.path.exists(path))
 check("cli kept other file", os.path.exists(os.path.join(agent.SESSIONS_DIR, legacy_name)))
