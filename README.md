@@ -234,9 +234,20 @@ Windows 乱码处理：
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
 | `--schedule` / `--no-schedule` | 关 | 是否启用定时任务并暴露调度工具；默认关闭，需显式加 `--schedule` |
-| `--plain` | 关 | 不渲染 Markdown，直接输出原始文本 |
-| `--verbose-tools` | 关 | 显示完整工具参数和工具结果（最多 20000 字符） |
-| `--thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`（网关返回该字段时）；交互模式可用 `/thinking on\|off` 切换 |
+| `--memory` / `--no-memory` | 关 | 是否启用长期记忆和情景记忆工具；默认关闭 |
+| `--memory-daily` / `--no-memory-daily` | 关 | 启动时补写昨天的自动情景记忆 |
+| `--memory-daily-time` | 无 | 配合 `--schedule`：每天到这个本地时间生成情景记忆 |
+| `--auto-compact` / `--no-auto-compact` | 关 | 上下文达到阈值时自动压缩 |
+| `--auto-compact-level` | `normal` | 8 档预设之一 |
+| `--auto-compact-threshold` / `--auto-compact-target` / `--auto-compact-keep` | 档位预设 | 覆盖触发百分比、目标保留百分比和最多保留回合 |
+| `--idle-compact` / `--no-idle-compact` | 关 | 空闲后下一次对话前自动压缩 |
+| `--idle-compact-minutes` | `10` | 空闲分钟数 |
+| `--idle-compact-level` | 跟随 auto | 空闲压缩档位 |
+| `--idle-compact-min-percent` / `--idle-compact-min-messages` | `20` / `6` | 空闲压缩的最低上下文和消息门槛 |
+| `--plain` / `--no-plain` | 关 | 是否渲染 Markdown；`--no-plain` 可覆盖配置文件 |
+| `--verbose-tools` / `--no-verbose-tools` | 关 | 显示完整工具参数和工具结果（最多 20000 字符） |
+| `--thinking` / `--no-thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`；交互模式可用 `/thinking on\|off` 切换 |
+| `--all-skill-dirs` | 关 | 关闭 `only_own_skills`，重新扫描全部技能目录 |
 | `--reasoning` | 不发送 | 思考控制，格式 `provider:level`；provider 支持 `deepseek`/`kimi`/`minimax`，level 支持 `off/minimal/low/medium/high/max`；详见下文 |
 | `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
 | `--list` | 关 | 列出已保存的会话并退出，不联网、不需要 API key |
@@ -245,11 +256,206 @@ Windows 乱码处理：
 | `--port` | `8765` | 网页端口，`0` 表示由系统分配 |
 | `--connect` | 关 | 打开连接配置向导；没有 prompt/`--web` 时配置完退出 |
 | `--profile NAME` | 无 | 使用指定保存连接，不修改配置里的 active |
-| `--config PATH` | `$BENBEN_CONFIG` 或 `~/.benben-agent/config.json` | 配置文件路径 |
-| `--no-config` | 关 | 启动时忽略配置文件 |
+| `--config PATH` | `$BENBEN_CONFIG` 或 `~/.benben-agent/config.json` | 配置文件路径；文件不存在时写入完整默认值 |
+| `--no-config` | 关 | 启动时忽略配置文件，也不创建配置文件 |
 | `--no-env` | 关 | 忽略 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` |
 
 > 有 active 保存连接时，`--base-url`、`--api-key`、`-m`、`--api-format` 的默认值来自保存连接；环境变量和显式参数会按上节优先级覆盖它。
+
+## 配置文件默认值
+
+`~/.benben-agent/config.json` 除了连接，还会保存一组 `defaults`：
+
+```json
+{
+  "version": 2,
+  "active": "deepseek",
+  "connections": {},
+  "defaults": {
+    "cwd": null,
+    "shell": "auto",
+    "shell_enabled": true,
+    "shell_fallback": true,
+    "confirm": false,
+    "thinking": false,
+    "reasoning": null,
+    "max_steps": 100,
+    "timeout": 120.0,
+    "temperature": null,
+    "max_tokens": null,
+    "plain": false,
+    "verbose_tools": false,
+    "skills": false,
+    "only_own_skills": false,
+    "skill_scripts": true,
+    "schedule": false,
+    "memory": false,
+    "memory_daily": false,
+    "memory_daily_time": null,
+    "auto_compact": {
+      "enabled": false,
+      "level": "normal",
+      "threshold": null,
+      "target_ratio": null,
+      "keep": null
+    },
+    "idle_compact": {
+      "enabled": false,
+      "minutes": 10,
+      "level": null,
+      "min_context_percent": 20,
+      "min_messages": 6
+    },
+    "web": {"host": "127.0.0.1", "port": 8765}
+  }
+}
+```
+
+规则：
+
+- 配置文件不存在时，启动会写入完整默认值，只写一次
+- 已有配置缺少字段时使用内置默认值，不会自动改写
+- 优先级：显式 CLI 参数 > `config.json` 的 `defaults` > 内置默认值
+- `--no-config` 不读取也不创建配置文件，适合临时运行
+- `cwd` 默认 `null`，表示使用当前目录
+- `/config save` 会把当前有效设置写回 `defaults`，包括当前 `cwd` 和 shell
+- `--no-thinking`、`--no-plain`、`--no-verbose-tools`、`--all-skill-dirs` 可以覆盖配置文件里的 true
+
+交互模式：
+
+```text
+/config          查看配置文件路径和已保存默认值
+/config path     只打印配置文件路径
+/config save     保存当前有效设置
+```
+
+例如先运行一次：
+
+```bash
+python3 benben-agent.py --memory --thinking --max-steps 50
+```
+
+然后在交互模式执行：
+
+```text
+/config save
+```
+
+下次直接启动就会使用这些设置，不必重复加参数。注意 `cwd` 也会被保存为当前工作区的绝对路径；如果希望跟随当前目录，请保持 `cwd` 为 `null`。
+
+## 模型能力信息
+
+模型名称之外，还可以配置上下文大小、最大输出、输入/输出模态、工具和 reasoning 支持。存储在：
+
+```text
+~/.benben-agent/models.json
+```
+
+首次启动且没有该文件时会写入兜底配置。形状：
+
+```json
+{
+  "version": 1,
+  "fallback": {
+    "context_window": 256000,
+    "max_output_tokens": 8192,
+    "supports_tools": true,
+    "supports_reasoning": null,
+    "notes": "Used when the model is not listed in models.json"
+  },
+  "models": {
+    "deepseek/deepseek-chat": {
+      "name": "DeepSeek Chat",
+      "context_window": 128000,
+      "max_output_tokens": 8192,
+      "input": ["text"],
+      "output": ["text"],
+      "supports_tools": true,
+      "supports_parallel_tools": true,
+      "supports_reasoning": false,
+      "reasoning_providers": [],
+      "api_formats": ["openai-chat-completions"],
+      "notes": "按实际网关修改",
+      "updated": "2026-11-12"
+    }
+  }
+}
+```
+
+查找顺序：
+
+1. `provider/model` 精确匹配
+2. 模型名匹配
+3. 连接 profile 里的 `model_info` 覆盖
+4. `models.json` 的 `fallback`
+5. 内置兜底
+
+当前兜底上下文为 **256000 tokens**，最大输出 `8192`。模型能力信息不包含价格。
+
+连接级覆盖示例：
+
+```json
+{
+  "connections": {
+    "work": {
+      "model": "custom-model",
+      "model_info": {
+        "context_window": 64000,
+        "max_output_tokens": 4096,
+        "input": ["text", "image"]
+      }
+    }
+  }
+}
+```
+
+使用方式：
+
+```text
+/model info                查看当前模型能力
+/model info <名称|编号>     查看指定模型能力
+/model config              配置/更新当前模型能力
+/model config <名称|编号>   配置指定模型能力
+/context                   查看当前上下文估算用量
+/status                    显示模型能力和上下文
+```
+
+配置模型时：
+
+- `/connect` 选完模型后会询问上下文、最大输出、文本/图像支持、工具、reasoning 等
+- `/model` 切换到未配置的模型时会询问是否配置
+- 已有配置只展示摘要，默认不重复询问
+- 非交互终端不阻塞，使用 fallback 并提示运行 `/model config`
+
+Web 端：
+
+- 侧边栏「模型能力」按钮可以编辑当前模型
+- 切换未配置模型或保存新连接后，会自动打开模型能力对话框
+- 保存写入 `~/.benben-agent/models.json`
+- `GET /api/model/info` 读取
+- `POST /api/model/info` 保存
+
+字段：
+
+```text
+context_window
+max_output_tokens
+input: text / image / audio
+output: text / image
+supports_tools
+supports_reasoning
+reasoning_providers
+notes
+```
+
+行为：
+
+- 上下文接近 80% 时提示 `/compact`
+- 模型信息明确为 text-only 时，CLI 和 Web 会拒绝发送图片
+- 模型信息未知时允许图片，但会显示 fallback 来源
+- `--max-tokens` 超过模型最大输出时打印警告
+- `supports_reasoning=false` 或 provider 不匹配时打印警告
+- `/api/models` 会尝试从上游 `/models` 响应解析上下文和模态信息；解析结果只在当前进程内使用，不写回 `models.json`
 
 ## 思考参数
 
@@ -343,7 +549,9 @@ python3 benben-agent.py \
 - system prompt 不保存，启动时按当前配置重新生成；
 - 思考内容和图片的 base64 都会保存，带图片的会话文件会明显变大；
 - 加载时跳过损坏的行，进程被杀留下的半行不会导致失败；
-- 定时任务定义和运行记录单独保存在 `~/.benben-agent/schedules/`，见下文「定时任务」。
+- 定时任务定义和运行记录单独保存在 `~/.benben-agent/schedules/`，见下文「定时任务」；
+- 长期记忆和情景记忆保存在 `~/.benben-agent/memory/`，见下文「长期记忆与情景记忆」；
+- 模型能力信息保存在 `~/.benben-agent/models.json`，见下文「模型能力信息」。
 
 列出和恢复：
 
@@ -387,6 +595,75 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 - 待压缩内容过长时会分块滚动总结；
 - 图片只以 `[图片]` 占位进入摘要，base64 不会发进摘要请求；
 - 网页输入框下方的「压缩」按钮等价于 `/compact`，压缩后刷新页面仍会显示摘要提示。
+
+### 自动压缩
+
+默认关闭。开启后，上下文达到阈值时，在发送下一次请求前自动压缩：
+
+```bash
+python3 benben-agent.py --auto-compact
+python3 benben-agent.py --auto-compact --auto-compact-level aggressive
+```
+
+8 档预设：
+
+| level | 触发阈值 | 目标保留 | 最多保留用户回合 |
+| --- | ---: | ---: | ---: |
+| `minimal` | 95% | 85% | 16 |
+| `very-light` | 90% | 75% | 12 |
+| `light` | 85% | 65% | 8 |
+| `normal` | 80% | 50% | 5 |
+| `aggressive` | 70% | 35% | 3 |
+| `very-aggressive` | 60% | 20% | 2 |
+| `extreme` | 50% | 12% | 1 |
+| `maximum` | 40% | 5% | 1 |
+
+自动压缩至少保留当前用户回合。自定义覆盖：
+
+```bash
+--auto-compact-threshold 75
+--auto-compact-target 40
+--auto-compact-keep 3
+```
+
+### 空闲压缩
+
+默认关闭。开启后，如果距离上一次对话已经超过设定时间，用户下一次发消息前会先压缩旧上下文，再处理新消息：
+
+```bash
+python3 benben-agent.py --idle-compact --idle-compact-minutes 10
+```
+
+保护条件：
+
+- 上下文至少占窗口 `--idle-compact-min-percent`，默认 20%
+- 消息数至少 `--idle-compact-min-messages`，默认 6
+- 空闲档位默认跟随自动压缩档位
+- 同一轮最多自动压缩一次
+- 压缩失败只提示，不阻塞对话
+
+交互模式：
+
+```text
+/compact auto                    查看状态
+/compact auto on|off             开关
+/compact auto presets            列出档位
+/compact auto level aggressive   切换档位
+/compact auto threshold 80       覆盖触发百分比
+/compact auto target 50          覆盖目标保留百分比
+/compact auto keep 5             覆盖最多保留回合
+
+/compact idle                    查看状态
+/compact idle on|off             开关
+/compact idle minutes 10         设置空闲分钟数
+/compact idle level normal       设置档位
+/compact idle min 20             设置最低上下文百分比
+/compact idle messages 6         设置最少消息数
+```
+
+`/config save` 会保存自动压缩和空闲压缩配置。
+
+注意：压缩只减少发送给模型的 token，不会删除或缩短磁盘上的会话 JSONL。
 
 ## 技能（Agent Skills）
 
@@ -515,6 +792,81 @@ once 2026-11-12 15:00
 
 网页侧边栏启用后会显示「定时任务」按钮，可以查看任务、运行、启停、查看记录和删除。运行完成后，新结果会以提示形式出现在对话区。
 
+## 长期记忆与情景记忆
+
+记忆默认关闭，和技能、定时任务一样需要显式启用：
+
+```bash
+python3 benben-agent.py --memory
+python3 benben-agent.py --memory --memory-daily
+python3 benben-agent.py --memory --memory-daily --schedule --memory-daily-time 23:50
+```
+
+- `--memory`：启用记忆工具
+- `--memory-daily`：启动时补写昨天的自动情景记忆
+- `--memory-daily-time HH:MM`：配合 `--schedule`，由内置定时任务每天生成当天情景记忆
+- 自动生成失败不会影响正常聊天；失败不写完成标记，下次可以重试
+
+数据位置：
+
+```text
+~/.benben-agent/memory/MEMORY.md                    # 长期记忆（0600）
+~/.benben-agent/memory/episodes/YYYY-MM-DD.md       # 情景记忆（0600）
+```
+
+长期记忆适合保存稳定偏好、环境事实、项目信息和重要决策；不要保存临时任务细节、猜测、密钥或隐私数据。情景记忆一天一个 Markdown 文件，同一天可以追加多个小节。
+
+启用后，模型会多出这些工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `remember` | 追加一条长期记忆 |
+| `recall` | 搜索长期记忆和情景记忆 |
+| `save_episode` | 追加当天情景总结 |
+| `list_episodes` | 列出最近的情景文件 |
+| `read_episode` | 读取某天的情景文件 |
+| `generate_daily_episode` | 生成某天的自动总结，已生成时返回 `exists` |
+
+示例：
+
+```text
+用户：记住，我偏好简洁的中文回答
+
+模型调用 remember(text="用户偏好简洁的中文回答", tags="偏好")
+→ remembered in MEMORY.md:3
+```
+
+```text
+用户：把今天完成的事情记一下
+
+模型调用 save_episode(summary="...", tags="开发")
+→ saved episode 2026-11-12 to ~/.benben-agent/memory/episodes/2026-11-12.md
+```
+
+自动情景记忆有三种入口：
+
+- 模型主动调用 `save_episode`
+- 启用 `--memory-daily` 后，启动时后台检查并补写昨天
+- 同时启用 `--schedule` 和 `--memory-daily-time` 后，内置 daily 任务调用 `generate_daily_episode`
+
+自动总结会写入标记：
+
+```markdown
+<!-- benben:auto-summary:2026-11-12 -->
+```
+
+同一个日期已经生成过时不会重复写入。自动总结会从会话 JSONL 中读取当天的用户和助手文本，忽略图片 base64，并对压缩后重复保留的 tail 去重。系统提示词不会自动注入记忆内容，模型需要时调用 `recall`。
+
+交互模式管理命令：
+
+```text
+/memory                      查看记忆目录、条目数和自动生成配置
+/memory path                 打印记忆目录
+/memory search <关键词>       搜索长期记忆和情景记忆
+/memory read <日期|today>     读取某天情景记忆
+/memory summarize [日期]      手动生成某天自动总结
+```
+
 ## 网页入口
 
 ```bash
@@ -553,6 +905,12 @@ python3 benben-agent.py --web
 | `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 否 |
 | `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 否 |
 | `run_skill_script` | 执行技能 `scripts/` 下的脚本（仅在启用脚本且存在脚本时提供） | 是 |
+| `remember` | 写入长期记忆（仅启用记忆时提供） | 否 |
+| `recall` | 搜索长期记忆和情景记忆（仅启用记忆时提供） | 否 |
+| `save_episode` | 追加当天情景总结（仅启用记忆时提供） | 否 |
+| `list_episodes` | 列出情景记忆文件（仅启用记忆时提供） | 否 |
+| `read_episode` | 读取情景记忆文件（仅启用记忆时提供） | 否 |
+| `generate_daily_episode` | 生成自动日总结（仅启用记忆时提供） | 否 |
 
 默认不询问，写文件和命令直接执行。加 `--confirm` 后，写文件和会修改状态的命令会询问 `Allow? [Y/n]`（直接回车即允许）；只读命令（grep、tail、ps、df、journalctl、curl 等）任何时候都不询问。判断是保守白名单：未知命令、包装器（sudo、timeout、env）、重定向、命令替换和危险参数都按修改状态处理；`curl` 带 `-o/-d/-X` 等写文件或发数据的参数、`wget` 不带 `-O -`/`--spider` 时都要求批准。标准输入不是终端（例如管道、CI）时直接拒绝，并把原因返回给模型。交互模式里可以随时用 `/confirm on` 和 `/confirm off` 切换。模型最多执行 `--max-steps` 次模型调用，一次性任务达到上限会以退出码 1 结束，交互模式只提示后继续。交互模式下 Ctrl+C 需要连按两次才退出：第一次取消当前输入或中断正在执行的任务，2 秒内再按一次才退出。
 

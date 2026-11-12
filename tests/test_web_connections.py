@@ -147,6 +147,11 @@ try:
     check("web html session menu", 'id="session-menu"' in html and 'id="session-rename"' in html)
     check("web html export", 'id="session-export"' in html and 'id="export-modal"' in html)
     check("web html tool details", "addToolDetail" in html and "tool-detail" in html)
+    check("web html model info", 'id="model-info"' in html and "renderModelInfo" in html)
+    check(
+        "web html model info modal",
+        'id="model-info-modal"' in html and 'id="model-info-edit"' in html,
+    )
     check("web html thinking toggle", 'id="thinking-toggle"' in html)
     check("web html reasoning select", 'id="reasoning"' in html)
     check("web html stop button", 'id="stop"' in html)
@@ -188,12 +193,39 @@ try:
     check("save active", saved["active"] == "work")
     check("save returned model", saved["connection"]["model"] == "model-a")
     check("save response hides key", "sk-secret-value" not in text)
+    check("save needs model info", saved["needs_model_info"] is True, saved)
 
     state = api_json("/api/state")
     check("state connection", state["connection"] == "work")
     check("state model", state["model"] == "model-a")
     check("state base", state["base_url"] == model_base)
     check("state workspace", state["workspace"] == os.path.realpath("."), state.get("workspace"))
+    check("state model info", state["model_info"]["context_window"] == 256000, state.get("model_info"))
+    check("state context", state["context"]["window"] == 256000, state.get("context"))
+    check("state auto compact", state["auto_compact"]["enabled"] is False, state.get("auto_compact"))
+    check("state idle compact", state["idle_compact"]["enabled"] is False, state.get("idle_compact"))
+    models_payload = api_json("/api/models")
+    check("models info", models_payload["info"]["context_window"] == 256000, models_payload.get("info"))
+
+    model_info_payload = api_json("/api/model/info")
+    check("model info needs fill", model_info_payload["needs_model_info"] is True, model_info_payload)
+    saved_info = api_json("/api/model/info", {
+        "model": "model-a",
+        "context_window": 128000,
+        "max_output_tokens": 4096,
+        "input": ["text", "image"],
+        "output": ["text"],
+        "supports_tools": True,
+        "supports_reasoning": False,
+        "reasoning_providers": [],
+        "notes": "web test",
+    })
+    check("model info saved", saved_info["info"]["context_window"] == 128000, saved_info)
+    check("model info source", saved_info["info"]["source"] == "models.json", saved_info)
+    check("model info no longer needs fill", saved_info["needs_model_info"] is False, saved_info)
+    refreshed_info = api_json("/api/model/info")
+    check("model info persisted", refreshed_info["info"]["input"] == ["text", "image"], refreshed_info)
+    check("model info image support", "image" in refreshed_info["info"]["input"], refreshed_info)
 
     # Runtime toggles: show thinking and reasoning level.
     runtime = api_json("/api/runtime")

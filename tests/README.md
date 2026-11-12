@@ -19,6 +19,10 @@ python3 tests/test_web_connections.py
 python3 tests/test_shell.py
 python3 tests/test_scheduler.py
 python3 tests/test_schedule_web.py
+python3 tests/test_memory.py
+python3 tests/test_config_defaults.py
+python3 tests/test_model_info.py
+python3 tests/test_auto_compact.py
 ```
 
 测试会：
@@ -48,3 +52,7 @@ python3 tests/test_schedule_web.py
 | `test_shell.py` | shell 检测顺序、`$SHELL` 优先、Windows 编码、工具切换、自动回退、系统提示 |
 | `test_scheduler.py` | 时间表达式、任务存储、只读/完整权限、运行记录、补跑一次、CLI `/schedule` |
 | `test_schedule_web.py` | Web 定时任务 API、轮询通知、启停/运行/记录/删除、禁用模式 |
+| `test_memory.py` | 长期记忆、情景记忆、自动日总结、内置定时任务、只读权限、CLI `/memory` |
+| `test_config_defaults.py` | 配置默认值、首次创建、CLI 优先级、`/config save`、`--no-config` |
+| `test_model_info.py` | 模型能力目录、fallback、模态、上下文用量、远程解析、图片预检、模型能力向导、`/model info` |
+| `test_auto_compact.py` | 8 档自动压缩、自定义覆盖、空闲压缩、配置持久化、`/compact auto|idle` |

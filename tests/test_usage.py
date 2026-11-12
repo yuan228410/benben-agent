@@ -52,7 +52,7 @@ events = []
 ok = agent.run_turn(client, ws, messages, 2, emit=lambda kind, text: events.append((kind, text)))
 print("events:", events)
 check("turn ok", ok)
-check("usage event", any(k == "usage" and "prompt=10" in t and "reasoning=3" in t and "cached=2" in t for k, t in events), events)
+check("usage event", any(k == "usage" and "input=10" in t and "output=5" in t and "reasoning=3" in t and "cached=2" in t for k, t in events), events)
 check("warning event", any(k == "warning" and "截断" in t for k, t in events), events)
 check("usage totals", client.last_turn_usage == {
     "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
@@ -66,6 +66,23 @@ events2 = []
 agent.run_turn(client2, ws, [{"role": "user", "content": "hi"}], 2, emit=lambda kind, text: events2.append((kind, text)))
 check("no warning on stop", not any(k == "warning" for k, _ in events2), events2)
 check("usage still emitted", any(k == "usage" for k, _ in events2), events2)
+events3 = []
+agent.run_turn(
+    client2,
+    ws,
+    [{"role": "user", "content": "hi"}],
+    2,
+    emit=lambda kind, text: events3.append((kind, text)),
+    context_window=1000,
+)
+check(
+    "usage context emitted",
+    any(
+        k == "usage" and "| context=~" in t and "/1000" in t and "%" in t
+        for k, t in events3
+    ),
+    events3,
+)
 server.shutdown()
 
 print()
