@@ -1093,6 +1093,10 @@ class BaseChatClient:
         self.last_turn_truncated = False
         self.last_reasoning_ignored = False
         self.last_models_payload: Any = None
+        # 上次模型调用时的真实 prompt token 数及其本地估算基线，
+        # 用于在两次调用之间推算当前上下文占用（比纯估算准）。
+        self.last_prompt_tokens: int | None = None
+        self.last_prompt_estimate: int | None = None
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -2456,8 +2460,22 @@ def model_supports_images(info: ModelInfo) -> bool | None:
     return "image" in info.input
 
 
-def context_usage(messages: list[dict[str, Any]], info: ModelInfo) -> dict[str, Any]:
+def context_usage(
+    messages: list[dict[str, Any]],
+    info: ModelInfo,
+    client: BaseChatClient | None = None,
+) -> dict[str, Any]:
+    """Estimate context usage.
+
+    When the client remembers the real prompt token count from the last API call,
+    project it forward using the local estimate's delta. That is much closer to
+    the truth than the raw character estimate (which ignores tool schemas).
+    """
     tokens = estimate_tokens(messages)
+    if client is not None:
+        projected = project_context_tokens(client, messages)
+        if projected is not None:
+            tokens = projected
     window = max(1, int(info.context_window))
     percent = min(100, int(tokens * 100 / window))
     return {
@@ -2466,6 +2484,27 @@ def context_usage(messages: list[dict[str, Any]], info: ModelInfo) -> dict[str, 
         "percent": percent,
         "remaining": max(0, window - tokens),
     }
+
+
+def project_context_tokens(
+    client: BaseChatClient,
+    messages: list[dict[str, Any]],
+) -> int | None:
+    """Project the current context size from the last real prompt token count.
+
+    Uses the difference between the current local estimate and the estimate
+    taken at the time of the last API call as the delta. Returns None when
+    there is no usable baseline (first call, or history was compacted).
+    """
+    real = client.last_prompt_tokens
+    base = client.last_prompt_estimate
+    if not isinstance(real, int) or real <= 0:
+        return None
+    if not isinstance(base, int) or base < 0:
+        return None
+    delta = estimate_tokens(messages) - base
+    projected = real + delta
+    return max(0, projected)
 
 
 def model_info_summary(info: ModelInfo) -> str:
@@ -3804,6 +3843,21 @@ def merge_usage(total: dict[str, int], usage: Any) -> None:
         total["cached_tokens"] = total.get("cached_tokens", 0) + cached
 
 
+def normalize_usage(usage: Any) -> dict[str, int]:
+    """Flatten one API usage payload into prompt/completion/total/reasoning/cached.
+
+    Different gateways report cached input under different keys
+    (prompt_tokens_details.cached_tokens, prompt_cache_hit_tokens), so callers
+    that need a single turn's numbers should go through here instead of
+    reading the raw payload.
+    """
+    out: dict[str, int] = {}
+    if not isinstance(usage, dict):
+        return out
+    merge_usage(out, usage)
+    return out
+
+
 def clean_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
     """Keep only fields that chat completions accepts on the next request."""
     content = message.get("content")
@@ -4972,8 +5026,11 @@ def run_auto_compact(
     )
     if keep is None:
         return None
+    # 摘要用的 client.chat 会覆盖 client.last_usage；压缩后上下文已经改变，
+    # 旧的 prompt_tokens 不再对应当前历史，必须清掉以免被误用。
+    saved_usage = client.last_usage
     try:
-        return compact_history(
+        result = compact_history(
             client,
             messages,
             session,
@@ -4981,7 +5038,13 @@ def run_auto_compact(
             progress=progress,
         )
     except (CompactError, ChatError, SessionError) as exc:
+        client.last_usage = saved_usage
         return {"error": str(exc), "keep": keep}
+    client.last_usage = {}
+    # 压缩后历史被重建，估算基线不再对应同一批消息，必须清掉
+    client.last_prompt_tokens = None
+    client.last_prompt_estimate = None
+    return result
 
 
 def maybe_auto_compact(
@@ -4994,7 +5057,7 @@ def maybe_auto_compact(
 ) -> dict[str, Any] | None:
     if not config.get("enabled"):
         return None
-    usage = context_usage(messages, info)
+    usage = context_usage(messages, info, client)
     threshold_tokens = int(
         info.context_window * int(config.get("threshold", 80)) / 100
     )
@@ -5018,7 +5081,7 @@ def maybe_idle_compact(
         return None
     if len(messages) - 1 < int(config.get("min_messages", 6)):
         return None
-    usage = context_usage(messages, info)
+    usage = context_usage(messages, info, client)
     if usage["percent"] < int(config.get("min_context_percent", 20)):
         return None
     return run_auto_compact(client, messages, session, info, config, progress)
@@ -8459,10 +8522,14 @@ def run_turn(
             _print_thinking(text)
 
     usage_total: dict[str, int] = {}
+    usage_turn: dict[str, int] = {}
+    call_count = 0
     truncated = False
     reasoning_warned = False
 
     def add_usage(usage: Any) -> None:
+        nonlocal call_count
+        call_count += 1
         merge_usage(usage_total, usage)
 
     try:
@@ -8482,6 +8549,12 @@ def run_turn(
                     f"网关忽略了关闭思考的请求（{label}）；响应仍包含 reasoning token",
                 )
             add_usage(client.last_usage)
+            turn_usage = normalize_usage(client.last_usage)
+            if turn_usage:
+                usage_turn = turn_usage
+            # 记录真实值与本地估算的基线，供下次调用前推算上下文占用
+            client.last_prompt_tokens = turn_usage.get("prompt_tokens")
+            client.last_prompt_estimate = estimate_tokens(messages)
             if client.last_finish_reason == "length":
                 truncated = True
             reasoning = reply.get("reasoning_content") or reply.get("reasoning") or ""
@@ -8547,26 +8620,53 @@ def run_turn(
     finally:
         client.last_turn_usage = dict(usage_total)
         client.last_turn_truncated = truncated
-        if usage_total or context_window:
+        if usage_total or usage_turn or context_window:
             parts = []
-            if usage_total:
-                parts.extend([
-                    f"input={usage_total.get('prompt_tokens', 0)}",
-                    f"output={usage_total.get('completion_tokens', 0)}",
-                    f"reasoning={usage_total.get('reasoning_tokens', 0)}",
-                    f"cached={usage_total.get('cached_tokens', 0)}",
-                    f"total={usage_total.get('total_tokens', 0)}",
-                ])
+            # 单轮：最后一次模型调用的用量，与 context 同量纲，反映"当前这一轮"
+            if usage_turn:
+                turn_cached = usage_turn.get('cached_tokens', 0)
+                turn_input = usage_turn.get('prompt_tokens', 0)
+                turn_hit = (turn_cached * 100 // turn_input) if turn_input > 0 else 0
+                parts.append(
+                    f"turn: input={turn_input} "
+                    f"cached={turn_cached} "
+                    f"new={turn_input - turn_cached} "
+                    f"hit={turn_hit}%"
+                )
             if context_window:
                 window = max(1, int(context_window))
-                context_tokens = estimate_tokens(messages)
+                # 优先用最后一次调用的真实 prompt token 数；没有才回退到本地估算
+                # （回退时带 `~` 前缀表示是估算值）
+                context_tokens = 0
+                is_estimate = True
+                if usage_turn:
+                    real_tokens = usage_turn.get('prompt_tokens', 0)
+                    if isinstance(real_tokens, int) and real_tokens > 0:
+                        context_tokens = real_tokens
+                        is_estimate = False
+                if is_estimate:
+                    context_tokens = estimate_tokens(messages)
                 percent = min(100, int(context_tokens * 100 / window))
-                if parts:
-                    parts.append("|")
+                tilde = "~" if is_estimate else ""
                 parts.append(
-                    f"context=~{context_tokens}/{window} ({percent}%)"
+                    f"context={tilde}{context_tokens}/{window} ({percent}%)"
                 )
-            report("usage", "[usage] " + " ".join(parts))
+            # 累计：整轮任务内所有模型调用的用量之和，反映"总消耗"
+            if usage_total:
+                total_cached = usage_total.get('cached_tokens', 0)
+                total_input = usage_total.get('prompt_tokens', 0)
+                total_hit = (total_cached * 100 // total_input) if total_input > 0 else 0
+                parts.append(
+                    f"total: calls={call_count} "
+                    f"input={total_input} "
+                    f"new={total_input - total_cached} "
+                    f"cached={total_cached} "
+                    f"hit={total_hit}% "
+                    f"output={usage_total.get('completion_tokens', 0)} "
+                    f"reasoning={usage_total.get('reasoning_tokens', 0)} "
+                    f"tokens={usage_total.get('total_tokens', 0)}"
+                )
+            report("usage", "[usage] " + " | ".join(parts))
         if truncated:
             report("warning", "输出被 max_tokens 截断，回答可能不完整")
         if session is not None:
@@ -11275,7 +11375,7 @@ def run_web(
                 for note in auto_notes:
                     emit("warning", note)
                 request_context = context_usage(
-                    state["messages"], request_model_info
+                    state["messages"], request_model_info, active_client
                 )
                 if request_context["percent"] >= 80:
                     emit(
@@ -11469,7 +11569,9 @@ def run_web(
                 with lock:
                     current = state["session"]
                     active_reasoning = active_client.reasoning
-                    context_state = context_usage(state["messages"], current_info)
+                    context_state = context_usage(
+                        state["messages"], current_info, active_client
+                    )
                     self._json(200, {
                         "session": current.uuid if current else None,
                         "model": active_client.model,
@@ -11504,7 +11606,9 @@ def run_web(
                 show = bool(state.get("show_thinking", show_thinking))
                 active_reasoning = active_client.reasoning
                 with lock:
-                    context_state = context_usage(state["messages"], current_info)
+                    context_state = context_usage(
+                        state["messages"], current_info, active_client
+                    )
                 self._json(200, {
                     "busy": bool(chat_state["active"]),
                     "api_format": active_connection.api_format,
@@ -13024,7 +13128,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"(kept {auto_stats['kept_messages']} messages)",
                         file=sys.stderr,
                     )
-            usage = context_usage(messages, model_info)
+            usage = context_usage(messages, model_info, client)
             if usage["percent"] >= 80:
                 print(
                     f"[context] ~{usage['tokens']} / {usage['window']} tokens "
@@ -13129,7 +13233,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"connection: {connection.name or 'custom'} [{connection.sources.get('base_url', 'default')}]")
                 print(f"model: {client.model}")
                 print(f"model info: {model_info_summary(model_info)}")
-                usage = context_usage(messages, model_info)
+                usage = context_usage(messages, model_info, client)
                 print(
                     f"context: ~{usage['tokens']} / {usage['window']} tokens "
                     f"({usage['percent']}%)"
@@ -13188,7 +13292,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
             if user_input == "/context":
-                usage = context_usage(messages, model_info)
+                usage = context_usage(messages, model_info, client)
                 print(
                     f"context: ~{usage['tokens']} / {usage['window']} tokens "
                     f"({usage['percent']}%) | remaining ~{usage['remaining']}"
@@ -13564,11 +13668,15 @@ def main(argv: list[str] | None = None) -> int:
                     percent = min(
                         100, int(stats["after_tokens"] * 100 / window)
                     )
+                    u_cached = usage.get('cached_tokens', 0)
+                    u_input = usage.get('prompt_tokens', 0)
+                    u_hit = (u_cached * 100 // u_input) if u_input > 0 else 0
                     print(
-                        "[usage] "
-                        f"input={usage.get('prompt_tokens', 0)} "
-                        f"output={usage.get('completion_tokens', 0)} "
-                        f"total={usage.get('total_tokens', 0)} "
+                        "[usage] turn: "
+                        f"input={u_input} "
+                        f"cached={u_cached} "
+                        f"new={u_input - u_cached} "
+                        f"hit={u_hit}% "
                         f"| context=~{stats['after_tokens']}/{window} ({percent}%)",
                         file=sys.stderr,
                     )
@@ -13914,7 +14022,7 @@ def main(argv: list[str] | None = None) -> int:
                             f"(kept {auto_stats['kept_messages']} messages)",
                             file=sys.stderr,
                         )
-            usage = context_usage(messages, model_info)
+            usage = context_usage(messages, model_info, client)
             if usage["percent"] >= 80:
                 print(
                     f"[context] ~{usage['tokens']} / {usage['window']} tokens "
@@ -13950,4 +14058,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

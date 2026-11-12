@@ -416,7 +416,7 @@ python3 benben-agent.py --memory --thinking --max-steps 50
 /model info <名称|编号>     查看指定模型能力
 /model config              配置/更新当前模型能力
 /model config <名称|编号>   配置指定模型能力
-/context                   查看当前上下文估算用量
+/context                   查看当前上下文用量（优先用真实 token 推算）
 /status                    显示模型能力和上下文
 ```
 
@@ -586,6 +586,24 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 `/session export` 默认只导出对话正文；`--tool` 同时导出工具调用和工具结果，`--thinking` 导出思考内容。不指定文件时写入当前工作区的 `session-<uuid>.md`。
 
 `/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏也提供会话列表、新建和删除；右键会话可以修改名称或导出 Markdown，聊天框输入 `/session` 也可以管理。
+
+### 用量统计
+
+每次回答结束会在 stderr 打印一行用量（Web 端同样透传到聊天界面）：
+
+```text
+[usage] turn: input=2757 cached=2656 new=101 hit=96% | context=2757/1000000 (0%) | total: calls=2 input=5413 new=2571 cached=2842 hit=52% output=91 reasoning=0 tokens=5504
+```
+
+| 段 | 字段 | 含义 |
+| --- | --- | --- |
+| `turn:` | `input` / `cached` / `new` / `hit` | 最后一次模型调用的用量；`new = input - cached` 是实际新读入，`hit` 是缓存命中率 |
+| `context=` | `tokens/window (percent)` | 当前上下文占用。优先用上次请求的真实 prompt token 推算（真实值 + 本地估算增量），没有可用基线时才回退到字符估算 |
+| `total:` | `calls` / `input` / `cached` / `hit` / `output` / `reasoning` / `tokens` | 本次回答内所有模型调用的累计；`calls` 是调用次数，`tokens = input + output` |
+
+- 只调用一次模型时 `turn` 与 `total` 数值相同；触发工具调用后 `calls` 增长，`total` 是累加值；
+- `hit` 里 `turn` 反映最后一轮命中情况，`total` 会被首轮冷启动拉低；
+- `/context` 命令同样优先用真实值推算；压缩会重置基线并回退到估算。
 
 ### 压缩上下文
 
