@@ -233,6 +233,7 @@ Windows 乱码处理：
 | `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
+| `--schedule` / `--no-schedule` | 关 | 是否启用定时任务并暴露调度工具；默认关闭，需显式加 `--schedule` |
 | `--plain` | 关 | 不渲染 Markdown，直接输出原始文本 |
 | `--verbose-tools` | 关 | 显示完整工具参数和工具结果（最多 20000 字符） |
 | `--thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`（网关返回该字段时）；交互模式可用 `/thinking on\|off` 切换 |
@@ -341,7 +342,8 @@ python3 benben-agent.py \
 - 目录权限 `0700`，文件 `0600`；
 - system prompt 不保存，启动时按当前配置重新生成；
 - 思考内容和图片的 base64 都会保存，带图片的会话文件会明显变大；
-- 加载时跳过损坏的行，进程被杀留下的半行不会导致失败。
+- 加载时跳过损坏的行，进程被杀留下的半行不会导致失败；
+- 定时任务定义和运行记录单独保存在 `~/.benben-agent/schedules/`，见下文「定时任务」。
 
 列出和恢复：
 
@@ -442,6 +444,77 @@ description: 按时间线归纳日志。处理日志排查、异常定位时使�
 
 技能默认关闭，用 `--skill` 开启；`--no-skill` 可显式关闭。关闭时不扫描技能目录，也不向模型暴露任何技能工具。交互模式里 `/skill` 列出已加载技能，`/skill <name> <问题>` 会强制加载指定技能并用它回答。
 
+## 定时任务（Scheduler）
+
+定时任务默认关闭，和技能一样需要显式启用：
+
+```bash
+python3 benben-agent.py --schedule                 # 交互模式 + 定时任务
+python3 benben-agent.py --schedule --web           # 网页模式 + 定时任务
+```
+
+- 调度器是**进程内**的：只有交互或网页进程运行时任务才会触发，进程退出后不会执行；
+- 不做外部通知（`notify-send`、`osascript`、Windows Toast、邮件、Webhook），结果只通过网页面板、CLI 和运行记录反馈；
+- 默认关闭时不会读取 `~/.benben-agent/schedules/`，也不会向模型暴露任何调度工具；`/schedule` 会提示用 `--schedule` 开启。
+
+启用后，模型会多出这些工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `create_schedule` | 创建任务：名称、提示词、时间表达式、可选 `read_only` |
+| `list_schedules` | 列出任务、下次运行、上次状态 |
+| `delete_schedule` | 删除任务及其运行记录 |
+| `enable_schedule` | 启用或暂停任务 |
+| `run_schedule_now` | 立即排队执行一次 |
+| `schedule_history` | 查看最近运行记录 |
+
+可以直接用对话创建，例如：
+
+```text
+用户：每天早上 9 点检查磁盘使用率，超过 85% 就给出告警
+
+模型：创建定时任务
+  ID: a1b2c3d4
+  计划: daily 09:00
+  下次运行: 2026-11-13 09:00
+  模式: 完整权限（定时触发时无人审批）
+```
+
+`when` 支持：
+
+```text
+every 30s / every 10m / every 2h / every 1d
+daily 09:00
+once 2026-11-12T15:00
+once 2026-11-12 15:00
+```
+
+时间按本机本地时间计算，不支持时区后缀和 cron 表达式。权限默认是**完整权限**：定时触发时无人审批，可以读写工作区文件和执行命令。创建时传 `read_only=true` 则只暴露 `list_dir`、`read_file`、`search`、`glob`。定时任务运行在独立会话里，不插入当前聊天；任务内部不再暴露调度工具，避免递归创建任务。
+
+数据位置：
+
+```text
+~/.benben-agent/schedules/tasks.json          # 任务定义（0600）
+~/.benben-agent/schedules/runs/<id>.jsonl     # 每次运行的时间、状态、输出、耗时（0600）
+```
+
+- 单 worker 串行执行，同一任务不会并发；
+- 错过执行只补一次，不会在启动时补跑所有历史周期；
+- 运行结果写入 JSONL，并在 CLI 下一次输入前提示，网页每 5 秒轮询任务面板和新结果。
+
+交互模式管理命令：
+
+```text
+/schedule                    查看任务
+/schedule history <id> [n]   查看运行记录
+/schedule run <id>           立即排队执行
+/schedule on <id>            启用
+/schedule off <id>           暂停
+/schedule delete <id>        删除任务和记录
+```
+
+网页侧边栏启用后会显示「定时任务」按钮，可以查看任务、运行、启停、查看记录和删除。运行完成后，新结果会以提示形式出现在对话区。
+
 ## 网页入口
 
 ```bash
@@ -453,6 +526,7 @@ python3 benben-agent.py --web
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
 - 页面支持对话、新建/切换/删除历史会话（删除有确认弹框）、上传图片，左侧下拉框可以切换模型（等价于 CLI 的 `/model`，切换后立即生效）；
 - 会话列表支持右键菜单修改名称、导出 Markdown；聊天框输入 `/session` 也可以管理会话；
+- 启用 `--schedule` 后侧边栏显示「定时任务」，可查看/运行/启停/删除任务和查看运行记录，后台每 5 秒轮询一次并提示新结果；
 - 工具调用显示为可展开块，默认折叠；展开后可查看完整参数和工具结果，历史会话也会回放；
 - 输入框下方有「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级按协议显示 DeepSeek/Kimi/MiniMax/OpenAI/Anthropic 选项；
 - 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；

@@ -17,6 +17,8 @@ python3 tests/test_config.py
 python3 tests/test_connect.py
 python3 tests/test_web_connections.py
 python3 tests/test_shell.py
+python3 tests/test_scheduler.py
+python3 tests/test_schedule_web.py
 ```
 
 测试会：
@@ -44,3 +46,5 @@ python3 tests/test_shell.py
 | `test_connect.py` | `/connect` 向导、预设、切换/删除、`--profile`、`--no-env` |
 | `test_web_connections.py` | Web 连接设置、会话标题/导出、工具详情、思考/停止控件 |
 | `test_shell.py` | shell 检测顺序、`$SHELL` 优先、Windows 编码、工具切换、自动回退、系统提示 |
+| `test_scheduler.py` | 时间表达式、任务存储、只读/完整权限、运行记录、补跑一次、CLI `/schedule` |
+| `test_schedule_web.py` | Web 定时任务 API、轮询通知、启停/运行/记录/删除、禁用模式 |
