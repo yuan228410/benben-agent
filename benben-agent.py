@@ -39,6 +39,15 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --shell NAME|PATH       指定 shell：auto、pwsh、powershell、git-bash、cmd、
                             bash、zsh、sh 或绝对路径（默认 auto）
     --no-shell-fallback     当前 shell 不认识命令时，不自动尝试其他 shell
+    --command-timeout SEC   run_command 默认超时（默认 60）
+    --max-command-timeout SEC
+                            run_command 最大超时（默认 600）
+    --background-after SEC  前台命令超过多少秒自动转后台（默认 30）
+    --no-auto-background    不自动转后台
+    --job-follow / --no-job-follow
+                            后台任务是否默认跟随输出
+    --job-poll-seconds SEC  跟随轮询间隔（默认 2）
+    --job-follow-lines N    每次显示最近几行（默认 5）
     --plain / --no-plain    是否渲染终端 Markdown
     --verbose-tools / --no-verbose-tools
                             是否显示完整工具参数和工具结果（最多 20000 字符）
@@ -109,6 +118,12 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /memory search <关键词>        搜索长期记忆和情景记忆
     /memory read <日期|today>     读取某天情景记忆
     /memory summarize [日期]      手动生成某天情景总结
+    /jobs                         后台任务列表和跟随控制
+    /jobs status|output <id>      查看任务状态和输出
+    /jobs follow <id>             跟随后台任务输出
+    /jobs detach <id>             停止跟随但保留任务
+    /jobs stop <id>               取消后台任务
+    /jobs clean / poll / lines    清理任务、设置轮询和行数
     /config                       查看配置文件路径和已保存默认值
     /config save                  把当前有效设置写入配置文件
     /reset                        清空上下文，下一条消息开新会话文件
@@ -130,6 +145,10 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /model [name|number|list]     查看/切换模型
     /model info [name|number]     查看模型能力信息
     /model config [name|number]   配置/更新模型能力
+    /model list all               列出所有已保存连接和模型
+    /model use <连接> [模型]      切换连接，可同时切换模型
+    /model use --save <连接> [模型]
+                                  切换并写入 active 连接
     /context                      查看上下文估算用量
     /exit, /quit                  退出（Ctrl-D 同效）
 
@@ -173,6 +192,7 @@ macOS zsh）；Windows 依次检测 pwsh、Windows PowerShell、Git Bash、cmd�
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import binascii
 import copy
@@ -190,6 +210,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -868,6 +889,18 @@ SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你
 - run_command 默认会在当前 shell 明显不认识命令时尝试其他可用 shell；如果结果出现
   [fallback] reason，向用户解释原因并建议安装工具或更换命令，不要反复重试。
   禁用回退时不会自动切换 shell。
+- 执行可能耗时的命令前，必须主动设置 timeout_seconds 并预估耗时：快速查询 10-30 秒，
+  构建/测试/安装 60-180 秒，大任务最多 300 秒；不要省略超时。
+- 不要在前台运行会持续不退出的命令，如服务器、守护进程、tail -f、watch、
+  交互式编辑器；改用非交互命令、加次数限制，或说明需要后台运行。
+- 命令超时或被用户中断后，先说明已运行时间、部分输出和下一步；不要原样重试。
+  需要更多时间时提高 timeout_seconds，或拆分任务。
+- 构建、测试、安装、大目录扫描等可能超过 30 秒的命令，使用 background=true。
+  交互模式默认 follow，会显示最近几行输出；不要在跟随期间反复调用模型。
+- 后台任务启动后告诉用户 job id；需要结果时调用 job_status/job_output。
+  任务结束前不要声称已经完成，只有 exited code 0 才能说成功。
+- Ctrl+C 或停止跟随只会停止观察，任务仍在运行；取消任务要调用 job_cancel，
+  或在 CLI/Web 使用 /jobs stop。
 - 充分利用宿主机已有的开发环境和工具链，不限于 Python、Node.js、.NET、Java、C/C++。
   任何已安装的运行时、编译器、解释器、构建系统、包管理器、测试框架、命令行工具、
   数据库客户端、容器或虚拟化工具、图像/音视频处理工具等，只要能可靠完成任务都可以使用。
@@ -1825,6 +1858,14 @@ def default_settings() -> dict[str, Any]:
             "min_context_percent": 20,
             "min_messages": 6,
         },
+        "command_timeout": 60,
+        "max_command_timeout": 600,
+        "background_after_seconds": 30,
+        "max_background_jobs": 8,
+        "background_output_chars": 20_000,
+        "job_follow": True,
+        "job_poll_seconds": 2,
+        "job_follow_lines": 5,
         "web": {"host": "127.0.0.1", "port": WEB_PORT},
     }
 
@@ -1859,6 +1900,7 @@ def _normalize_defaults(raw: Any) -> dict[str, Any]:
         "schedule",
         "memory",
         "memory_daily",
+        "job_follow",
     )
     for key in bool_keys:
         if key not in raw:
@@ -2065,6 +2107,33 @@ def _normalize_defaults(raw: Any) -> dict[str, Any]:
                 warn("idle_compact.min_messages must be an integer between 1 and 10000")
     elif idle is not None:
         warn("idle_compact must be an object")
+
+    for key, minimum, maximum, label in (
+        ("command_timeout", 1, 86400, "seconds"),
+        ("max_command_timeout", 1, 86400, "seconds"),
+        ("background_after_seconds", 0, 3600, "seconds"),
+        ("max_background_jobs", 1, 64, "jobs"),
+        ("background_output_chars", 1000, 200000, "characters"),
+        ("job_poll_seconds", 1, 60, "seconds"),
+        ("job_follow_lines", 1, 50, "lines"),
+    ):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and minimum <= value <= maximum
+        ):
+            defaults[key] = value
+        elif value is not None:
+            warn(f"{key} must be an integer between {minimum} and {maximum} {label}")
+    if defaults["command_timeout"] > defaults["max_command_timeout"]:
+        warn("command_timeout cannot exceed max_command_timeout; using defaults")
+        defaults["command_timeout"] = min(
+            default_settings()["command_timeout"],
+            defaults["max_command_timeout"],
+        )
     return defaults
 
 
@@ -2496,8 +2565,8 @@ def project_context_tokens(
     taken at the time of the last API call as the delta. Returns None when
     there is no usable baseline (first call, or history was compacted).
     """
-    real = client.last_prompt_tokens
-    base = client.last_prompt_estimate
+    real = getattr(client, "last_prompt_tokens", None)
+    base = getattr(client, "last_prompt_estimate", None)
     if not isinstance(real, int) or real <= 0:
         return None
     if not isinstance(base, int) or base < 0:
@@ -2958,6 +3027,18 @@ def resolve_settings(args: Any, config: dict[str, Any]) -> None:
     args.idle_compact_min_messages = int(
         pick("idle_compact_min_messages", idle.get("min_messages", 6))
     )
+    args.command_timeout = int(pick("command_timeout", 60))
+    args.max_command_timeout = int(pick("max_command_timeout", 600))
+    args.background_after_seconds = int(
+        pick("background_after_seconds", 30)
+    )
+    args.max_background_jobs = int(pick("max_background_jobs", 8))
+    args.background_output_chars = int(
+        pick("background_output_chars", 20_000)
+    )
+    args.job_follow = bool(pick("job_follow", True))
+    args.job_poll_seconds = int(pick("job_poll_seconds", 2))
+    args.job_follow_lines = int(pick("job_follow_lines", 5))
     args.host = pick("host", web.get("host", "127.0.0.1"))
     args.port = int(pick("port", web.get("port", WEB_PORT)))
 
@@ -3007,6 +3088,14 @@ def settings_from_runtime(
             "min_context_percent": int(args.idle_compact_min_percent),
             "min_messages": int(args.idle_compact_min_messages),
         },
+        "command_timeout": int(args.command_timeout),
+        "max_command_timeout": int(args.max_command_timeout),
+        "background_after_seconds": int(args.background_after_seconds),
+        "max_background_jobs": int(args.max_background_jobs),
+        "background_output_chars": int(args.background_output_chars),
+        "job_follow": bool(args.job_follow),
+        "job_poll_seconds": int(args.job_poll_seconds),
+        "job_follow_lines": int(args.job_follow_lines),
         "web": {"host": args.host, "port": int(args.port)},
     }
 
@@ -4342,6 +4431,74 @@ def _last_compact_offset(path: str) -> int | None:
     return last
 
 
+def _ensure_session_file_newline(path: str) -> bool:
+    """Make sure the JSONL ends on a line boundary after a kill or crash."""
+    try:
+        with open(path, "rb+") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                return False
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) == b"\n":
+                return False
+            handle.write(b"\n")
+            return True
+    except OSError:
+        return False
+
+
+def repair_session_messages(
+    messages: list[dict[str, Any]],
+    reason: str = "error: interrupted or missing tool result; previous turn was incomplete",
+) -> tuple[int, list[dict[str, Any]]]:
+    """Insert missing tool results and return (count, appended tail).
+
+    Missing results are inserted immediately after the existing tool results for
+    the same assistant call. Only results appended at the very end can be safely
+    persisted by appending to the JSONL; mid-history repairs remain in memory.
+    """
+    inserted_total = 0
+    trailing: list[dict[str, Any]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            index += 1
+            continue
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            index += 1
+            continue
+        answered = set()
+        cursor = index + 1
+        while cursor < len(messages) and messages[cursor].get("role") == "tool":
+            answered.add(messages[cursor].get("tool_call_id"))
+            cursor += 1
+        missing = [
+            call
+            for call in tool_calls
+            if isinstance(call, dict) and call.get("id") not in answered
+        ]
+        if not missing:
+            index = cursor
+            continue
+        at_end = cursor == len(messages)
+        new_messages = [
+            {
+                "role": "tool",
+                "tool_call_id": call.get("id"),
+                "content": reason,
+            }
+            for call in missing
+        ]
+        messages[cursor:cursor] = new_messages
+        inserted_total += len(new_messages)
+        if at_end:
+            trailing.extend(new_messages)
+        index = cursor + len(new_messages)
+    return inserted_total, trailing
+
+
 def load_session(uuid: str, messages: list[dict[str, Any]]) -> Session:
     matches = _find_session_paths(uuid)
     if not matches:
@@ -4351,6 +4508,7 @@ def load_session(uuid: str, messages: list[dict[str, Any]]) -> Session:
     path = matches[0]
     match = re.match(r"(\d+)-(\d{8})-([0-9a-f]{8})\.jsonl$", os.path.basename(path))
     sequence = int(match.group(1)) if match else 0
+    newline_fixed = _ensure_session_file_newline(path)
     try:
         offset = _last_compact_offset(path)
         with open(path, "rb") as handle:
@@ -4359,8 +4517,27 @@ def load_session(uuid: str, messages: list[dict[str, Any]]) -> Session:
             loaded = _replay_session_records(_iter_session_records(handle))
     except OSError as exc:
         raise SessionError(str(exc)) from exc
-    messages.extend(loaded)
+
+    inserted, trailing = repair_session_messages(loaded)
     session = Session(path, uuid, sequence)
+    if inserted:
+        print(
+            f"[session] repaired {inserted} missing tool result(s) in "
+            f"{os.path.basename(path)}",
+            file=sys.stderr,
+        )
+    if trailing:
+        session.saved = len(loaded) - len(trailing)
+        try:
+            session.log(loaded)
+        except SessionError as exc:
+            print(f"[session] {exc}", file=sys.stderr)
+    if newline_fixed:
+        print(
+            f"[session] fixed incomplete last line in {os.path.basename(path)}",
+            file=sys.stderr,
+        )
+    messages.extend(loaded)
     session.saved = len(messages)
     return session
 
@@ -5742,13 +5919,26 @@ def tool_schemas(workspace: "Workspace") -> list[dict[str, Any]]:
                 if tool["function"]["name"] in MEMORY_READ_TOOL_NAMES
             )
     else:
-        tools = [
-            tool
-            for tool in TOOL_SCHEMAS
-            if workspace.allow_shell or tool["function"]["name"] != "run_command"
-        ]
+        tools = []
+        for tool in TOOL_SCHEMAS:
+            name = tool["function"]["name"]
+            if name == "run_command" and not workspace.allow_shell:
+                continue
+            if name == "run_command":
+                tool = copy.deepcopy(tool)
+                tool["function"]["parameters"]["properties"]["timeout_seconds"][
+                    "description"
+                ] = (
+                    "Kill the command after this many seconds. "
+                    "Required for every call: quick query 10-30, "
+                    "build/test/install 60-180, large task up to "
+                    f"{workspace.max_command_timeout}."
+                )
+            tools.append(tool)
         tools.append(LIST_SHELLS_SCHEMA)
         tools.append(SWITCH_SHELL_SCHEMA)
+        if workspace.allow_shell and not workspace.scheduled_run:
+            tools.extend(JOB_SCHEMAS)
         if workspace.memory is not None:
             tools.extend(MEMORY_SCHEMAS)
     if workspace.skills and not workspace.read_only:
@@ -5891,18 +6081,107 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "Run a shell command in the workspace root. Requires user approval.",
+            "description": (
+                "Run a shell command in the workspace root. Requires user approval. "
+                "Always estimate duration and set timeout_seconds. Do not run servers, "
+                "daemons, tail -f, watch, or interactive programs in the foreground."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to execute."},
                     "timeout_seconds": {
                         "type": "integer",
-                        "description": "Kill the command after this many seconds. Default 60, max 300.",
+                        "description": (
+                            "Kill the command after this many seconds. "
+                            "Required for every call: quick query 10-30, "
+                            "build/test/install 60-180, large task up to the "
+                            "configured maximum (default 600)."
+                        ),
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": (
+                            "Run in the background and return a job id. "
+                            "Use for builds, tests, installs and long scripts."
+                        ),
+                    },
+                    "follow": {
+                        "type": "boolean",
+                        "description": (
+                            "With background=true, follow progress until completion. "
+                            "Defaults to true in interactive CLI/web mode. "
+                            "Ctrl+C/stop stops following but leaves the job running."
+                        ),
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "timeout_seconds"],
             },
+        },
+    },
+]
+
+
+JOB_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "job_status",
+            "description": (
+                "Show a background job's status, elapsed time and recent output. "
+                "Use after run_command(background=true)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Job id such as job-3f2a."},
+                    "output_chars": {
+                        "type": "integer",
+                        "description": "Maximum output characters to show. Default 4000.",
+                    },
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_output",
+            "description": "Return recent output from a background job.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Job id."},
+                    "tail_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters from the end. Default 4000.",
+                    },
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_cancel",
+            "description": "Cancel a running background job and kill its process tree.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Job id."}
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_jobs",
+            "description": "List running and recently finished background jobs.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
@@ -6030,6 +6309,34 @@ def is_read_only_command(command: str, shell_kind: str = "posix") -> bool:
     return True
 
 
+def _kill_process_tree(process: "subprocess.Popen[Any]") -> None:
+    """Kill a process and its children after timeout or Ctrl+C."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _capture_process(
     args: Any,
     cwd: str,
@@ -6038,8 +6345,11 @@ def _capture_process(
     shell: bool = False,
     encoding: str | None = None,
     fallback_encodings: tuple[str, ...] | None = None,
-) -> tuple[int, str, str, bool]:
-    """Run a process and cap each output stream at MAX_TOOL_OUTPUT."""
+) -> tuple[int, str, str, bool, bool]:
+    """Run a process and cap each output stream at MAX_TOOL_OUTPUT.
+
+    Returns (returncode, stdout, stderr, truncated, timed_out).
+    """
 
     def drain(pipe: Any, store: dict[str, Any]) -> None:
         try:
@@ -6064,6 +6374,13 @@ def _capture_process(
             except OSError:
                 pass
 
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if creationflags:
+            popen_kwargs["creationflags"] = creationflags
+    else:
+        popen_kwargs["start_new_session"] = True
     try:
         process = subprocess.Popen(
             args,
@@ -6073,6 +6390,7 @@ def _capture_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            **popen_kwargs,
         )
     except OSError as exc:
         raise ToolError(str(exc)) from exc
@@ -6086,16 +6404,22 @@ def _capture_process(
     for reader in readers:
         reader.start()
     timed_out = False
+    interrupted: KeyboardInterrupt | None = None
     try:
         process.wait(timeout=timeout)
+    except KeyboardInterrupt as exc:
+        interrupted = exc
+        _kill_process_tree(process)
     except subprocess.TimeoutExpired:
         timed_out = True
-        process.kill()
-        process.wait()
+        _kill_process_tree(process)
+    except BaseException:
+        _kill_process_tree(process)
+        raise
     for reader in readers:
         reader.join(1.0)
-    if timed_out:
-        raise ToolError(f"command timed out after {timeout}s")
+    if interrupted is not None:
+        raise interrupted
     encodings: list[str] = []
     if encoding:
         encodings.append(encoding)
@@ -6109,6 +6433,7 @@ def _capture_process(
         stdout,
         stderr,
         bool(out["truncated"] or err["truncated"]),
+        timed_out,
     )
 
 
@@ -6308,6 +6633,440 @@ def _walk_glob_paths(root: str, pattern: str) -> list[str]:
     return results
 
 
+class _TailBuffer:
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1000, int(limit))
+        self.parts: list[bytes] = []
+        self.size = 0
+        self.total = 0
+        self.truncated = False
+        self._lock = threading.Lock()
+
+    def add(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._lock:
+            self.parts.append(data)
+            self.size += len(data)
+            self.total += len(data)
+            while self.size > self.limit and len(self.parts) > 1:
+                removed = self.parts.pop(0)
+                self.size -= len(removed)
+                self.truncated = True
+            if self.size > self.limit:
+                over = self.size - self.limit
+                self.parts[0] = self.parts[0][over:]
+                self.size -= over
+                self.truncated = True
+
+    def data(self) -> bytes:
+        with self._lock:
+            return b"".join(self.parts)
+
+    def data_since(self, cursor: int) -> tuple[bytes, int, bool]:
+        with self._lock:
+            start = self.total - self.size
+            if cursor < start:
+                return b"".join(self.parts), self.total, True
+            offset = max(0, cursor - start)
+            return b"".join(self.parts)[offset:], self.total, False
+
+
+class BackgroundJobManager:
+    """Run and inspect long-running commands without blocking the turn."""
+
+    def __init__(
+        self,
+        *,
+        max_jobs: int = 8,
+        output_chars: int = MAX_TOOL_OUTPUT,
+    ) -> None:
+        self.max_jobs = max(1, int(max_jobs))
+        self.output_chars = max(1000, int(output_chars))
+        self._lock = threading.RLock()
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._notifications: queue.Queue = queue.Queue(maxsize=100)
+
+    def _running_count(self) -> int:
+        return sum(
+            1 for job in self._jobs.values() if job.get("status") == "running"
+        )
+
+    def _notify(self, job: dict[str, Any]) -> None:
+        note = {
+            "id": job["id"],
+            "command": job.get("command"),
+            "status": job.get("status"),
+            "exit_code": job.get("exit_code"),
+            "elapsed": job.get("elapsed", 0.0),
+            "followed": bool(job.get("followed")),
+            "auto_promoted": bool(job.get("auto_promoted")),
+        }
+        try:
+            self._notifications.put_nowait(note)
+        except queue.Full:
+            try:
+                self._notifications.get_nowait()
+                self._notifications.put_nowait(note)
+            except queue.Empty:
+                pass
+
+    def start(
+        self,
+        shell: ShellInfo,
+        argv: list[str],
+        cwd: str,
+        timeout: int,
+        command_text: str,
+    ) -> str:
+        with self._lock:
+            if self._running_count() >= self.max_jobs:
+                raise ToolError(
+                    f"too many background jobs (max {self.max_jobs}); "
+                    "use list_jobs/job_cancel"
+                )
+            job_id = "job-" + secrets.token_hex(2)
+            while job_id in self._jobs:
+                job_id = "job-" + secrets.token_hex(2)
+
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            raise ToolError(str(exc)) from exc
+
+        stdout = _TailBuffer(self.output_chars)
+        stderr = _TailBuffer(self.output_chars)
+        combined = _TailBuffer(self.output_chars)
+
+        def drain(pipe: Any, target: _TailBuffer) -> None:
+            try:
+                while True:
+                    chunk = (
+                        pipe.read1(4096)
+                        if hasattr(pipe, "read1")
+                        else pipe.read(4096)
+                    )
+                    if not chunk:
+                        break
+                    target.add(chunk)
+                    combined.add(chunk)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+        readers = [
+            threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
+            threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+
+        job: dict[str, Any] = {
+            "id": job_id,
+            "command": command_text,
+            "shell": shell,
+            "process": process,
+            "timeout": int(timeout),
+            "started": time.monotonic(),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "finished": None,
+            "status": "running",
+            "exit_code": None,
+            "timed_out": False,
+            "cancelled": False,
+            "stdout": stdout,
+            "stderr": stderr,
+            "combined": combined,
+            "readers": readers,
+            "detach_requested": False,
+            "followed": False,
+            "auto_promoted": False,
+            "elapsed": 0.0,
+        }
+        with self._lock:
+            self._jobs[job_id] = job
+
+        def monitor() -> None:
+            try:
+                process.wait(timeout=job["timeout"])
+            except subprocess.TimeoutExpired:
+                job["timed_out"] = True
+                _kill_process_tree(process)
+            except BaseException:
+                job["cancelled"] = True
+                _kill_process_tree(process)
+            finally:
+                for reader in readers:
+                    reader.join(1.0)
+                with self._lock:
+                    if job["cancelled"]:
+                        status = "cancelled"
+                    elif job["timed_out"]:
+                        status = "timed_out"
+                    else:
+                        status = "exited"
+                    job["status"] = status
+                    job["exit_code"] = process.returncode
+                    job["finished"] = time.monotonic()
+                    job["elapsed"] = job["finished"] - job["started"]
+                self._notify(job)
+
+        threading.Thread(target=monitor, name=f"benben-{job_id}", daemon=True).start()
+        return job_id
+
+    def _job(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            raise ToolError(f"unknown job: {job_id}")
+        return job
+
+    def wait(self, job_id: str, seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            job = self._job(job_id)
+            if job.get("status") != "running":
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
+    def _output(
+        self,
+        job: dict[str, Any],
+        tail_chars: int = 4000,
+    ) -> str:
+        shell = job["shell"]
+        encodings = [shell.encoding, *shell.fallback_encodings]
+        stdout = decode_output(job["stdout"].data(), encodings)
+        stderr = decode_output(job["stderr"].data(), encodings)
+        text = ""
+        if stdout:
+            text += "stdout:\n" + stdout
+        if stderr:
+            if text:
+                text += "\n"
+            text += "stderr:\n" + stderr
+        if not text:
+            text = "(no output yet)"
+        if len(text) > tail_chars:
+            text = text[-tail_chars:]
+        return text
+
+    def result(self, job_id: str) -> tuple[int, str, str, bool, bool]:
+        job = self._job(job_id)
+        if job.get("status") == "running":
+            raise ToolError(f"job is still running: {job_id}")
+        shell = job["shell"]
+        encodings = [shell.encoding, *shell.fallback_encodings]
+        stdout = decode_output(job["stdout"].data(), encodings)
+        stderr = decode_output(job["stderr"].data(), encodings)
+        return (
+            int(job.get("exit_code") or 0),
+            stdout,
+            stderr,
+            bool(job["stdout"].truncated or job["stderr"].truncated),
+            bool(job.get("timed_out")),
+        )
+
+    def status_text(self, job_id: str, output_chars: int = 4000) -> str:
+        job = self._job(job_id)
+        status = job.get("status")
+        elapsed = (
+            job["elapsed"]
+            if job.get("finished") is not None
+            else time.monotonic() - job["started"]
+        )
+        lines = [
+            f"{job['id']}: {status}",
+            f"command: {job.get('command')}",
+            f"elapsed: {elapsed:.1f}s",
+            f"timeout: {job.get('timeout')}s",
+        ]
+        if job.get("exit_code") is not None:
+            lines.append(f"exit code: {job.get('exit_code')}")
+        if status == "running":
+            lines.append("output tail:")
+            lines.append(self._output(job, min(output_chars, 2000)))
+        elif status in ("exited", "timed_out", "cancelled"):
+            lines.append("output tail:")
+            lines.append(self._output(job, output_chars))
+        return "\n".join(lines)
+
+    def output_text(self, job_id: str, tail_chars: int = 4000) -> str:
+        job = self._job(job_id)
+        return self._output(job, tail_chars)
+
+    def read_since(self, job_id: str, cursor: int) -> tuple[str, int, bool]:
+        job = self._job(job_id)
+        data, new_cursor, truncated = job["combined"].data_since(cursor)
+        shell = job["shell"]
+        text = decode_output(
+            data,
+            [shell.encoding, *shell.fallback_encodings],
+        )
+        return text, new_cursor, truncated
+
+    def snapshot(self, job_id: str) -> dict[str, Any]:
+        job = self._job(job_id)
+        elapsed = (
+            job["elapsed"]
+            if job.get("finished") is not None
+            else time.monotonic() - job["started"]
+        )
+        return {
+            "id": job["id"],
+            "command": job.get("command"),
+            "status": job.get("status"),
+            "exit_code": job.get("exit_code"),
+            "timeout": job.get("timeout"),
+            "elapsed": elapsed,
+            "detach_requested": bool(job.get("detach_requested")),
+            "timed_out": bool(job.get("timed_out")),
+            "cancelled": bool(job.get("cancelled")),
+        }
+
+    def mark_followed(self, job_id: str) -> None:
+        job = self._job(job_id)
+        with self._lock:
+            job["followed"] = True
+
+    def mark_auto_promoted(self, job_id: str) -> None:
+        job = self._job(job_id)
+        with self._lock:
+            job["auto_promoted"] = True
+
+    def request_detach(self, job_id: str) -> bool:
+        job = self._job(job_id)
+        with self._lock:
+            if job.get("status") != "running":
+                return False
+            job["detach_requested"] = True
+        return True
+
+    def cancel(self, job_id: str) -> str:
+        job = self._job(job_id)
+        with self._lock:
+            if job.get("status") != "running":
+                return f"job is not running: {job_id} ({job.get('status')})"
+            job["cancelled"] = True
+        _kill_process_tree(job["process"])
+        self.wait(job_id, 6.0)
+        return self.status_text(job_id, 1000)
+
+    def list_snapshots(self) -> list[dict[str, Any]]:
+        with self._lock:
+            ids = list(self._jobs.keys())
+        rows = []
+        for job_id in ids:
+            try:
+                rows.append(self.snapshot(job_id))
+            except ToolError:
+                continue
+        return sorted(rows, key=lambda item: item["elapsed"], reverse=True)
+
+    def list_text(self) -> str:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        if not jobs:
+            return "no background jobs"
+        lines = ["background jobs:"]
+        for job in sorted(jobs, key=lambda item: item["started"], reverse=True):
+            elapsed = (
+                job["elapsed"]
+                if job.get("finished") is not None
+                else time.monotonic() - job["started"]
+            )
+            lines.append(
+                f"- {job['id']} | {job.get('status')} | "
+                f"{elapsed:.1f}s/{job.get('timeout')}s | {job.get('command')}"
+            )
+        return "\n".join(lines)
+
+    def clean_finished(self) -> str:
+        with self._lock:
+            finished = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.get("status") != "running"
+            ]
+            for job_id in finished:
+                self._jobs.pop(job_id, None)
+        return f"cleaned {len(finished)} finished job(s)"
+
+    def stop_all(self) -> None:
+        with self._lock:
+            running = [
+                job for job in self._jobs.values()
+                if job.get("status") == "running"
+            ]
+        for job in running:
+            try:
+                self.cancel(job["id"])
+            except Exception:
+                pass
+
+    def drain_notifications(self) -> list[dict[str, Any]]:
+        rows = []
+        while True:
+            try:
+                rows.append(self._notifications.get_nowait())
+            except queue.Empty:
+                break
+        return rows
+
+
+def _format_job_event(kind: str, text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return f"[job] {text}"
+    job_id = payload.get("id", "job")
+    if kind == "job_start":
+        return (
+            f"[{job_id}] started: {payload.get('command')} "
+            f"(timeout {payload.get('timeout')}s)"
+        )
+    if kind == "job_output":
+        lines = payload.get("lines") or []
+        omitted = int(payload.get("omitted") or 0)
+        parts = []
+        if omitted:
+            parts.append(f"[{job_id}] ... 省略 {omitted} 行 ...")
+        parts.extend(f"[{job_id}] {line}" for line in lines)
+        return "\n".join(parts)
+    if kind == "job_done":
+        status = payload.get("status")
+        exit_code = payload.get("exit_code")
+        elapsed = payload.get("elapsed", 0)
+        suffix = f" code {exit_code}" if exit_code is not None else ""
+        return f"[{job_id}] {status}{suffix} ({elapsed:.1f}s)"
+    if kind == "job_detach":
+        return (
+            f"[{job_id}] stopped watching; task is still running; "
+            f"use /jobs stop {job_id} to cancel"
+        )
+    return f"[{job_id}] {kind}"
+
+
 class Workspace:
     def __init__(
         self,
@@ -6318,6 +7077,14 @@ class Workspace:
         allow_skill_scripts: bool = True,
         shell_state: ShellState | None = None,
         shell_fallback: bool = True,
+        command_timeout: int = 60,
+        max_command_timeout: int = 600,
+        background_after_seconds: int = 30,
+        max_background_jobs: int = 8,
+        background_output_chars: int = MAX_TOOL_OUTPUT,
+        job_follow: bool = True,
+        job_poll_seconds: int = 2,
+        job_follow_lines: int = 5,
     ) -> None:
         self.root = os.path.realpath(root)
         self.confirm = confirm
@@ -6326,6 +7093,20 @@ class Workspace:
         self.allow_skill_scripts = allow_skill_scripts
         self.shell_state = shell_state or detect_shell_state()
         self.shell_fallback = shell_fallback
+        self.command_timeout = max(1, int(command_timeout))
+        self.max_command_timeout = max(
+            self.command_timeout, int(max_command_timeout)
+        )
+        self.background_after_seconds = max(0, int(background_after_seconds))
+        self.jobs = BackgroundJobManager(
+            max_jobs=max_background_jobs,
+            output_chars=background_output_chars,
+        )
+        self.job_follow = bool(job_follow)
+        self.job_poll_seconds = max(1, int(job_poll_seconds))
+        self.job_follow_lines = max(1, min(int(job_follow_lines), 50))
+        self.job_event: Callable[[str, str], None] | None = None
+        self.cancel_event: threading.Event | None = None
         self.prompt_mode = "interactive"
         self.interactive = sys.stdin.isatty()
         self.read_only = False
@@ -6678,11 +7459,11 @@ class Workspace:
         preview = f"{name}/{script}" + (" " + " ".join(args[:10]) if args else "")
         if not self._approve("run_skill_script", preview):
             raise ToolError("permission denied by user")
-        timeout = max(1, min(int(timeout_seconds), 300))
+        timeout = max(1, min(int(timeout_seconds), self.max_command_timeout))
         env = os.environ.copy()
         env["BENBEN_SKILL_DIR"] = skill["dir"]
         env["BENBEN_WORKSPACE"] = self.root
-        returncode, stdout, stderr, truncated = _capture_process(
+        returncode, stdout, stderr, truncated, timed_out = _capture_process(
             command + args,
             self.root,
             timeout,
@@ -6691,6 +7472,11 @@ class Workspace:
             fallback_encodings=fallbacks,
         )
         parts = [f"exit code: {returncode}"]
+        if timed_out:
+            parts.append(
+                f"[timeout] script timed out after {timeout}s; "
+                "set timeout_seconds higher or split the work"
+            )
         if stdout:
             parts.append("stdout:\n" + stdout)
         if stderr:
@@ -6716,7 +7502,7 @@ class Workspace:
                 f"retried with {shell.name}; use switch_shell {shell.name} to make it persistent"
             )
         if note:
-            parts.append(f"[fallback] {note}")
+            parts.append(note if note.startswith("[") else f"[fallback] {note}")
         if stdout:
             parts.append("stdout:\n" + stdout)
         if stderr:
@@ -6726,7 +7512,183 @@ class Workspace:
             output = output[:MAX_TOOL_OUTPUT] + "\n... (output truncated)"
         return output
 
-    def run_command(self, command: str, timeout_seconds: int = 60) -> str:
+    def _emit_job(self, kind: str, payload: dict[str, Any]) -> None:
+        text = json.dumps(payload, ensure_ascii=False)
+        if self.job_event is not None:
+            self.job_event(kind, text)
+        else:
+            formatted = _format_job_event(kind, text)
+            if formatted:
+                print(_style(formatted, DIM, supports_color()), flush=True)
+
+    def _follow_result_text(
+        self,
+        job_id: str,
+        status: dict[str, Any],
+        *,
+        failed_lines: int = 10,
+        success_lines: int = 5,
+    ) -> str:
+        failed = (
+            status.get("status") != "exited"
+            or int(status.get("exit_code") or 0) != 0
+        )
+        line_count = failed_lines if failed else success_lines
+        output = _sanitize(self.jobs.output_text(job_id, 20000))
+        lines = output.splitlines()
+        tail = "\n".join(lines[-line_count:]) if lines else "(no output)"
+        parts = [
+            f"job {job_id} {status.get('status')}",
+            f"exit code: {status.get('exit_code')}",
+            f"elapsed: {float(status.get('elapsed') or 0):.1f}s",
+            f"output tail ({line_count} lines):",
+            tail,
+        ]
+        if len(lines) > line_count:
+            parts.append(
+                f"... earlier output omitted; use job_output(\"{job_id}\") for more"
+            )
+        return "\n".join(parts)
+
+    def _follow_job(
+        self,
+        job_id: str,
+        shell: ShellInfo,
+        timeout: int,
+        command: str,
+    ) -> str:
+        self.jobs.mark_followed(job_id)
+        cursor = 0
+        pending = ""
+        self._emit_job(
+            "job_start",
+            {
+                "id": job_id,
+                "command": command,
+                "timeout": timeout,
+                "shell": shell.describe(),
+            },
+        )
+        try:
+            while True:
+                snapshot = self.jobs.snapshot(job_id)
+                cancel_requested = (
+                    self.cancel_event is not None
+                    and self.cancel_event.is_set()
+                )
+                if snapshot.get("detach_requested") or cancel_requested:
+                    self.jobs.request_detach(job_id)
+                    self._emit_job("job_detach", snapshot)
+                    return (
+                        f"job {job_id} is still running; stopped watching\n"
+                        f"use /jobs status {job_id} or /jobs stop {job_id}"
+                    )
+                text, cursor, truncated = self.jobs.read_since(job_id, cursor)
+                if truncated:
+                    pending = ""
+                    self._emit_job(
+                        "job_output",
+                        {
+                            "id": job_id,
+                            "lines": ["earlier output was truncated"],
+                            "omitted": 0,
+                        },
+                    )
+                pending += text
+                parts = re.split(r"[\r\n]+", pending)
+                complete = parts[:-1]
+                pending = parts[-1]
+                lines = [
+                    _sanitize(line.rstrip())
+                    for line in complete
+                    if line.strip()
+                ]
+                if lines:
+                    shown = lines[-self.job_follow_lines:]
+                    omitted = max(0, len(lines) - len(shown))
+                    self._emit_job(
+                        "job_output",
+                        {
+                            "id": job_id,
+                            "lines": shown,
+                            "omitted": omitted,
+                        },
+                    )
+                snapshot = self.jobs.snapshot(job_id)
+                if snapshot.get("status") != "running":
+                    if pending.strip():
+                        self._emit_job(
+                            "job_output",
+                            {
+                                "id": job_id,
+                                "lines": [_sanitize(pending.strip())],
+                                "omitted": 0,
+                            },
+                        )
+                    snapshot["output_tail"] = [
+                        _sanitize(line)
+                        for line in self.jobs.output_text(
+                            job_id, 4000
+                        ).splitlines()[-10:]
+                    ]
+                    self._emit_job("job_done", snapshot)
+                    return self._follow_result_text(job_id, snapshot)
+                time.sleep(self.job_poll_seconds)
+        except KeyboardInterrupt:
+            self.jobs.request_detach(job_id)
+            snapshot = self.jobs.snapshot(job_id)
+            self._emit_job("job_detach", snapshot)
+            return (
+                f"job {job_id} is still running; stopped watching\n"
+                f"use /jobs status {job_id} or /jobs stop {job_id}"
+            )
+
+    def follow_job(self, job_id: str) -> str:
+        snapshot = self.jobs.snapshot(job_id)
+        job = self.jobs._job(job_id)
+        return self._follow_job(
+            job_id,
+            job["shell"],
+            int(job.get("timeout") or 0),
+            str(job.get("command") or ""),
+        )
+
+    def _background_started_text(
+        self,
+        job_id: str,
+        shell: ShellInfo,
+        timeout: int,
+        command: str,
+        fallback_from: ShellInfo | None = None,
+    ) -> str:
+        lines = [
+            f"started background job {job_id}",
+            f"command: {command}",
+            f"timeout: {timeout}s",
+            f"shell: {shell.describe()}",
+        ]
+        if fallback_from is not None:
+            lines.append(
+                f"[fallback] {fallback_from.name} could not handle the command; "
+                f"started with {shell.name}"
+            )
+        lines.append(f'use job_status("{job_id}") to check progress')
+        return "\n".join(lines)
+
+    def _timeout_note(self, timeout: int) -> str:
+        return (
+            f"[timeout] command timed out after {timeout}s; "
+            "partial output is included below; set timeout_seconds higher "
+            f"(max {self.max_command_timeout}) or split the command"
+        )
+
+    def run_command(
+        self,
+        command: str,
+        timeout_seconds: int | None = None,
+        background: bool = False,
+        follow: bool | None = None,
+    ) -> str:
         if not self.allow_shell:
             raise ToolError("the run_command tool is disabled")
         if not command.strip():
@@ -6735,7 +7697,27 @@ class Workspace:
         read_only = is_read_only_command(command, current.kind)
         if not self._approve("run_command", command, read_only=read_only):
             raise ToolError("permission denied by user")
-        timeout = max(1, min(int(timeout_seconds), 300))
+        if timeout_seconds is None:
+            timeout_seconds = self.command_timeout
+        timeout = max(1, min(int(timeout_seconds), self.max_command_timeout))
+        if follow is None:
+            follow = self.job_follow and self.prompt_mode in ("interactive", "web")
+
+        if background:
+            if self.scheduled_run:
+                raise ToolError("background jobs are not available in scheduled runs")
+            job_id = self.jobs.start(
+                current,
+                current.command_argv(command),
+                self.root,
+                timeout,
+                command,
+            )
+            if follow:
+                return self._follow_job(job_id, current, timeout, command)
+            return self._background_started_text(
+                job_id, current, timeout, command
+            )
 
         candidates: list[ShellInfo] = [current]
         if self.shell_fallback:
@@ -6747,10 +7729,16 @@ class Workspace:
                 seen.add(key)
                 candidates.append(item)
 
-        attempts: list[tuple[ShellInfo, tuple[int, str, str, bool]]] = []
+        attempts: list[tuple[ShellInfo, tuple[int, str, str, bool, bool]]] = []
         launch_errors: list[tuple[ShellInfo, str]] = []
         skipped: list[str] = []
         current_key = os.path.normcase(os.path.realpath(current.path))
+        grace = (
+            self.background_after_seconds
+            if self.prompt_mode in ("interactive", "web")
+            else 0
+        )
+
         for candidate in candidates:
             is_current = os.path.normcase(os.path.realpath(candidate.path)) == current_key
             if (
@@ -6761,24 +7749,63 @@ class Workspace:
             ):
                 skipped.append(candidate.name)
                 continue
-            try:
-                result = _capture_process(
-                    candidate.command_argv(command),
-                    self.root,
-                    timeout,
-                    encoding=candidate.encoding,
-                    fallback_encodings=candidate.fallback_encodings,
-                )
-            except ToolError as exc:
-                if "timed out" in str(exc):
+
+            if grace > 0:
+                try:
+                    job_id = self.jobs.start(
+                        candidate,
+                        candidate.command_argv(command),
+                        self.root,
+                        timeout,
+                        command,
+                    )
+                except ToolError as exc:
+                    launch_errors.append((candidate, str(exc)))
+                    continue
+                try:
+                    finished = self.jobs.wait(job_id, min(grace, timeout + 0.5))
+                except KeyboardInterrupt:
+                    # Still in the foreground grace period: Ctrl+C terminates it.
+                    self.jobs.cancel(job_id)
                     raise
-                launch_errors.append((candidate, str(exc)))
-                continue
+                if not finished:
+                    self.jobs.mark_auto_promoted(job_id)
+                    if follow:
+                        return self._follow_job(
+                            job_id, candidate, timeout, command
+                        )
+                    return self._background_started_text(
+                        job_id,
+                        candidate,
+                        timeout,
+                        command,
+                        fallback_from=current if not is_current else None,
+                    )
+                result = self.jobs.result(job_id)
+            else:
+                try:
+                    result = _capture_process(
+                        candidate.command_argv(command),
+                        self.root,
+                        timeout,
+                        encoding=candidate.encoding,
+                        fallback_encodings=candidate.fallback_encodings,
+                    )
+                except ToolError as exc:
+                    launch_errors.append((candidate, str(exc)))
+                    continue
+
             attempts.append((candidate, result))
+            if result[4]:
+                return self._format_command_result(
+                    candidate,
+                    result[:4],
+                    note=self._timeout_note(timeout),
+                )
             if not _shell_mismatch(candidate.kind, result[0], result[1], result[2]):
                 return self._format_command_result(
                     candidate,
-                    result,
+                    result[:4],
                     fallback_from=current if not is_current else None,
                 )
 
@@ -6805,8 +7832,8 @@ class Workspace:
         )
         if skipped:
             note += "; fallback skipped without approval: " + ", ".join(skipped)
-        result = attempts[0][1] if attempts else (1, "", "", False)
-        return self._format_command_result(current, result, note=note)
+        result = attempts[0][1] if attempts else (1, "", "", False, False)
+        return self._format_command_result(current, result[:4], note=note)
 
     def list_shells(self) -> str:
         return self.shell_state.describe()
@@ -6874,6 +7901,25 @@ class Workspace:
     def generate_daily_episode(self, date: str = "") -> str:
         return self._memory_service().generate_daily_episode(date)
 
+    def job_status(self, id: str, output_chars: int = 4000) -> str:
+        return _sanitize(
+            self.jobs.status_text(id, max(200, min(int(output_chars), 20000)))
+        )
+
+    def job_output(self, id: str, tail_chars: int = 4000) -> str:
+        return _sanitize(
+            self.jobs.output_text(id, max(200, min(int(tail_chars), 20000)))
+        )
+
+    def job_cancel(self, id: str) -> str:
+        return self.jobs.cancel(id)
+
+    def list_jobs(self) -> str:
+        return self.jobs.list_text()
+
+    def close(self) -> None:
+        self.jobs.stop_all()
+
     def dispatch(self, name: str, arguments: dict[str, Any]) -> str:
         if self.memory_only and name not in MEMORY_TOOL_NAMES:
             raise ToolError(f"tool {name} is disabled for this memory task")
@@ -6892,6 +7938,10 @@ class Workspace:
             "write_file": self.write_file,
             "edit_file": self.edit_file,
             "run_command": self.run_command,
+            "job_status": self.job_status,
+            "job_output": self.job_output,
+            "job_cancel": self.job_cancel,
+            "list_jobs": self.list_jobs,
             "list_shells": self.list_shells,
             "switch_shell": self.switch_shell,
             "create_schedule": self.create_schedule,
@@ -8342,6 +9392,101 @@ def run_config_command(
     print("usage: /config [path|save]")
 
 
+def print_job_notifications(workspace: Workspace) -> None:
+    for note in workspace.jobs.drain_notifications():
+        if note.get("followed"):
+            continue
+        if not note.get("auto_promoted"):
+            continue
+        code = note.get("exit_code")
+        suffix = f" code {code}" if code is not None else ""
+        print(
+            _style(
+                f"[job] {note.get('id')} {note.get('status')}{suffix} "
+                f"({float(note.get('elapsed') or 0):.1f}s)",
+                DIM,
+                supports_color(),
+            ),
+            flush=True,
+        )
+
+
+def run_jobs_command(
+    workspace: Workspace,
+    argument: str,
+    args: Any | None = None,
+) -> None:
+    parts = argument.split()
+    action = parts[0].lower() if parts else ""
+    try:
+        if action in ("", "list"):
+            print(workspace.jobs.list_text())
+            print(
+                "usage: /jobs [status <id>|output <id> [n]|follow <id>|"
+                "detach <id>|stop <id>|clean|poll <1-60>|lines <1-50>]"
+            )
+            return
+        if action == "help":
+            print(
+                "usage: /jobs [status <id>|output <id> [n]|follow <id>|"
+                "detach <id>|stop <id>|clean|poll <1-60>|lines <1-50>]"
+            )
+            return
+        if action == "clean":
+            print(workspace.jobs.clean_finished())
+            return
+        if action == "poll":
+            if len(parts) == 1:
+                print(f"job poll interval: {workspace.job_poll_seconds}s")
+                return
+            value = int(parts[1])
+            if not 1 <= value <= 60:
+                raise ValueError
+            workspace.job_poll_seconds = value
+            if args is not None:
+                args.job_poll_seconds = value
+            print(f"job poll interval: {value}s")
+            return
+        if action == "lines":
+            if len(parts) == 1:
+                print(f"job follow lines: {workspace.job_follow_lines}")
+                return
+            value = int(parts[1])
+            if not 1 <= value <= 50:
+                raise ValueError
+            workspace.job_follow_lines = value
+            if args is not None:
+                args.job_follow_lines = value
+            print(f"job follow lines: {value}")
+            return
+        if len(parts) < 2:
+            print(f"usage: /jobs {action} <id>")
+            return
+        job_id = parts[1]
+        if action == "status":
+            output_chars = int(parts[2]) if len(parts) > 2 else 4000
+            print(workspace.jobs.status_text(job_id, output_chars))
+        elif action == "output":
+            tail_chars = int(parts[2]) if len(parts) > 2 else 4000
+            print(workspace.jobs.output_text(job_id, tail_chars))
+        elif action == "follow":
+            print(workspace.follow_job(job_id))
+        elif action == "detach":
+            if workspace.jobs.request_detach(job_id):
+                print(f"stopped watching {job_id}; task is still running")
+            else:
+                print(f"job is not running: {job_id}")
+        elif action in ("stop", "cancel"):
+            print(workspace.jobs.cancel(job_id))
+        else:
+            print(
+                "usage: /jobs [status <id>|output <id> [n]|follow <id>|"
+                "detach <id>|stop <id>|clean|poll <1-60>|lines <1-50>]"
+            )
+    except (ValueError, ToolError) as exc:
+        print(f"error: {exc or 'invalid value'}", file=sys.stderr)
+
+
 def run_memory_command(
     memory: "MemoryService | None",
     argument: str,
@@ -8518,9 +9663,13 @@ def run_turn(
             print(_style(f"  {text}", DIM, supports_color()), file=sys.stderr, flush=True)
         elif kind == "warning":
             print(_style(f"  {text}", YELLOW, supports_color()), file=sys.stderr, flush=True)
+        elif kind.startswith("job_"):
+            print(_style(_format_job_event(kind, text), DIM, supports_color()), flush=True)
         else:
             _print_thinking(text)
 
+    workspace.job_event = lambda kind, text: report(kind, text)
+    workspace.cancel_event = cancel_event
     usage_total: dict[str, int] = {}
     usage_turn: dict[str, int] = {}
     call_count = 0
@@ -8618,6 +9767,8 @@ def run_turn(
         print(f"[stopped] reached the limit of {max_steps} model calls without a final answer", file=sys.stderr)
         return False
     finally:
+        workspace.job_event = None
+        workspace.cancel_event = None
         client.last_turn_usage = dict(usage_total)
         client.last_turn_truncated = truncated
         if usage_total or usage_turn or context_window:
@@ -8914,10 +10065,11 @@ def print_help() -> None:
     print("          /reset, /compact [N] | auto ... | idle ..., /skill [name [question]],")
     print("          /image [path|clear], /save [--tool] [--thinking] [file],")
     print("          /confirm on|off, /thinking on|off, /reasoning provider:level,")
-    print("          /model [name|number|list|info|config [name|number]], /context,")
+    print("          /model [name|number|list|list all|info|config|use <conn> [model]], /context,")
     print("          /shell [name|path|list|auto],")
     print("          /session [list|new|use <id>|export <id>|rename|delete|info],")
     print("          /schedule [list|history <id>|run <id>|on <id>|off <id>|delete <id>],")
+    print("          /jobs [list|status|output|follow|detach|stop|clean|poll|lines],")
     print("          /memory [status|path|search <query>|read <date>|summarize [date]],")
     print("          /config [path|save],")
     print("          /status,")
@@ -8974,25 +10126,11 @@ def read_user_line(prompt: str) -> str:
 
 
 def repair_interrupted_turn(messages: list[dict[str, Any]]) -> None:
-    """Answer tool calls that were cut off by Ctrl+C so the next request stays valid."""
-    last_assistant = None
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "assistant":
-            last_assistant = index
-            break
-    if last_assistant is None:
-        return
-    tool_calls = messages[last_assistant].get("tool_calls") or []
-    answered = {
-        message.get("tool_call_id")
-        for message in messages[last_assistant + 1 :]
-        if message.get("role") == "tool"
-    }
-    for call in tool_calls:
-        if call.get("id") not in answered:
-            messages.append(
-                {"role": "tool", "tool_call_id": call["id"], "content": "error: interrupted by user"}
-            )
+    """Answer tool calls cut off by Ctrl+C or a process kill."""
+    repair_session_messages(
+        messages,
+        reason="error: interrupted by user; previous tool call did not finish",
+    )
 
 
 def render_history(
@@ -9096,12 +10234,12 @@ aside { width: 250px; flex: none; background: #fff; border-right: 1px solid #e3e
 .session { display: block; flex: 1; min-width: 0; text-align: left; padding: 8px; border: 1px solid transparent; background: transparent; border-radius: 6px; cursor: pointer; }
 .session:hover { background: #f1f3f6; }
 .session.active { background: #eef4ff; border-color: #b9d2ff; }
-.delete { flex: none; width: 30px; border: 0; border-radius: 6px; background: transparent; color: #b0b6c0; cursor: pointer; }
-.delete:hover { color: #d92d20; background: #fef3f2; }
 .session-menu { position: fixed; z-index: 95; min-width: 120px; padding: 4px; background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18); }
 .session-menu[hidden] { display: none; }
 .session-menu button { display: block; width: 100%; text-align: left; padding: 6px 10px; border: 0; border-radius: 4px; background: transparent; color: #344054; cursor: pointer; font: inherit; }
 .session-menu button:hover { background: #f1f3f6; }
+.session-menu button.danger { color: #d92d20; }
+.session-menu button.danger:hover { background: #fef3f2; }
 .session .title { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session .meta { display: block; color: #8a919c; font-size: 12px; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -9192,6 +10330,20 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .modal-actions button:disabled { color: #b0b6c0; cursor: default; }
 .modal-warning { margin-bottom: 10px; padding: 7px 9px; border-radius: 6px; background: #fff7e6; color: #93640b; font-size: 12px; }
 .modal-status { min-height: 18px; color: #667085; font-size: 12px; white-space: pre-wrap; }
+.help-body h3 { margin: 14px 0 6px; font-size: 14px; }
+.help-body h3:first-child { margin-top: 0; }
+.help-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.help-table td { border-bottom: 1px solid #eef0f3; padding: 5px 6px; vertical-align: top; }
+.help-table td:first-child { width: 42%; color: #344054; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+.help-note { margin: 8px 0; padding: 7px 9px; border-radius: 6px; background: #f9fafb; color: #667085; font-size: 12px; }
+.job-block { align-self: stretch; max-width: 820px; margin: 0 0 12px; padding: 9px 11px; border: 1px solid #d9e2ef; border-radius: 8px; background: #f8fbff; font-size: 12px; }
+.job-block .job-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.job-block .job-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; }
+.job-block .job-state { color: #667085; }
+.job-block pre { margin: 6px 0 0; padding: 6px 8px; border-radius: 5px; background: #fff; border: 1px solid #e3e6ea; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto; }
+.job-block .job-actions { display: flex; gap: 6px; margin-top: 6px; }
+.job-block .job-actions button { padding: 3px 8px; border: 1px solid #c9ced6; border-radius: 5px; background: #fff; cursor: pointer; font-size: 12px; }
+.job-block .job-actions button.danger { color: #d92d20; }
 .schedule-item { border: 1px solid #e3e6ea; border-radius: 8px; padding: 10px; margin-bottom: 8px; background: #fafbfc; }
 .schedule-item .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .schedule-item .name { font-weight: 600; }
@@ -9212,12 +10364,17 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   <aside>
     <div class="brand">benben-agent</div>
     <div class="model-row">
+      <label for="connection-select">连接</label>
+      <select id="connection-select"></select>
+    </div>
+    <div class="model-row">
       <label for="model">模型</label>
       <select id="model"></select>
       <div id="model-info" class="model-info"></div>
       <button id="model-info-edit" class="link-button">模型能力</button>
       <button id="connect" class="link-button">连接设置</button>
       <button id="schedules-open" class="link-button" hidden>定时任务</button>
+      <button id="help-open" class="link-button">帮助 / 指令</button>
     </div>
     <button id="new">+ 新会话</button>
     <div id="sessions"></div>
@@ -9326,6 +10483,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 <div id="session-menu" class="session-menu" hidden>
   <button id="session-rename" type="button">修改名称</button>
   <button id="session-export" type="button">导出会话</button>
+  <button id="session-delete" class="danger" type="button">删除会话</button>
 </div>
 <div id="export-modal" class="modal" hidden>
   <div class="modal-card">
@@ -9343,6 +10501,86 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
     <div class="modal-actions">
       <button id="export-start" class="primary" type="button">导出 Markdown</button>
       <button id="export-cancel" type="button">取消</button>
+    </div>
+  </div>
+</div>
+<div id="help-modal" class="modal" hidden>
+  <div class="modal-card" style="width: 760px;">
+    <div class="modal-head">
+      <strong>帮助与常用指令</strong>
+      <button id="help-close" class="close" type="button" title="关闭">×</button>
+    </div>
+    <div class="help-body">
+      <h3>对话</h3>
+      <table class="help-table">
+        <tr><td>Enter</td><td>发送消息</td></tr>
+        <tr><td>Shift+Enter</td><td>输入换行</td></tr>
+        <tr><td>选择图片</td><td>附加图片到下一条消息</td></tr>
+        <tr><td>停止</td><td>中断当前模型生成和工具执行</td></tr>
+        <tr><td>压缩</td><td>把较早对话总结成摘要，减少上下文</td></tr>
+      </table>
+
+      <h3>会话</h3>
+      <table class="help-table">
+        <tr><td>/session</td><td>列出最近会话</td></tr>
+        <tr><td>/session list all</td><td>列出全部会话</td></tr>
+        <tr><td>/session new</td><td>新建会话</td></tr>
+        <tr><td>/session use 编号|uuid</td><td>切换会话</td></tr>
+        <tr><td>/session info</td><td>查看当前会话</td></tr>
+        <tr><td>/session rename 新标题</td><td>修改当前会话标题</td></tr>
+        <tr><td>/session delete 编号|uuid</td><td>删除会话</td></tr>
+      </table>
+      <div class="help-note">也可以右键会话：修改名称、导出会话、删除会话。</div>
+
+      <h3>上下文</h3>
+      <table class="help-table">
+        <tr><td>/compact</td><td>压缩上下文，保留默认用户回合数</td></tr>
+        <tr><td>/compact 3</td><td>压缩后保留最近 3 个用户回合</td></tr>
+        <tr><td>/compact 0</td><td>只保留摘要，不保留最近回合</td></tr>
+      </table>
+
+      <h3>后台任务</h3>
+      <table class="help-table">
+        <tr><td>/jobs</td><td>列出后台任务</td></tr>
+        <tr><td>/jobs status 编号</td><td>查看状态和最近输出</td></tr>
+        <tr><td>/jobs output 编号 [n]</td><td>查看最近输出</td></tr>
+        <tr><td>/jobs follow 编号</td><td>开始跟随，每 2 秒显示最近 5 行</td></tr>
+        <tr><td>/jobs detach 编号</td><td>停止跟随，任务继续运行</td></tr>
+        <tr><td>/jobs stop 编号</td><td>取消任务，杀掉进程树</td></tr>
+        <tr><td>/jobs clean</td><td>清理已完成任务</td></tr>
+        <tr><td>/jobs poll 2</td><td>设置跟随轮询间隔</td></tr>
+        <tr><td>/jobs lines 5</td><td>设置跟随显示行数</td></tr>
+      </table>
+
+      <h3>连接、模型和 Shell</h3>
+      <table class="help-table">
+        <tr><td>/connect</td><td>打开连接设置</td></tr>
+        <tr><td>/model list all</td><td>列出所有已保存连接和模型</td></tr>
+        <tr><td>/model use 连接 [模型]</td><td>切换连接，可同时切换模型</td></tr>
+        <tr><td>/status</td><td>查看连接、模型、上下文、shell 和会话</td></tr>
+        <tr><td>/shell</td><td>查看当前和可用 shell</td></tr>
+        <tr><td>/shell 名称|路径</td><td>切换 shell</td></tr>
+        <tr><td>/shell auto</td><td>重新自动检测 shell</td></tr>
+      </table>
+      <div class="help-note">模型切换使用侧边栏下拉框；模型能力使用「模型能力」按钮。</div>
+
+      <h3>其他入口</h3>
+      <table class="help-table">
+        <tr><td>/help</td><td>打开这个帮助弹窗</td></tr>
+        <tr><td>连接设置</td><td>管理 API 连接、模型和 key</td></tr>
+        <tr><td>模型能力</td><td>编辑上下文、模态、工具和 reasoning 信息</td></tr>
+        <tr><td>定时任务</td><td>启用 --schedule 后显示，管理定时任务</td></tr>
+      </table>
+
+      <h3>CLI 专属</h3>
+      <div class="help-note">
+        以下命令只在 CLI 支持，Web 使用对应按钮或设置项：
+        /exit、/image、/save、/model info、/model config、/memory、/schedule、/config、
+        /confirm、/thinking、/reasoning。
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button id="help-close-bottom" class="primary" type="button">关闭</button>
     </div>
   </div>
 </div>
@@ -9436,6 +10674,8 @@ let reading = 0;
 let chatController = null;
 let lastToolDetail = null;
 let exportSession = null;
+let jobBlocks = new Map();
+let jobPollTimers = new Map();
 let modelInfoProvider = "";
 let modelInfoModel = "";
 
@@ -9453,6 +10693,7 @@ const sessionsEl = document.getElementById("sessions");
 const sessionMenuEl = document.getElementById("session-menu");
 const sessionRenameEl = document.getElementById("session-rename");
 const sessionExportEl = document.getElementById("session-export");
+const sessionDeleteEl = document.getElementById("session-delete");
 const exportModalEl = document.getElementById("export-modal");
 const exportTitleEl = document.getElementById("export-title");
 const exportCloseEl = document.getElementById("export-close");
@@ -9474,8 +10715,13 @@ const scheduleHistoryTextEl = document.getElementById("schedule-history-text");
 const scheduleHistoryCloseEl = document.getElementById("schedule-history-close");
 const previewsEl = document.getElementById("previews");
 const modelEl = document.getElementById("model");
+const connectionSelectEl = document.getElementById("connection-select");
 const modelInfoEl = document.getElementById("model-info");
 const modelInfoEditEl = document.getElementById("model-info-edit");
+const helpOpenEl = document.getElementById("help-open");
+const helpModalEl = document.getElementById("help-modal");
+const helpCloseEl = document.getElementById("help-close");
+const helpCloseBottomEl = document.getElementById("help-close-bottom");
 const modelInfoModalEl = document.getElementById("model-info-modal");
 const modelInfoTitleEl = document.getElementById("model-info-title");
 const modelInfoCloseEl = document.getElementById("model-info-close");
@@ -9563,7 +10809,9 @@ async function loadStoredImage(id, name) {
 lightboxEl.addEventListener("click", closeLightbox);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (!modelInfoModalEl.hidden) {
+  if (!helpModalEl.hidden) {
+    closeHelpModal();
+  } else if (!modelInfoModalEl.hidden) {
     closeModelInfoModal();
   } else if (!scheduleModalEl.hidden) {
     closeScheduleModal();
@@ -9601,6 +10849,111 @@ function addLine(cls, text) {
   div.textContent = text;
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+function createJobBlock(id) {
+  let block = jobBlocks.get(id);
+  if (block) return block;
+  const wrapped = document.createElement("div");
+  wrapped.className = "job-block";
+  const head = document.createElement("div");
+  head.className = "job-head";
+  const jobId = document.createElement("span");
+  jobId.className = "job-id";
+  jobId.textContent = id;
+  const state = document.createElement("span");
+  state.className = "job-state";
+  state.textContent = "starting…";
+  head.appendChild(jobId);
+  head.appendChild(state);
+  const output = document.createElement("pre");
+  output.textContent = "";
+  const actions = document.createElement("div");
+  actions.className = "job-actions";
+  const detach = document.createElement("button");
+  detach.type = "button";
+  detach.textContent = "停止跟随";
+  detach.onclick = () => stopJobFollow(id);
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "danger";
+  cancel.textContent = "取消任务";
+  cancel.onclick = () => cancelJob(id);
+  actions.appendChild(detach);
+  actions.appendChild(cancel);
+  wrapped.appendChild(head);
+  wrapped.appendChild(output);
+  wrapped.appendChild(actions);
+  logEl.appendChild(wrapped);
+  logEl.scrollTop = logEl.scrollHeight;
+  block = { wrapped, state, output, actions };
+  jobBlocks.set(id, block);
+  return block;
+}
+
+function finishJobBlock(id, stateText) {
+  const block = jobBlocks.get(id);
+  if (!block) return;
+  block.state.textContent = stateText;
+  block.actions.textContent = "";
+}
+
+function handleJobEvent(kind, payload) {
+  if (!payload || !payload.id) return;
+  const block = createJobBlock(payload.id);
+  if (kind === "job_start") {
+    block.state.textContent = "running · " + (payload.command || "") +
+      (payload.timeout ? " · timeout " + payload.timeout + "s" : "");
+    return;
+  }
+  if (kind === "job_output") {
+    const lines = payload.lines || [];
+    const omitted = Number(payload.omitted) || 0;
+    let prefix = omitted ? "[... 省略 " + omitted + " 行 ...]\n" : "";
+    block.output.textContent = prefix + lines.join("\n");
+    logEl.scrollTop = logEl.scrollHeight;
+    return;
+  }
+  if (kind === "job_detach") {
+    block.state.textContent = "已停止跟随 · 任务仍在运行";
+    block.actions.textContent = "";
+    return;
+  }
+  if (kind === "job_done") {
+    const status = payload.status || "done";
+    const code = payload.exit_code === null || payload.exit_code === undefined
+      ? "" : " · code " + payload.exit_code;
+    block.state.textContent = status + code + " · " + Number(payload.elapsed || 0).toFixed(1) + "s";
+    if (payload.output_tail && payload.output_tail.length) {
+      block.output.textContent = payload.output_tail.join("\n");
+    }
+    block.actions.textContent = "";
+  }
+}
+
+async function stopJobFollow(id) {
+  try {
+    const data = await api("/api/jobs/detach", { id: id });
+    const block = jobBlocks.get(id);
+    if (block) {
+      block.state.textContent = "已停止跟随 · 任务仍在运行";
+      block.actions.textContent = "";
+    }
+    statusEl.textContent = data.message || "已停止跟随";
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
+}
+
+async function cancelJob(id) {
+  try {
+    const data = await api("/api/jobs/stop", { id: id });
+    const block = jobBlocks.get(id);
+    if (block) block.state.textContent = "已取消";
+    statusEl.textContent = data.message || "已取消任务";
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
 }
 
 function addToolDetail(text, callId) {
@@ -10113,6 +11466,12 @@ sessionExportEl.onclick = (event) => {
   hideSessionMenu();
   openExportModal(session);
 };
+sessionDeleteEl.onclick = (event) => {
+  event.stopPropagation();
+  const session = menuSession;
+  hideSessionMenu();
+  if (session) removeSession(session.uuid, session.title);
+};
 exportCloseEl.onclick = closeExportModal;
 exportCancelEl.onclick = closeExportModal;
 exportStartEl.onclick = exportSessionMarkdown;
@@ -10150,16 +11509,7 @@ async function loadSessions() {
         event.stopPropagation();
         openSessionMenu(event, s);
       };
-      const remove = document.createElement("button");
-      remove.className = "delete";
-      remove.textContent = "×";
-      remove.title = "删除会话";
-      remove.onclick = (event) => {
-        event.stopPropagation();
-        removeSession(s.uuid, s.title);
-      };
       row.appendChild(button);
-      row.appendChild(remove);
       sessionsEl.appendChild(row);
     }
   } catch (err) {
@@ -10279,6 +11629,21 @@ async function saveModelInfo() {
     modelInfoSaveEl.disabled = false;
   }
 }
+
+function openHelpModal() {
+  helpModalEl.hidden = false;
+}
+
+function closeHelpModal() {
+  helpModalEl.hidden = true;
+}
+
+helpOpenEl.onclick = openHelpModal;
+helpCloseEl.onclick = closeHelpModal;
+helpCloseBottomEl.onclick = closeHelpModal;
+helpModalEl.addEventListener("click", (event) => {
+  if (event.target === helpModalEl) closeHelpModal();
+});
 
 modelInfoEditEl.onclick = openCurrentModelInfo;
 modelInfoCloseEl.onclick = closeModelInfoModal;
@@ -10497,9 +11862,32 @@ function loadConnectionForm(name) {
   }
 }
 
+function renderConnectionSelect(data) {
+  const items = data.connections || [];
+  connectionSelectEl.textContent = "";
+  if (!items.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "当前连接";
+    connectionSelectEl.appendChild(option);
+    connectionSelectEl.disabled = true;
+    return;
+  }
+  connectionSelectEl.disabled = false;
+  for (const item of items) {
+    const option = document.createElement("option");
+    option.value = item.name;
+    option.textContent = item.name + (item.runtime ? " (当前)" : "");
+    connectionSelectEl.appendChild(option);
+  }
+  const runtime = items.find(item => item.runtime) || items.find(item => item.active);
+  if (runtime) connectionSelectEl.value = runtime.name;
+}
+
 async function refreshConnections() {
   const data = await api("/api/connections");
   connectionsData = data;
+  renderConnectionSelect(data);
   if (data.env_overrides && data.env_overrides.length) {
     connectEnvEl.textContent = "当前环境变量会覆盖保存的连接：" + data.env_overrides.join("、");
     connectEnvEl.hidden = false;
@@ -10666,6 +12054,24 @@ connectModalEl.addEventListener("click", (event) => {
   if (event.target === connectModalEl) closeConnectModal();
 });
 
+connectionSelectEl.onchange = async () => {
+  const name = connectionSelectEl.value;
+  if (!name) return;
+  try {
+    const data = await api("/api/connections/use", { name: name });
+    currentModel = data.model;
+    setModelOptions([currentModel], currentModel);
+    statusEl.textContent = "连接已切换: " + name + " · " + data.model;
+    await refreshConnections();
+    await loadModels();
+    await loadRuntimeSettings();
+    if (data.needs_model_info) openCurrentModelInfo();
+  } catch (err) {
+    statusEl.textContent = String(err);
+    await refreshConnections().catch(() => {});
+  }
+};
+
 modelEl.onchange = async () => {
   const name = modelEl.value;
   try {
@@ -10693,8 +12099,6 @@ async function openSession(uuid) {
 }
 
 async function removeSession(uuid, title) {
-  const label = title ? uuid + "（" + title + "）" : uuid;
-  if (!window.confirm("删除会话 " + label + "？\n\n会话文件和消息记录会被永久删除。")) return;
   try {
     await api("/api/delete", { session: uuid });
     if (currentSession === uuid) {
@@ -10952,10 +12356,140 @@ async function handleShellCommand(argument) {
   }
 }
 
+function stopJobTimer(id) {
+  const timer = jobPollTimers.get(id);
+  if (timer) {
+    clearInterval(timer);
+    jobPollTimers.delete(id);
+  }
+}
+
+function startJobFollow(id) {
+  const block = createJobBlock(id);
+  block.state.textContent = "follow";
+  const poll = async () => {
+    try {
+      const status = await api("/api/jobs/status", { id: id, output_chars: 2000 });
+      const output = await api("/api/jobs/output", { id: id, tail_chars: 4000 });
+      block.output.textContent = output.text || "";
+      const first = (status.text || "").split("\n")[0] || "";
+      block.state.textContent = first;
+      if (!first.includes("running")) stopJobTimer(id);
+    } catch (err) {
+      stopJobTimer(id);
+      block.state.textContent = String(err);
+    }
+  };
+  stopJobTimer(id);
+  jobPollTimers.set(id, setInterval(poll, 2000));
+  poll();
+}
+
+async function handleJobsCommand(argument) {
+  const parts = (argument || "").trim().split(/\s+/).filter(Boolean);
+  const action = (parts[0] || "").toLowerCase();
+  try {
+    if (!action || action === "list") {
+      const data = await api("/api/jobs");
+      const rows = data.jobs || [];
+      if (!rows.length) {
+        addLine("tool", "no background jobs");
+      } else {
+        for (const job of rows) {
+          addLine("tool", job.id + " | " + job.status + " | " +
+            Number(job.elapsed || 0).toFixed(1) + "s/" + job.timeout + "s | " +
+            (job.command || ""));
+        }
+      }
+      addLine("tool", "usage: /jobs [status <id>|output <id> [n]|follow <id>|detach <id>|stop <id>|clean|poll|lines]");
+      return;
+    }
+    if (action === "poll") {
+      if (parts[1]) {
+        const value = parseInt(parts[1], 10);
+        const data = await api("/api/jobs/config", { poll_seconds: value });
+        addLine("tool", "job poll interval: " + data.poll_seconds + "s");
+      } else {
+        const data = await api("/api/jobs");
+        addLine("tool", "job poll interval: " + data.poll_seconds + "s");
+      }
+      return;
+    }
+    if (action === "lines") {
+      if (parts[1]) {
+        const value = parseInt(parts[1], 10);
+        const data = await api("/api/jobs/config", { follow_lines: value });
+        addLine("tool", "job follow lines: " + data.follow_lines);
+      } else {
+        const data = await api("/api/jobs");
+        addLine("tool", "job follow lines: " + data.follow_lines);
+      }
+      return;
+    }
+    if (action === "clean") {
+      const data = await api("/api/jobs/clean", {});
+      addLine("tool", data.message || "cleaned");
+      return;
+    }
+    const id = parts[1];
+    if (!id) {
+      addLine("tool", "usage: /jobs " + action + " <id>");
+      return;
+    }
+    if (action === "status") {
+      const data = await api("/api/jobs/status", { id: id, output_chars: 4000 });
+      addLine("tool", data.text || "");
+      return;
+    }
+    if (action === "output") {
+      const chars = parts[2] ? parseInt(parts[2], 10) : 4000;
+      const data = await api("/api/jobs/output", { id: id, tail_chars: chars });
+      addLine("tool", data.text || "");
+      return;
+    }
+    if (action === "follow") {
+      startJobFollow(id);
+      addLine("tool", "following " + id + " every 2s; use /jobs detach " + id + " to stop");
+      return;
+    }
+    if (action === "detach") {
+      stopJobTimer(id);
+      const data = await api("/api/jobs/detach", { id: id });
+      const block = jobBlocks.get(id);
+      if (block) {
+        block.state.textContent = "已停止跟随 · 任务仍在运行";
+        block.actions.textContent = "";
+      }
+      addLine("tool", data.message || "stopped following " + id);
+      return;
+    }
+    if (action === "stop" || action === "cancel") {
+      stopJobTimer(id);
+      const data = await api("/api/jobs/stop", { id: id });
+      addLine("tool", data.message || "cancelled " + id);
+      return;
+    }
+    addLine("tool", "usage: /jobs [status <id>|output <id> [n]|follow <id>|detach <id>|stop <id>|clean|poll|lines]");
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
+}
+
 async function send() {
   const text = inputEl.value.trim();
   if ((!text && uploads.length === 0) || reading > 0 || sendEl.disabled) return;
   if (!token) { statusEl.textContent = "缺少 token"; return; }
+  if (/^\/help\s*$/.test(text)) {
+    inputEl.value = "";
+    openHelpModal();
+    return;
+  }
+  const jobsMatch = text.match(/^\/jobs(?:\s+(.*))?$/);
+  if (jobsMatch) {
+    inputEl.value = "";
+    handleJobsCommand(jobsMatch[1] || "");
+    return;
+  }
   const sessionMatch = text.match(/^\/session(?:\s+(.*))?$/);
   if (sessionMatch) {
     inputEl.value = "";
@@ -11033,6 +12567,13 @@ async function send() {
         else if (event.type === "thinking") addLine("tool", "思考: " + event.text);
         else if (event.type === "usage") addLine("tool", event.text);
         else if (event.type === "warning") addLine("warning", "⚠ " + event.text);
+        else if (event.type.startsWith("job_")) {
+          try {
+            handleJobEvent(event.type, JSON.parse(event.text));
+          } catch (err) {
+            addLine("warning", "⚠ job event parse failed: " + String(err));
+          }
+        }
         else if (event.type === "error") {
           addLine("warning", "⚠ " + event.text);
           failed = true;
@@ -11114,6 +12655,7 @@ inputEl.addEventListener("keydown", (event) => {
     statusEl.textContent = String(err);
   }
   loadSessions();
+  await refreshConnections().catch(() => {});
   loadModels();
   await refreshSchedules(false);
   setInterval(() => refreshSchedules(true), 5000);
@@ -11484,6 +13026,13 @@ def run_web(
             if parsed.path == "/api/sessions":
                 self._json(200, {"sessions": session_summaries()})
                 return
+            if parsed.path == "/api/jobs":
+                self._json(200, {
+                    "jobs": workspace.jobs.list_snapshots(),
+                    "poll_seconds": workspace.job_poll_seconds,
+                    "follow_lines": workspace.job_follow_lines,
+                })
+                return
             if parsed.path == "/api/schedules":
                 if scheduler is None:
                     self._json(200, {
@@ -11722,6 +13271,92 @@ def run_web(
                     ),
                     "markdown": markdown,
                 })
+                return
+
+            if parsed.path == "/api/jobs/config":
+                try:
+                    if "poll_seconds" in payload:
+                        value = payload["poll_seconds"]
+                        if not isinstance(value, int) or isinstance(value, bool):
+                            self._error(400, "poll_seconds must be an integer")
+                            return
+                        if not 1 <= value <= 60:
+                            self._error(400, "poll_seconds must be between 1 and 60")
+                            return
+                        workspace.job_poll_seconds = value
+                    if "follow_lines" in payload:
+                        value = payload["follow_lines"]
+                        if not isinstance(value, int) or isinstance(value, bool):
+                            self._error(400, "follow_lines must be an integer")
+                            return
+                        if not 1 <= value <= 50:
+                            self._error(400, "follow_lines must be between 1 and 50")
+                            return
+                        workspace.job_follow_lines = value
+                    self._json(200, {
+                        "ok": True,
+                        "poll_seconds": workspace.job_poll_seconds,
+                        "follow_lines": workspace.job_follow_lines,
+                    })
+                except ToolError as exc:
+                    self._error(400, str(exc))
+                return
+
+            if parsed.path in (
+                "/api/jobs/status",
+                "/api/jobs/output",
+                "/api/jobs/detach",
+                "/api/jobs/stop",
+                "/api/jobs/cancel",
+                "/api/jobs/clean",
+            ):
+                try:
+                    if parsed.path == "/api/jobs/clean":
+                        self._json(200, {
+                            "ok": True,
+                            "message": workspace.jobs.clean_finished(),
+                        })
+                        return
+                    job_id = payload.get("id")
+                    if not isinstance(job_id, str) or not job_id:
+                        self._error(400, "id must be a non-empty string")
+                        return
+                    if parsed.path == "/api/jobs/status":
+                        chars = payload.get("output_chars", 4000)
+                        if not isinstance(chars, int) or isinstance(chars, bool):
+                            self._error(400, "output_chars must be an integer")
+                            return
+                        self._json(200, {
+                            "ok": True,
+                            "text": workspace.jobs.status_text(job_id, chars),
+                        })
+                    elif parsed.path == "/api/jobs/output":
+                        chars = payload.get("tail_chars", 4000)
+                        if not isinstance(chars, int) or isinstance(chars, bool):
+                            self._error(400, "tail_chars must be an integer")
+                            return
+                        self._json(200, {
+                            "ok": True,
+                            "text": workspace.jobs.output_text(job_id, chars),
+                        })
+                    elif parsed.path == "/api/jobs/detach":
+                        detached = workspace.jobs.request_detach(job_id)
+                        self._json(200, {
+                            "ok": True,
+                            "detached": detached,
+                            "message": (
+                                f"stopped watching {job_id}; task is still running"
+                                if detached
+                                else f"job is not running: {job_id}"
+                            ),
+                        })
+                    else:
+                        self._json(200, {
+                            "ok": True,
+                            "message": workspace.jobs.cancel(job_id),
+                        })
+                except ToolError as exc:
+                    self._error(404, str(exc))
                 return
 
             if parsed.path == "/api/schedules/history":
@@ -12585,6 +14220,78 @@ def main(argv: list[str] | None = None) -> int:
         help="minimum messages before idle compaction (default: 6)",
     )
     parser.add_argument(
+        "--command-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="default run_command timeout (default: 60)",
+    )
+    parser.add_argument(
+        "--max-command-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="maximum allowed run_command timeout (default: 600)",
+    )
+    background_group = parser.add_mutually_exclusive_group()
+    background_group.add_argument(
+        "--background-after",
+        dest="background_after_seconds",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="move a foreground command to background after this many seconds (default: 30)",
+    )
+    background_group.add_argument(
+        "--no-auto-background",
+        dest="background_after_seconds",
+        action="store_const",
+        const=0,
+        help="never move foreground commands to background automatically",
+    )
+    parser.add_argument(
+        "--max-background-jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="maximum simultaneous background jobs (default: 8)",
+    )
+    parser.add_argument(
+        "--background-output-chars",
+        type=int,
+        default=None,
+        metavar="N",
+        help="characters retained per background output stream (default: 20000)",
+    )
+    job_follow_group = parser.add_mutually_exclusive_group()
+    job_follow_group.add_argument(
+        "--job-follow",
+        dest="job_follow",
+        action="store_true",
+        default=None,
+        help="follow background command output until completion (default: on)",
+    )
+    job_follow_group.add_argument(
+        "--no-job-follow",
+        dest="job_follow",
+        action="store_false",
+        help="return immediately when a background command starts",
+    )
+    parser.add_argument(
+        "--job-poll-seconds",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="background follow poll interval (default: 2)",
+    )
+    parser.add_argument(
+        "--job-follow-lines",
+        type=int,
+        default=None,
+        metavar="N",
+        help="lines shown per follow poll (default: 5)",
+    )
+    parser.add_argument(
         "-c",
         "--continue",
         dest="resume",
@@ -12781,6 +14488,36 @@ def main(argv: list[str] | None = None) -> int:
     if not (0 <= args.port <= 65535):
         print("error: --port must be between 0 and 65535", file=sys.stderr)
         return 2
+    if not 1 <= args.command_timeout <= 86400:
+        print("error: --command-timeout must be between 1 and 86400", file=sys.stderr)
+        return 2
+    if not 1 <= args.max_command_timeout <= 86400:
+        print("error: --max-command-timeout must be between 1 and 86400", file=sys.stderr)
+        return 2
+    if args.command_timeout > args.max_command_timeout:
+        print(
+            "error: --command-timeout cannot exceed --max-command-timeout",
+            file=sys.stderr,
+        )
+        return 2
+    if not 0 <= args.background_after_seconds <= 3600:
+        print("error: --background-after must be between 0 and 3600", file=sys.stderr)
+        return 2
+    if not 1 <= args.max_background_jobs <= 64:
+        print("error: --max-background-jobs must be between 1 and 64", file=sys.stderr)
+        return 2
+    if not 1000 <= args.background_output_chars <= 200000:
+        print(
+            "error: --background-output-chars must be between 1000 and 200000",
+            file=sys.stderr,
+        )
+        return 2
+    if not 1 <= args.job_poll_seconds <= 60:
+        print("error: --job-poll-seconds must be between 1 and 60", file=sys.stderr)
+        return 2
+    if not 1 <= args.job_follow_lines <= 50:
+        print("error: --job-follow-lines must be between 1 and 50", file=sys.stderr)
+        return 2
     if (
         args.auto_compact_threshold is not None
         and not 1 <= args.auto_compact_threshold <= 100
@@ -12916,7 +14653,16 @@ def main(argv: list[str] | None = None) -> int:
         allow_shell=args.shell_enabled,
         shell_state=shell_state,
         shell_fallback=args.shell_fallback,
+        command_timeout=args.command_timeout,
+        max_command_timeout=args.max_command_timeout,
+        background_after_seconds=args.background_after_seconds,
+        max_background_jobs=args.max_background_jobs,
+        background_output_chars=args.background_output_chars,
+        job_follow=args.job_follow,
+        job_poll_seconds=args.job_poll_seconds,
+        job_follow_lines=args.job_follow_lines,
     )
+    atexit.register(workspace.close)
     workspace.skills = (
         discover_skills(workspace.root, only_own=args.only_own_skills) if args.skills else {}
     )
@@ -13175,6 +14921,7 @@ def main(argv: list[str] | None = None) -> int:
         last_activity = time.monotonic()
         while True:
             print_schedule_notifications(scheduler)
+            print_job_notifications(workspace)
             try:
                 user_input = read_user_line(_input_prompt("you> ", BOLD + CYAN)).strip()
             except EOFError:
@@ -13270,6 +15017,13 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if user_input == "/schedule" or user_input.startswith("/schedule "):
                 run_schedule_command(scheduler, user_input[len("/schedule"):].strip())
+                continue
+            if user_input == "/jobs" or user_input.startswith("/jobs "):
+                run_jobs_command(
+                    workspace,
+                    user_input[len("/jobs"):].strip(),
+                    args,
+                )
                 continue
             if user_input == "/memory" or user_input.startswith("/memory "):
                 run_memory_command(memory, user_input[len("/memory"):].strip())
@@ -13858,6 +15612,126 @@ def main(argv: list[str] | None = None) -> int:
                     elif target == client.model:
                         model_info = saved
                     continue
+                if info_parts[0].lower() in ("use", "switch"):
+                    rest = info_parts[1].strip() if len(info_parts) > 1 else ""
+                    if not rest:
+                        print("usage: /model use [--save] <connection> [model]")
+                        continue
+                    save_switch = False
+                    if rest.startswith("--save "):
+                        save_switch = True
+                        rest = rest[len("--save "):].strip()
+                    tokens = rest.split(maxsplit=1)
+                    target_name = tokens[0]
+                    target_model = tokens[1].strip() if len(tokens) > 1 else ""
+                    profiles = config.get("connections") or {}
+                    if target_name not in profiles:
+                        known = ", ".join(sorted(profiles)) or "(none)"
+                        print(
+                            f"error: unknown connection {target_name!r}; "
+                            f"saved connections: {known}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    try:
+                        new_connection = connection_from_profile(
+                            target_name,
+                            profiles[target_name],
+                            use_env_fallback=not args.no_env,
+                        )
+                        new_client = make_client(new_connection)
+                    except (ConfigError, ChatError) as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
+                    if target_model:
+                        new_client.model = target_model
+                    client = new_client
+                    connection = new_connection
+                    if scheduler is not None:
+                        scheduler.update_context(connection, client.model)
+                    if memory is not None:
+                        memory.update_context(connection, client.model)
+                    model_info = model_registry.resolve(
+                        connection.provider,
+                        client.model,
+                        connection.api_format,
+                        connection.model_info,
+                    )
+                    if save_switch:
+                        draft = copy.deepcopy(config)
+                        draft.setdefault("connections", {})
+                        draft["active"] = target_name
+                        if target_model:
+                            draft["connections"].setdefault(target_name, {})
+                            draft["connections"][target_name]["model"] = target_model
+                        try:
+                            save_config(draft, config_path)
+                        except ConfigError as exc:
+                            print(f"error: {exc}", file=sys.stderr)
+                            continue
+                        config.clear()
+                        config.update(draft)
+                    reasoning_label = (
+                        client.reasoning.label
+                        if client.reasoning is not None
+                        else "default"
+                    )
+                    print(
+                        f"current connection: {connection.name or 'custom'} | "
+                        f"model: {client.model} | api: {connection.api_format} | "
+                        f"reasoning: {reasoning_label}"
+                    )
+                    print(model_info_summary(model_info))
+                    if model_info.source in ("fallback", "remote"):
+                        if sys.stdin.isatty():
+                            saved = configure_model_info(
+                                connection.provider,
+                                client.model,
+                                model_registry,
+                                connection.api_format,
+                                force_update=False,
+                            )
+                            if saved is not None:
+                                model_info = saved
+                        else:
+                            print(
+                                "hint: model capability is not configured; "
+                                "run /model config to add it",
+                                file=sys.stderr,
+                            )
+                    warning = reasoning_model_warning(
+                        client.reasoning, client.model
+                    )
+                    if warning:
+                        print(f"warning: {warning}", file=sys.stderr)
+                    continue
+                if " ".join(argument.lower().split()) in ("list all", "all"):
+                    profiles = config.get("connections") or {}
+                    if not profiles:
+                        print("no saved connections; use /connect to create one")
+                        continue
+                    print("saved connections:")
+                    for name in sorted(profiles):
+                        profile = profiles.get(name) or {}
+                        marker = ""
+                        if connection.name == name:
+                            marker = "  *"
+                        active = " (active)" if config.get("active") == name else ""
+                        info = model_registry.resolve(
+                            profile.get("provider") or "custom",
+                            profile.get("model") or "?",
+                            profile.get("api_format") or "",
+                            profile.get("model_info")
+                            if isinstance(profile.get("model_info"), dict)
+                            else None,
+                        )
+                        print(
+                            f"- {name}{marker}{active}: "
+                            f"{profile.get('model') or '?'} "
+                            f"[{info.context_window // 1000}k]"
+                        )
+                    print("use /model use <connection> [model] to switch")
+                    continue
                 if argument.lower() == "list" or argument.isdigit():
                     try:
                         models = client.list_models()
@@ -14042,6 +15916,11 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             except KeyboardInterrupt:
                 repair_interrupted_turn(messages)
+                if session is not None:
+                    try:
+                        session.log(messages)
+                    except SessionError as exc:
+                        print(f"[session] {exc}", file=sys.stderr)
                 if guard.pressed():
                     print()
                     return 130

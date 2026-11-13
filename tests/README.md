@@ -23,6 +23,10 @@ python3 tests/test_memory.py
 python3 tests/test_config_defaults.py
 python3 tests/test_model_info.py
 python3 tests/test_auto_compact.py
+python3 tests/test_command_timeout.py
+python3 tests/test_session_repair.py
+python3 tests/test_background_jobs.py
+python3 tests/test_model_switch.py
 ```
 
 测试会：
@@ -56,3 +60,7 @@ python3 tests/test_auto_compact.py
 | `test_config_defaults.py` | 配置默认值、首次创建、CLI 优先级、`/config save`、`--no-config` |
 | `test_model_info.py` | 模型能力目录、fallback、模态、上下文用量、远程解析、图片预检、模型能力向导、`/model info` |
 | `test_auto_compact.py` | 8 档自动压缩、自定义覆盖、空闲压缩、配置持久化、`/compact auto|idle` |
+| `test_command_timeout.py` | 超时必填、超时提示、部分输出、子进程树清理 |
+| `test_session_repair.py` | 未完成 tool_call 修复、半行修复、修复幂等 |
+| `test_background_jobs.py` | 自动转后台、跟随输出、进程取消、前台 Ctrl+C、`/jobs` |
+| `test_model_switch.py` | `/model list all`、跨连接切换、`--save` 持久化 |

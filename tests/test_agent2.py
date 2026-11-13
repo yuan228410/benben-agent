@@ -228,7 +228,14 @@ client = agent.ChatClient(f"http://127.0.0.1:{server.server_port}/v1", "", "m", 
 messages = [{"role": "user", "content": "go"}]
 ok = agent.run_turn(client, ws, messages, 3)
 check("run_turn with edit_file", ok and "GAMMA" in open(os.path.join(base, "edit/a.txt")).read(), messages[-1])
-check("all 9 tools sent", messages[-1]["content"] == "done:list_dir,read_file,search,glob,write_file,edit_file,run_command,list_shells,switch_shell", messages[-1])
+check(
+    "all tools sent",
+    messages[-1]["content"] == (
+        "done:list_dir,read_file,search,glob,write_file,edit_file,run_command,"
+        "list_shells,switch_shell,job_status,job_output,job_cancel,list_jobs"
+    ),
+    messages[-1],
+)
 
 
 history_messages = [

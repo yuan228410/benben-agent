@@ -144,10 +144,26 @@ try:
     check("web html slash shell", "handleShellCommand" in html)
     check("web html slash status", "handleStatusCommand" in html)
     check("web html slash session", "handleSessionCommand" in html)
-    check("web html session menu", 'id="session-menu"' in html and 'id="session-rename"' in html)
+    check(
+        "web html session menu",
+        'id="session-menu"' in html
+        and 'id="session-rename"' in html
+        and 'id="session-delete"' in html,
+    )
+    check("web html no side delete", 'class="delete"' not in html)
     check("web html export", 'id="session-export"' in html and 'id="export-modal"' in html)
     check("web html tool details", "addToolDetail" in html and "tool-detail" in html)
     check("web html model info", 'id="model-info"' in html and "renderModelInfo" in html)
+    check("web html connection select", 'id="connection-select"' in html)
+    check(
+        "web html help modal",
+        'id="help-open"' in html
+        and 'id="help-modal"' in html
+        and "openHelpModal" in html
+        and "/session" in html
+        and "/compact" in html
+        and "/jobs" in html,
+    )
     check(
         "web html model info modal",
         'id="model-info-modal"' in html and 'id="model-info-edit"' in html,
@@ -206,6 +222,15 @@ try:
     check("state idle compact", state["idle_compact"]["enabled"] is False, state.get("idle_compact"))
     models_payload = api_json("/api/models")
     check("models info", models_payload["info"]["context_window"] == 256000, models_payload.get("info"))
+
+    jobs_payload = api_json("/api/jobs")
+    check("jobs list empty", jobs_payload["jobs"] == [], jobs_payload)
+    job_config = api_json("/api/jobs/config", {"poll_seconds": 3, "follow_lines": 4})
+    check("jobs poll config", job_config["poll_seconds"] == 3, job_config)
+    check("jobs lines config", job_config["follow_lines"] == 4, job_config)
+    code, _ = api("/api/jobs/status", {"id": "job-nope"}, expect_error=True)
+    check("jobs unknown id", code == 404, code)
+    check("web html job block", "job-block" in html and "handleJobEvent" in html)
 
     model_info_payload = api_json("/api/model/info")
     check("model info needs fill", model_info_payload["needs_model_info"] is True, model_info_payload)

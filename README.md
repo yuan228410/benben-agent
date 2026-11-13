@@ -230,6 +230,11 @@ Windows 乱码处理：
 | `--no-shell` | 关 | 禁用 `run_command` |
 | `--shell` | `auto` | shell：`auto`、`pwsh`、`powershell`、`git-bash`、`cmd`、`bash`、`zsh`、`sh` 或绝对路径 |
 | `--no-shell-fallback` | 关 | 当前 shell 不认识命令时，不自动尝试其他 shell |
+| `--command-timeout` / `--max-command-timeout` | `60` / `600` | 命令默认超时和最大允许超时 |
+| `--background-after` / `--no-auto-background` | `30` | 前台命令超过多少秒自动转后台；`--no-auto-background` 关闭 |
+| `--max-background-jobs` / `--background-output-chars` | `8` / `20000` | 后台任务并发上限和每路输出保留字符数 |
+| `--job-follow` / `--no-job-follow` | 开 | 后台任务是否默认跟随输出 |
+| `--job-poll-seconds` / `--job-follow-lines` | `2` / `5` | 跟随轮询间隔和每次显示行数 |
 | `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
@@ -306,6 +311,14 @@ Windows 乱码处理：
       "min_context_percent": 20,
       "min_messages": 6
     },
+    "command_timeout": 60,
+    "max_command_timeout": 600,
+    "background_after_seconds": 30,
+    "max_background_jobs": 8,
+    "background_output_chars": 20000,
+    "job_follow": true,
+    "job_poll_seconds": 2,
+    "job_follow_lines": 5,
     "web": {"host": "127.0.0.1", "port": 8765}
   }
 }
@@ -416,9 +429,15 @@ python3 benben-agent.py --memory --thinking --max-steps 50
 /model info <名称|编号>     查看指定模型能力
 /model config              配置/更新当前模型能力
 /model config <名称|编号>   配置指定模型能力
+/model list all            列出所有已保存连接和模型
+/model use <连接> [模型]    切换连接，可同时切换模型
+/model use --save <连接> [模型]
+                           切换并写入 active 连接
 /context                   查看当前上下文用量（优先用真实 token 推算）
 /status                    显示模型能力和上下文
 ```
+
+Web 侧边栏增加连接下拉框和模型下拉框：先选连接，再选该连接的模型；切换后如果模型能力未配置，会自动打开模型能力对话框。
 
 配置模型时：
 
@@ -549,6 +568,8 @@ python3 benben-agent.py \
 - system prompt 不保存，启动时按当前配置重新生成；
 - 思考内容和图片的 base64 都会保存，带图片的会话文件会明显变大；
 - 加载时跳过损坏的行，进程被杀留下的半行不会导致失败；
+- 启动恢复或 Web 打开会话时自动修复未完成的 tool_call：补一条 `error: interrupted` 工具结果，避免下一轮 API 请求因历史不完整而失败；
+- 文件末尾如果没有换行，加载时会自动补一个换行，避免新记录和半行拼接；
 - 定时任务定义和运行记录单独保存在 `~/.benben-agent/schedules/`，见下文「定时任务」；
 - 长期记忆和情景记忆保存在 `~/.benben-agent/memory/`，见下文「长期记忆与情景记忆」；
 - 模型能力信息保存在 `~/.benben-agent/models.json`，见下文「模型能力信息」。
@@ -585,7 +606,7 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 
 `/session export` 默认只导出对话正文；`--tool` 同时导出工具调用和工具结果，`--thinking` 导出思考内容。不指定文件时写入当前工作区的 `session-<uuid>.md`。
 
-`/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏也提供会话列表、新建和删除；右键会话可以修改名称或导出 Markdown，聊天框输入 `/session` 也可以管理。
+`/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏提供会话列表和新建；删除会话放在右键菜单里，右键还可以修改名称或导出 Markdown，聊天框输入 `/session` 也可以管理。
 
 ### 用量统计
 
@@ -810,6 +831,46 @@ once 2026-11-12 15:00
 
 网页侧边栏启用后会显示「定时任务」按钮，可以查看任务、运行、启停、查看记录和删除。运行完成后，新结果会以提示形式出现在对话区。
 
+## 后台任务与跟随
+
+耗时命令不会一直阻塞会话。`run_command` 支持 `background` 和 `follow`：
+
+```json
+{
+  "command": "npm run build",
+  "timeout_seconds": 600,
+  "background": true,
+  "follow": true
+}
+```
+
+- 前台命令超过 `background_after_seconds`（默认 30 秒）会自动转后台
+- 交互式 CLI 和 Web 默认跟随
+- 每 2 秒读取一次新增输出，只显示最近 5 行
+- 输出过多时显示省略行数
+- 跟随期间不调用模型，不消耗模型 token
+- 任务结束后返回退出码、耗时和输出尾部
+- 成功显示最后 5 行，失败显示最后 10 行
+- 完整输出留在后台缓冲区或命令日志文件
+
+CLI/Web 指令：
+
+```text
+/jobs                       列出任务
+/jobs status <id>           查看状态和最近输出
+/jobs output <id> [n]       查看输出
+/jobs follow <id>           开始跟随
+/jobs detach <id>           停止跟随，任务继续
+/jobs stop <id>             取消任务，杀进程树
+/jobs clean                 清理已完成任务
+/jobs poll 2                设置轮询间隔
+/jobs lines 5               设置跟随显示行数
+```
+
+Ctrl+C 或 Web「停止跟随」只停止观察，后台任务继续运行。取消任务要使用 `/jobs stop` 或 `job_cancel`。agent 退出时会停止所有后台任务；后台任务不跨进程持久化。
+
+Web 端启动后台任务时会显示任务块，包含最近输出、「停止跟随」和「取消任务」按钮。
+
 ## 长期记忆与情景记忆
 
 记忆默认关闭，和技能、定时任务一样需要显式启用：
@@ -895,7 +956,8 @@ python3 benben-agent.py --web
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
 - 页面支持对话、新建/切换/删除历史会话（删除有确认弹框）、上传图片，左侧下拉框可以切换模型（等价于 CLI 的 `/model`，切换后立即生效）；
-- 会话列表支持右键菜单修改名称、导出 Markdown；聊天框输入 `/session` 也可以管理会话；
+- 侧边栏「帮助 / 指令」打开帮助弹窗，列出 Web 支持的斜杠命令和常用操作；输入 `/help` 也可以打开；
+- 会话列表支持右键菜单修改名称、导出 Markdown、删除会话；聊天框输入 `/session` 也可以管理会话；
 - 启用 `--schedule` 后侧边栏显示「定时任务」，可查看/运行/启停/删除任务和查看运行记录，后台每 5 秒轮询一次并提示新结果；
 - 工具调用显示为可展开块，默认折叠；展开后可查看完整参数和工具结果，历史会话也会回放；
 - 输入框下方有「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级按协议显示 DeepSeek/Kimi/MiniMax/OpenAI/Anthropic 选项；
@@ -929,6 +991,8 @@ python3 benben-agent.py --web
 | `list_episodes` | 列出情景记忆文件（仅启用记忆时提供） | 否 |
 | `read_episode` | 读取情景记忆文件（仅启用记忆时提供） | 否 |
 | `generate_daily_episode` | 生成自动日总结（仅启用记忆时提供） | 否 |
+
+`run_command` 的 `timeout_seconds` 是必填参数：快速查询建议 10-30 秒，构建/测试/安装 60-180 秒，最大 300 秒。命令超时或用户按 Ctrl+C 时会杀掉整个进程树，保留已捕获的部分输出，并提示模型提高超时或拆分任务。不要在前台运行服务器、守护进程、`tail -f`、`watch` 或交互式编辑器。
 
 默认不询问，写文件和命令直接执行。加 `--confirm` 后，写文件和会修改状态的命令会询问 `Allow? [Y/n]`（直接回车即允许）；只读命令（grep、tail、ps、df、journalctl、curl 等）任何时候都不询问。判断是保守白名单：未知命令、包装器（sudo、timeout、env）、重定向、命令替换和危险参数都按修改状态处理；`curl` 带 `-o/-d/-X` 等写文件或发数据的参数、`wget` 不带 `-O -`/`--spider` 时都要求批准。标准输入不是终端（例如管道、CI）时直接拒绝，并把原因返回给模型。交互模式里可以随时用 `/confirm on` 和 `/confirm off` 切换。模型最多执行 `--max-steps` 次模型调用，一次性任务达到上限会以退出码 1 结束，交互模式只提示后继续。交互模式下 Ctrl+C 需要连按两次才退出：第一次取消当前输入或中断正在执行的任务，2 秒内再按一次才退出。
 
