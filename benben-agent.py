@@ -48,7 +48,12 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
                             后台任务是否默认跟随输出
     --job-poll-seconds SEC  跟随轮询间隔（默认 2）
     --job-follow-lines N    每次显示最近几行（默认 5）
-    --plain / --no-plain    是否渲染终端 Markdown
+    --stream / --no-stream  是否流式读取模型输出（交互终端默认开启）
+    --stream-idle-timeout SEC
+                            流式无事件超时（默认 300）
+    --stream-flush-ms MS    CLI 流式刷新间隔（默认 40；0 表示每块刷新）
+    --debug-stream          只打印 SSE 事件类型，不打印正文
+    --plain / --no-plain    是否渲染终端 Markdown（仅非流式）
     --verbose-tools / --no-verbose-tools
                             是否显示完整工具参数和工具结果（最多 20000 字符）
     -i, --image PATH        给任务附加图片，可重复，最多 4 张、单张 10 MB
@@ -124,6 +129,8 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /jobs detach <id>             停止跟随但保留任务
     /jobs stop <id>               取消后台任务
     /jobs clean / poll / lines    清理任务、设置轮询和行数
+    /stream                       查看当前流式输出模式
+    /stream on|off|auto           切换流式、非流式或恢复启动默认
     /config                       查看配置文件路径和已保存默认值
     /config save                  把当前有效设置写入配置文件
     /reset                        清空上下文，下一条消息开新会话文件
@@ -195,6 +202,7 @@ import argparse
 import atexit
 import base64
 import binascii
+import codecs
 import copy
 from datetime import datetime, timedelta
 import fnmatch
@@ -219,6 +227,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import islice
 from typing import Any, Callable, NamedTuple
@@ -926,6 +935,14 @@ class ChatError(Exception):
     """Raised when the chat completions API cannot be used."""
 
 
+class ChatCancelled(Exception):
+    """Raised when the user stops a streaming response."""
+
+
+class StreamNotSupported(Exception):
+    """Raised when an endpoint rejects a streaming request; callers fall back."""
+
+
 class ToolError(Exception):
     """Raised when a tool call fails; the message is shown back to the model."""
 
@@ -1099,6 +1116,21 @@ def reasoning_model_warning(config: ReasoningConfig | None, model: str) -> str |
 # --------------------------------------------------------------------------- #
 
 
+_SSE_DONE = object()
+
+
+def _merge_tool_arguments(existing: str, fragment: str) -> str:
+    """Merge streamed tool arguments, tolerating gateways that resend JSON."""
+    if not fragment:
+        return existing
+    if not existing or fragment == existing:
+        return fragment
+    stripped = fragment.lstrip()
+    if stripped.startswith("{") and len(fragment) >= len(existing):
+        return fragment
+    return existing + fragment
+
+
 class BaseChatClient:
     def __init__(
         self,
@@ -1130,6 +1162,12 @@ class BaseChatClient:
         # 用于在两次调用之间推算当前上下文占用（比纯估算准）。
         self.last_prompt_tokens: int | None = None
         self.last_prompt_estimate: int | None = None
+        # Streaming is negotiated per client: some gateways reject stream=true
+        # or stream_options; remember that for the rest of the process.
+        self.supports_stream = True
+        self.supports_stream_options = True
+        self.stream_idle_timeout = 300.0
+        self.debug_stream = False
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -1182,6 +1220,141 @@ class BaseChatClient:
     def _models_root(self) -> str:
         return self.base_url
 
+    def _stream_debug(self, text: str) -> None:
+        if self.debug_stream:
+            print(f"[stream] {text}", file=sys.stderr, flush=True)
+
+    def _direct_json_response(self, response: Any) -> dict[str, Any] | None:
+        """Some gateways ignore stream=true and return one JSON document."""
+        content_type = ""
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            content_type = (headers.get("Content-Type") or "").lower()
+        if "text/event-stream" in content_type:
+            return None
+        if "application/json" not in content_type:
+            return None
+        try:
+            raw = response.read()
+        except (TimeoutError, OSError, HTTPException):
+            return None
+        try:
+            data = json.loads(raw.decode("utf-8", "replace"))
+        except (ValueError, AttributeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _open_stream(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        timeout: float | None = None,
+    ) -> Any:
+        """Open an SSE request, retrying connection/HTTP errors.
+
+        A 4xx that looks like "this endpoint does not stream" raises
+        StreamNotSupported so the caller can retry without streaming.
+        """
+        headers = self._headers()
+        headers["Accept"] = "text/event-stream"
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+        timeout_value = timeout or self.stream_idle_timeout
+        for attempt in range(self.max_retries + 1):
+            retry_after = None
+            request = urllib.request.Request(
+                url, data=data, headers=headers, method="POST"
+            )
+            try:
+                return urllib.request.urlopen(request, timeout=timeout_value)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:1000]
+                retry_after = exc.headers.get("Retry-After")
+                if exc.code in (400, 404, 405, 422, 501):
+                    raise StreamNotSupported(
+                        f"HTTP {exc.code} from {url}: {detail}"
+                    ) from exc
+                error = ChatError(f"HTTP {exc.code} from {url}: {detail}")
+                if exc.code not in (408, 409, 429) and exc.code < 500:
+                    raise error from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                error = ChatError(
+                    f"Cannot reach {url}: {getattr(exc, 'reason', exc)}"
+                )
+
+            if attempt == self.max_retries:
+                raise error
+            delay = _retry_delay(retry_after, attempt)
+            print(f"[retry] {error}; retrying in {delay:.1f}s", file=sys.stderr)
+            time.sleep(delay)
+
+    def _sse_events(
+        self,
+        line: str,
+    ) -> list[Any]:
+        line = line.rstrip("\r")
+        if not line or line.startswith(":") or not line.startswith("data:"):
+            return []
+        data = line[len("data:"):].strip()
+        if not data:
+            return []
+        if data == "[DONE]":
+            return [_SSE_DONE]
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            self._stream_debug("bad-json")
+            return []
+        if not isinstance(event, dict):
+            return []
+        self._stream_debug(str(event.get("type") or "data"))
+        return [event]
+
+    def _iter_sse(
+        self,
+        response: Any,
+        cancel_event: "threading.Event | None" = None,
+    ) -> Any:
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        stop = threading.Event()
+        watcher: threading.Thread | None = None
+
+        def watch() -> None:
+            while not stop.wait(0.2):
+                if cancel_event is not None and cancel_event.is_set():
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+
+        if cancel_event is not None:
+            watcher = threading.Thread(target=watch, daemon=True)
+            watcher.start()
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ChatCancelled()
+                try:
+                    raw_line = response.readline()
+                except (TimeoutError, OSError, ValueError, HTTPException) as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ChatCancelled() from exc
+                    raise ChatError(f"stream read failed: {exc}") from exc
+                if not raw_line:
+                    break
+                line = decoder.decode(raw_line)
+                for event in self._sse_events(line):
+                    yield event
+        finally:
+            stop.set()
+            if watcher is not None:
+                watcher.join(timeout=0.5)
+            try:
+                response.close()
+            except Exception:
+                pass
+
     def list_models(self) -> list[str]:
         data = self._request(f"{self._models_root()}/models", timeout=min(self.timeout, 30.0))
         self.last_models_payload = data
@@ -1198,7 +1371,11 @@ class BaseChatClient:
 
 
 class ChatClient(BaseChatClient):
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             # Underscore keys are local-only (e.g. _thinking) and must not reach the API.
@@ -1216,9 +1393,9 @@ class ChatClient(BaseChatClient):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        return payload
 
-        self.last_reasoning_ignored = False
-        data = self._request(f"{self.base_url}/chat/completions", payload)
+    def _finalize(self, data: dict[str, Any]) -> dict[str, Any]:
         try:
             choice = data["choices"][0]
             message = choice["message"]
@@ -1244,6 +1421,157 @@ class ChatClient(BaseChatClient):
             ):
                 self.last_reasoning_ignored = True
         return message
+
+    def _chat_once(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self.last_reasoning_ignored = False
+        payload = self._build_payload(messages, tools)
+        data = self._request(f"{self.base_url}/chat/completions", payload)
+        return self._finalize(data)
+
+    def _stream_chat(
+        self,
+        payload: dict[str, Any],
+        on_delta: Callable[[str, str], None],
+        cancel_event: "threading.Event | None",
+    ) -> dict[str, Any]:
+        self.last_reasoning_ignored = False
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_slots: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        usage: dict[str, Any] = {}
+        saw_event = False
+        saw_done = False
+
+        response = self._open_stream(
+            f"{self.base_url}/chat/completions", payload
+        )
+        direct = self._direct_json_response(response)
+        if direct is not None:
+            self._stream_debug("direct-json")
+            return self._finalize(direct)
+        for event in self._iter_sse(response, cancel_event):
+            if event is _SSE_DONE:
+                saw_done = True
+                break
+            saw_event = True
+            error = event.get("error")
+            if isinstance(error, dict):
+                raise ChatError(
+                    f"stream error: {error.get('message') or json.dumps(error)[:500]}"
+                )
+            choices = event.get("choices")
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    text = delta.get("content")
+                    if isinstance(text, list):
+                        text = _plain_text(text)
+                    if isinstance(text, str) and text:
+                        content_parts.append(text)
+                        self._stream_debug(f"content len={len(text)}")
+                        on_delta("content", text)
+                    reasoning = (
+                        delta.get("reasoning_content")
+                        or delta.get("reasoning")
+                    )
+                    if isinstance(reasoning, str) and reasoning:
+                        reasoning_parts.append(reasoning)
+                        on_delta("thinking", reasoning)
+                    for index, raw_call in enumerate(delta.get("tool_calls") or []):
+                        if not isinstance(raw_call, dict):
+                            continue
+                        slot_index = raw_call.get("index")
+                        if not isinstance(slot_index, int):
+                            slot_index = index
+                        slot = tool_slots.setdefault(
+                            slot_index,
+                            {"id": "", "name": "", "arguments": ""},
+                        )
+                        call_id = raw_call.get("id")
+                        if isinstance(call_id, str) and call_id:
+                            slot["id"] = call_id
+                        function = raw_call.get("function")
+                        if isinstance(function, dict):
+                            name = function.get("name")
+                            if isinstance(name, str) and name and not slot["name"]:
+                                slot["name"] = name
+                            fragment = function.get("arguments")
+                            if isinstance(fragment, str) and fragment:
+                                slot["arguments"] = _merge_tool_arguments(
+                                    slot["arguments"], fragment
+                                )
+                reason = choice.get("finish_reason")
+                if isinstance(reason, str):
+                    finish_reason = reason
+            event_usage = event.get("usage")
+            if isinstance(event_usage, dict) and event_usage:
+                usage = event_usage
+
+        if not saw_event and not content_parts and not tool_slots:
+            raise ChatError("stream ended without any response data")
+        if (
+            (content_parts or reasoning_parts or tool_slots)
+            and finish_reason is None
+            and not saw_done
+        ):
+            raise ChatError("stream ended before finish_reason")
+
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts),
+        }
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+        if tool_slots:
+            message["tool_calls"] = [
+                {
+                    "id": slot["id"] or f"call_{index}",
+                    "type": "function",
+                    "function": {
+                        "name": slot["name"] or "unknown",
+                        "arguments": slot["arguments"] or "{}",
+                    },
+                }
+                for index, slot in sorted(tool_slots.items())
+            ]
+        data = {
+            "choices": [{"message": message, "finish_reason": finish_reason}],
+            "usage": usage,
+        }
+        return self._finalize(data)
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str, str], None] | None = None,
+        cancel_event: "threading.Event | None" = None,
+    ) -> dict[str, Any]:
+        if on_delta is None or not self.supports_stream:
+            return self._chat_once(messages, tools)
+        payload = self._build_payload(messages, tools)
+        payload["stream"] = True
+        if self.supports_stream_options:
+            payload["stream_options"] = {"include_usage": True}
+        while True:
+            try:
+                return self._stream_chat(payload, on_delta, cancel_event)
+            except StreamNotSupported:
+                if payload.pop("stream_options", None) is not None:
+                    self.supports_stream_options = False
+                    self._stream_debug("retry without stream_options")
+                    continue
+                self.supports_stream = False
+                self._stream_debug("fallback to non-streaming")
+                return self._chat_once(messages, tools)
 
 
 # --------------------------------------------------------------------------- #
@@ -1493,7 +1821,11 @@ class AnthropicClient(BaseChatClient):
                 headers["x-api-key"] = self.api_key
         return headers
 
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         try:
             system, converted = _to_anthropic_messages(messages)
         except ImageError as exc:
@@ -1526,9 +1858,9 @@ class AnthropicClient(BaseChatClient):
             budget = min(budgets.get(self.reasoning.level, 4096), max_tokens - 1024)
             if budget >= 1024:
                 payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        return payload
 
-        self.last_reasoning_ignored = False
-        data = self._request(f"{self._root()}/messages", payload)
+    def _finalize(self, data: dict[str, Any]) -> dict[str, Any]:
         message, stop_reason, usage = _anthropic_response(data)
         input_tokens = int(usage.get("input_tokens") or 0)
         cache_read = int(usage.get("cache_read_input_tokens") or 0)
@@ -1550,6 +1882,149 @@ class AnthropicClient(BaseChatClient):
             self.last_usage["completion_tokens_details"] = {"reasoning_tokens": thinking_tokens}
         self.last_finish_reason = ANTHROPIC_STOP_REASONS.get(stop_reason or "", "stop")
         return message
+
+    def _chat_once(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self.last_reasoning_ignored = False
+        payload = self._build_payload(messages, tools)
+        data = self._request(f"{self._root()}/messages", payload)
+        return self._finalize(data)
+
+    def _stream_chat(
+        self,
+        payload: dict[str, Any],
+        on_delta: Callable[[str, str], None],
+        cancel_event: "threading.Event | None",
+    ) -> dict[str, Any]:
+        self.last_reasoning_ignored = False
+        blocks: dict[int, dict[str, Any]] = {}
+        partial_json: dict[int, str] = {}
+        usage: dict[str, Any] = {}
+        stop_reason: str | None = None
+        saw_event = False
+        saw_stop = False
+
+        response = self._open_stream(f"{self._root()}/messages", payload)
+        direct = self._direct_json_response(response)
+        if direct is not None:
+            self._stream_debug("direct-json")
+            return self._finalize(direct)
+        for event in self._iter_sse(response, cancel_event):
+            if event is _SSE_DONE:
+                break
+            saw_event = True
+            event_type = event.get("type")
+            if event_type == "error":
+                detail = event.get("error")
+                if isinstance(detail, dict):
+                    detail = detail.get("message") or json.dumps(detail)[:500]
+                raise ChatError(f"stream error: {detail}")
+            if event_type == "message_start":
+                message = event.get("message")
+                if isinstance(message, dict):
+                    start_usage = message.get("usage")
+                    if isinstance(start_usage, dict):
+                        usage.update(start_usage)
+                continue
+            if event_type == "content_block_start":
+                index = event.get("index")
+                block = event.get("content_block")
+                if isinstance(index, int) and isinstance(block, dict):
+                    blocks[index] = copy.deepcopy(block)
+                    if block.get("type") == "tool_use":
+                        partial_json[index] = ""
+                        blocks[index]["input"] = {}
+                    elif block.get("type") == "text" and block.get("text"):
+                        on_delta("content", str(block["text"]))
+                    elif block.get("type") == "thinking" and block.get("thinking"):
+                        on_delta("thinking", str(block["thinking"]))
+                continue
+            if event_type == "content_block_delta":
+                index = event.get("index")
+                delta = event.get("delta")
+                if not isinstance(index, int) or not isinstance(delta, dict):
+                    continue
+                block = blocks.setdefault(index, {"type": "text", "text": ""})
+                delta_type = delta.get("type")
+                if delta_type == "text_delta":
+                    text = delta.get("text") or ""
+                    if isinstance(text, str) and text:
+                        block["text"] = (block.get("text") or "") + text
+                        on_delta("content", text)
+                elif delta_type == "thinking_delta":
+                    text = delta.get("thinking") or ""
+                    if isinstance(text, str) and text:
+                        block["thinking"] = (block.get("thinking") or "") + text
+                        on_delta("thinking", text)
+                elif delta_type == "signature_delta":
+                    signature = delta.get("signature") or ""
+                    if isinstance(signature, str) and signature:
+                        block["signature"] = (block.get("signature") or "") + signature
+                elif delta_type == "input_json_delta":
+                    fragment = delta.get("partial_json") or ""
+                    if isinstance(fragment, str) and fragment:
+                        partial_json[index] = partial_json.get(index, "") + fragment
+                continue
+            if event_type == "content_block_stop":
+                index = event.get("index")
+                if not isinstance(index, int):
+                    continue
+                block = blocks.get(index)
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    raw = partial_json.get(index, "")
+                    if raw:
+                        try:
+                            block["input"] = json.loads(raw)
+                        except json.JSONDecodeError:
+                            block["input"] = {"_raw": raw}
+                continue
+            if event_type == "message_delta":
+                delta = event.get("delta")
+                if isinstance(delta, dict):
+                    reason = delta.get("stop_reason")
+                    if isinstance(reason, str):
+                        stop_reason = reason
+                event_usage = event.get("usage")
+                if isinstance(event_usage, dict):
+                    usage.update(event_usage)
+                continue
+            if event_type in ("message_stop", "ping"):
+                if event_type == "message_stop":
+                    saw_stop = True
+                continue
+
+        if not saw_event and not blocks:
+            raise ChatError("stream ended without an Anthropic message")
+        if blocks and not saw_stop and stop_reason is None:
+            raise ChatError("stream ended before message_stop")
+        data = {
+            "content": [blocks[index] for index in sorted(blocks)],
+            "stop_reason": stop_reason,
+            "usage": usage,
+        }
+        return self._finalize(data)
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str, str], None] | None = None,
+        cancel_event: "threading.Event | None" = None,
+    ) -> dict[str, Any]:
+        if on_delta is None or not self.supports_stream:
+            return self._chat_once(messages, tools)
+        payload = self._build_payload(messages, tools)
+        payload["stream"] = True
+        try:
+            return self._stream_chat(payload, on_delta, cancel_event)
+        except StreamNotSupported:
+            self.supports_stream = False
+            self._stream_debug("fallback to non-streaming")
+            return self._chat_once(messages, tools)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -1773,7 +2248,11 @@ class ResponsesClient(BaseChatClient):
     def _models_root(self) -> str:
         return self._v1_root()
 
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         try:
             instructions, input_items = _to_responses_input(messages)
         except ImageError as exc:
@@ -1799,13 +2278,181 @@ class ResponsesClient(BaseChatClient):
             effort = _COMMON_EFFORTS.get(self.reasoning.level)
             if effort:
                 payload["reasoning"] = {"effort": effort}
+        return payload
 
-        self.last_reasoning_ignored = False
-        data = self._request(f"{self._v1_root()}/responses", payload)
+    def _finalize(self, data: dict[str, Any]) -> dict[str, Any]:
         message, finish_reason, usage = _responses_response(data)
         self.last_usage = usage
         self.last_finish_reason = finish_reason
         return message
+
+    def _chat_once(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self.last_reasoning_ignored = False
+        payload = self._build_payload(messages, tools)
+        data = self._request(f"{self._v1_root()}/responses", payload)
+        return self._finalize(data)
+
+    def _stream_chat(
+        self,
+        payload: dict[str, Any],
+        on_delta: Callable[[str, str], None],
+        cancel_event: "threading.Event | None",
+    ) -> dict[str, Any]:
+        self.last_reasoning_ignored = False
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        items: dict[int, dict[str, Any]] = {}
+        final: dict[str, Any] | None = None
+        saw_event = False
+
+        response = self._open_stream(f"{self._v1_root()}/responses", payload)
+        direct = self._direct_json_response(response)
+        if direct is not None:
+            self._stream_debug("direct-json")
+            return self._finalize(direct)
+        for event in self._iter_sse(response, cancel_event):
+            if event is _SSE_DONE:
+                break
+            saw_event = True
+            event_type = event.get("type")
+            if event_type in (
+                "response.completed",
+                "response.done",
+                "response.incomplete",
+            ):
+                candidate = event.get("response")
+                if isinstance(candidate, dict):
+                    final = candidate
+                break
+            if event_type == "response.failed":
+                detail = event.get("response")
+                if isinstance(detail, dict):
+                    detail = (detail.get("error") or {}).get("message") or json.dumps(detail)[:500]
+                raise ChatError(f"stream error: {detail}")
+            if event_type == "error":
+                detail = event.get("error")
+                if isinstance(detail, dict):
+                    detail = detail.get("message") or json.dumps(detail)[:500]
+                raise ChatError(f"stream error: {detail}")
+            if event_type == "response.output_item.added":
+                index = event.get("output_index")
+                item = event.get("item")
+                if isinstance(index, int) and isinstance(item, dict):
+                    if item.get("type") == "function_call":
+                        items[index] = {
+                            "type": "function_call",
+                            "call_id": item.get("call_id") or "",
+                            "name": item.get("name") or "",
+                            "arguments": item.get("arguments") or "",
+                        }
+                continue
+            if event_type == "response.function_call_arguments.delta":
+                index = event.get("output_index")
+                fragment = event.get("delta") or ""
+                if isinstance(index, int) and isinstance(fragment, str):
+                    slot = items.setdefault(
+                        index,
+                        {
+                            "type": "function_call",
+                            "call_id": event.get("item_id") or "",
+                            "name": "",
+                            "arguments": "",
+                        },
+                    )
+                    slot["arguments"] = _merge_tool_arguments(
+                        slot.get("arguments") or "", fragment
+                    )
+                continue
+            if event_type == "response.function_call_arguments.done":
+                index = event.get("output_index")
+                arguments = event.get("arguments")
+                if isinstance(index, int) and isinstance(arguments, str):
+                    slot = items.setdefault(
+                        index,
+                        {
+                            "type": "function_call",
+                            "call_id": event.get("item_id") or "",
+                            "name": "",
+                            "arguments": "",
+                        },
+                    )
+                    slot["arguments"] = arguments
+                continue
+            if event_type == "response.output_item.done":
+                index = event.get("output_index")
+                item = event.get("item")
+                if isinstance(index, int) and isinstance(item, dict):
+                    if item.get("type") == "function_call":
+                        items[index] = {
+                            "type": "function_call",
+                            "call_id": item.get("call_id") or "",
+                            "name": item.get("name") or "",
+                            "arguments": item.get("arguments") or "",
+                        }
+                continue
+            if event_type == "response.output_text.delta":
+                text = event.get("delta") or ""
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+                    on_delta("content", text)
+                continue
+            if event_type in (
+                "response.reasoning_text.delta",
+                "response.reasoning_summary_text.delta",
+            ):
+                text = event.get("delta") or ""
+                if isinstance(text, str) and text:
+                    reasoning_parts.append(text)
+                    on_delta("thinking", text)
+                continue
+
+        if final is None:
+            if not saw_event and not text_parts and not items:
+                raise ChatError("stream ended without a Responses payload")
+            output: list[dict[str, Any]] = []
+            if text_parts:
+                output.append({
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "".join(text_parts)}
+                    ],
+                })
+            for index in sorted(items):
+                output.append(items[index])
+            if reasoning_parts:
+                output.append({
+                    "type": "reasoning",
+                    "content": [
+                        {
+                            "type": "reasoning_text",
+                            "text": "".join(reasoning_parts),
+                        }
+                    ],
+                })
+            final = {"output": output}
+        return self._finalize(final)
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str, str], None] | None = None,
+        cancel_event: "threading.Event | None" = None,
+    ) -> dict[str, Any]:
+        if on_delta is None or not self.supports_stream:
+            return self._chat_once(messages, tools)
+        payload = self._build_payload(messages, tools)
+        payload["stream"] = True
+        try:
+            return self._stream_chat(payload, on_delta, cancel_event)
+        except StreamNotSupported:
+            self.supports_stream = False
+            self._stream_debug("fallback to non-streaming")
+            return self._chat_once(messages, tools)
 
 
 def _natural_key(name: str) -> list[Any]:
@@ -1866,6 +2513,10 @@ def default_settings() -> dict[str, Any]:
         "job_follow": True,
         "job_poll_seconds": 2,
         "job_follow_lines": 5,
+        "stream": True,
+        "stream_idle_timeout": 300,
+        "stream_flush_ms": 40,
+        "debug_stream": False,
         "web": {"host": "127.0.0.1", "port": WEB_PORT},
     }
 
@@ -1901,6 +2552,8 @@ def _normalize_defaults(raw: Any) -> dict[str, Any]:
         "memory",
         "memory_daily",
         "job_follow",
+        "stream",
+        "debug_stream",
     )
     for key in bool_keys:
         if key not in raw:
@@ -2116,6 +2769,8 @@ def _normalize_defaults(raw: Any) -> dict[str, Any]:
         ("background_output_chars", 1000, 200000, "characters"),
         ("job_poll_seconds", 1, 60, "seconds"),
         ("job_follow_lines", 1, 50, "lines"),
+        ("stream_idle_timeout", 10, 3600, "seconds"),
+        ("stream_flush_ms", 0, 1000, "milliseconds"),
     ):
         if key not in raw:
             continue
@@ -3039,6 +3694,10 @@ def resolve_settings(args: Any, config: dict[str, Any]) -> None:
     args.job_follow = bool(pick("job_follow", True))
     args.job_poll_seconds = int(pick("job_poll_seconds", 2))
     args.job_follow_lines = int(pick("job_follow_lines", 5))
+    args.stream = bool(pick("stream", True))
+    args.stream_idle_timeout = int(pick("stream_idle_timeout", 300))
+    args.stream_flush_ms = int(pick("stream_flush_ms", 40))
+    args.debug_stream = bool(pick("debug_stream", False))
     args.host = pick("host", web.get("host", "127.0.0.1"))
     args.port = int(pick("port", web.get("port", WEB_PORT)))
 
@@ -3096,6 +3755,10 @@ def settings_from_runtime(
         "job_follow": bool(args.job_follow),
         "job_poll_seconds": int(args.job_poll_seconds),
         "job_follow_lines": int(args.job_follow_lines),
+        "stream": bool(args.stream),
+        "stream_idle_timeout": int(args.stream_idle_timeout),
+        "stream_flush_ms": int(args.stream_flush_ms),
+        "debug_stream": bool(args.debug_stream),
         "web": {"host": args.host, "port": int(args.port)},
     }
 
@@ -9487,6 +10150,35 @@ def run_jobs_command(
         print(f"error: {exc or 'invalid value'}", file=sys.stderr)
 
 
+def run_stream_command(
+    argument: str,
+    runtime: dict[str, bool],
+    args: Any,
+    client: "BaseChatClient",
+) -> None:
+    action = argument.strip().lower() or "status"
+    if action in ("", "status"):
+        current = "on" if runtime["current"] else "off"
+        default = "on" if runtime["default"] else "off"
+        print(f"stream: {current} (session) | startup default: {default}")
+        return
+    if action not in ("on", "off", "auto"):
+        print("usage: /stream [on|off|auto|status]")
+        return
+    if action == "auto":
+        runtime["current"] = bool(runtime["default"])
+    else:
+        runtime["current"] = action == "on"
+    args.stream = runtime["current"]
+    if runtime["current"]:
+        # Let a previous gateway rejection be retried after an explicit opt-in.
+        client.supports_stream = True
+        client.supports_stream_options = True
+        print("stream: on; next turns will stream")
+    else:
+        print("stream: off; next turns wait for the full response")
+
+
 def run_memory_command(
     memory: "MemoryService | None",
     argument: str,
@@ -9630,6 +10322,113 @@ def run_schedule_command(
 # --------------------------------------------------------------------------- #
 
 
+_ANSI_PARTIAL_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*$")
+
+
+class _AnsiCarry:
+    """Strip ANSI sequences without leaking a sequence split across chunks."""
+
+    def __init__(self) -> None:
+        self.pending = ""
+
+    def clean(self, text: str) -> str:
+        data = self.pending + text
+        match = _ANSI_PARTIAL_RE.search(data)
+        if match:
+            self.pending = data[match.start():]
+            data = data[:match.start()]
+        else:
+            self.pending = ""
+        return _sanitize(data)
+
+
+class _CliStreamPrinter:
+    """Print streamed assistant text without terminal Markdown rendering."""
+
+    def __init__(self, flush_ms: int = 40) -> None:
+        self.flush_ms = max(0, int(flush_ms))
+        self.buffer: list[str] = []
+        self.last_flush = time.monotonic()
+        self.last_write = 0.0
+        self.started = False
+        self.in_thinking = False
+        self.content_carry = _AnsiCarry()
+        self.thinking_carry = _AnsiCarry()
+        self.last_char = ""
+
+    def _write(self, text: str, force: bool = False) -> None:
+        if not text:
+            return
+        self.buffer.append(text)
+        self.last_char = text[-1]
+        now = time.monotonic()
+        since_flush = (now - self.last_flush) * 1000
+        since_write = (now - self.last_write) * 1000
+        self.last_write = now
+        if (
+            force
+            or self.flush_ms <= 0
+            or since_flush >= self.flush_ms
+            or since_write >= self.flush_ms
+        ):
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        sys.stdout.write("".join(self.buffer))
+        sys.stdout.flush()
+        self.buffer.clear()
+        self.last_flush = time.monotonic()
+
+    def begin_content(self) -> None:
+        if self.in_thinking:
+            self.end_thinking()
+        if self.started:
+            return
+        self._write(_agent_prefix(), force=True)
+        self.started = True
+
+    def content(self, text: str) -> None:
+        clean = self.content_carry.clean(text)
+        if not clean:
+            return
+        self.begin_content()
+        self._write(clean)
+
+    def thinking(self, text: str) -> None:
+        clean = self.thinking_carry.clean(text)
+        if not clean:
+            return
+        if self.started:
+            self.finish_reply()
+        if not self.in_thinking:
+            self._write(
+                _style("  [thinking] ", DIM, supports_color()), force=True
+            )
+            self.in_thinking = True
+        color = supports_color()
+        self._write(_style(clean, DIM, color))
+
+    def end_thinking(self) -> None:
+        if not self.in_thinking:
+            return
+        if self.last_char != "\n":
+            self._write("\n", force=True)
+        else:
+            self.flush()
+        self.in_thinking = False
+
+    def finish_reply(self) -> None:
+        self.end_thinking()
+        if self.started:
+            if self.last_char != "\n":
+                self._write("\n", force=True)
+            else:
+                self.flush()
+            self.started = False
+
+
 def run_turn(
     client: BaseChatClient,
     workspace: Workspace,
@@ -9643,18 +10442,50 @@ def run_turn(
     cancel_event: "threading.Event | None" = None,
     verbose_tools: bool = False,
     context_window: int | None = None,
+    stream: bool = False,
+    stream_flush_ms: int = 40,
 ) -> bool:
     """Let the model call tools until it produces a final answer. Returns True if it did."""
 
+    printer = (
+        _CliStreamPrinter(stream_flush_ms)
+        if stream and emit is None
+        else None
+    )
+    stream_state = {"content": False, "thinking": False}
+    reply_index = 0
+
     def report(kind: str, text: str) -> None:
+        if kind == "thinking" and stream_state["thinking"]:
+            stream_state["thinking"] = False
+            if printer is not None:
+                printer.end_thinking()
+            return
+        if kind == "content" and stream_state["content"]:
+            stream_state["content"] = False
+            if emit is None:
+                if printer is not None:
+                    printer.finish_reply()
+                return
         if emit is not None:
             emit(kind, text)
+        elif kind == "content_start":
+            if printer is not None:
+                printer.begin_content()
+        elif kind == "content_delta":
+            if printer is not None:
+                printer.content(text)
+        elif kind == "thinking_delta":
+            if printer is not None:
+                printer.thinking(text)
         elif kind == "content":
-            if render:
+            if render and not stream:
                 _print_markdown(text)
             else:
                 print(f"{_agent_prefix()}{text.rstrip(chr(10) + chr(13))}", flush=True)
         elif kind == "tool":
+            if printer is not None:
+                printer.finish_reply()
             print(_style(f"  {text}", DIM, supports_color()), flush=True)
         elif kind == "tool_result":
             indented = (text or "(empty)").replace("\n", "\n  ")
@@ -9686,7 +10517,43 @@ def run_turn(
             if cancel_event is not None and cancel_event.is_set():
                 report("warning", "已停止")
                 return False
-            reply = client.chat(messages, tools if tools is not None else tool_schemas(workspace))
+            reply_index += 1
+            stream_state["content"] = False
+            stream_state["thinking"] = False
+            delta_state = {"content": False}
+
+            def on_delta(
+                kind: str,
+                text: str,
+                index: int = reply_index,
+            ) -> None:
+                if kind == "content":
+                    stream_state["content"] = True
+                    if not delta_state["content"]:
+                        delta_state["content"] = True
+                        report("content_start", str(index))
+                    report("content_delta", text)
+                elif kind == "thinking":
+                    stream_state["thinking"] = True
+                    if show_thinking:
+                        report("thinking_delta", text)
+
+            try:
+                if stream:
+                    reply = client.chat(
+                        messages,
+                        tools if tools is not None else tool_schemas(workspace),
+                        on_delta=on_delta,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    reply = client.chat(
+                        messages,
+                        tools if tools is not None else tool_schemas(workspace),
+                    )
+            except ChatCancelled:
+                report("warning", "已停止")
+                return False
             if cancel_event is not None and cancel_event.is_set():
                 report("warning", "已停止")
                 return False
@@ -9767,6 +10634,8 @@ def run_turn(
         print(f"[stopped] reached the limit of {max_steps} model calls without a final answer", file=sys.stderr)
         return False
     finally:
+        if printer is not None:
+            printer.finish_reply()
         workspace.job_event = None
         workspace.cancel_event = None
         client.last_turn_usage = dict(usage_total)
@@ -10070,6 +10939,7 @@ def print_help() -> None:
     print("          /session [list|new|use <id>|export <id>|rename|delete|info],")
     print("          /schedule [list|history <id>|run <id>|on <id>|off <id>|delete <id>],")
     print("          /jobs [list|status|output|follow|detach|stop|clean|poll|lines],")
+    print("          /stream [on|off|auto|status],")
     print("          /memory [status|path|search <query>|read <date>|summarize [date]],")
     print("          /config [path|save],")
     print("          /status,")
@@ -10223,13 +11093,26 @@ WEB_HTML = r"""<!doctype html>
 * { box-sizing: border-box; }
 body { margin: 0; font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; color: #222; background: #f6f7f9; }
 #app { display: flex; height: 100vh; }
-aside { width: 250px; flex: none; background: #fff; border-right: 1px solid #e3e6ea; padding: 12px; overflow-y: auto; }
-.brand { font-weight: 600; margin-bottom: 12px; }
+aside { width: 250px; flex: none; background: #fff; border-right: 1px solid #e3e6ea; padding: 12px; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.brand { font-weight: 600; margin-bottom: 12px; flex: none; }
+.sessions-group { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; color: #475467; font-size: 12px; font-weight: 600; }
+.group-head > span { min-width: 0; }
+#sessions { flex: 1; min-height: 0; overflow-y: auto; padding-right: 2px; }
+.side-group { flex: none; border-top: 1px solid #e3e6ea; margin-top: 8px; padding-top: 6px; }
+.side-group > summary { display: flex; align-items: center; gap: 6px; list-style: none; cursor: pointer; color: #475467; font-size: 12px; font-weight: 600; }
+.side-group > summary::-webkit-details-marker { display: none; }
+.side-group > summary::before { content: "▸"; color: #8a919c; flex: none; }
+.side-group[open] > summary::before { content: "▾"; }
+.summary-label { flex: none; }
+.group-note { flex: 1; min-width: 0; text-align: right; color: #8a919c; font-weight: 400; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-group .group-body { padding-top: 8px; max-height: 48vh; overflow-y: auto; }
+.side-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 .model-row { margin-bottom: 10px; }
 .model-row label { display: block; color: #8a919c; font-size: 12px; margin-bottom: 4px; }
 #model { width: 100%; padding: 6px; border: 1px solid #c9ced6; border-radius: 6px; background: #fff; }
 .model-info { margin-top: 6px; color: #8a919c; font-size: 11px; line-height: 1.45; word-break: break-word; }
-#new { width: 100%; padding: 6px; margin-bottom: 10px; border: 1px solid #c9ced6; background: #f9fafb; border-radius: 6px; cursor: pointer; }
+#new { padding: 3px 9px; border: 1px solid #c9ced6; background: #f9fafb; border-radius: 6px; cursor: pointer; font-size: 12px; }
 .session-row { display: flex; gap: 6px; margin-bottom: 6px; }
 .session { display: block; flex: 1; min-width: 0; text-align: left; padding: 8px; border: 1px solid transparent; background: transparent; border-radius: 6px; cursor: pointer; }
 .session:hover { background: #f1f3f6; }
@@ -10363,21 +11246,45 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 <div id="app">
   <aside>
     <div class="brand">benben-agent</div>
-    <div class="model-row">
-      <label for="connection-select">连接</label>
-      <select id="connection-select"></select>
-    </div>
-    <div class="model-row">
-      <label for="model">模型</label>
-      <select id="model"></select>
-      <div id="model-info" class="model-info"></div>
-      <button id="model-info-edit" class="link-button">模型能力</button>
-      <button id="connect" class="link-button">连接设置</button>
-      <button id="schedules-open" class="link-button" hidden>定时任务</button>
-      <button id="help-open" class="link-button">帮助 / 指令</button>
-    </div>
-    <button id="new">+ 新会话</button>
-    <div id="sessions"></div>
+    <section id="sessions-group" class="sessions-group">
+      <div class="group-head">
+        <span>会话</span>
+        <button id="new" type="button">+ 新建</button>
+      </div>
+      <div id="sessions"></div>
+    </section>
+    <details id="settings-group" class="side-group">
+      <summary>
+        <span class="summary-label">连接与模型</span>
+        <span id="settings-summary" class="group-note"></span>
+      </summary>
+      <div class="group-body">
+        <div class="model-row">
+          <label for="connection-select">连接</label>
+          <select id="connection-select"></select>
+        </div>
+        <div class="model-row">
+          <label for="model">模型</label>
+          <select id="model"></select>
+          <div id="model-info" class="model-info"></div>
+          <div class="side-actions">
+            <button id="model-info-edit" class="link-button">模型能力</button>
+            <button id="connect" class="link-button">连接设置</button>
+          </div>
+        </div>
+      </div>
+    </details>
+    <details id="tools-group" class="side-group">
+      <summary>
+        <span class="summary-label">工具与帮助</span>
+      </summary>
+      <div class="group-body">
+        <div class="side-actions">
+          <button id="schedules-open" class="link-button" hidden>定时任务</button>
+          <button id="help-open" class="link-button">帮助 / 指令</button>
+        </div>
+      </div>
+    </details>
   </aside>
   <main>
     <div id="log"></div>
@@ -10388,6 +11295,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
       <div class="row">
         <label class="file">选择图片<input id="files" type="file" accept="image/*" multiple hidden></label>
         <span id="files-label"></span>
+        <label class="toggle"><input type="checkbox" id="stream-toggle" checked> 流式输出</label>
         <label class="toggle"><input type="checkbox" id="thinking-toggle"> 显示思考</label>
         <select id="reasoning" title="思考等级">
           <option value="">默认</option>
@@ -10539,6 +11447,15 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         <tr><td>/compact 0</td><td>只保留摘要，不保留最近回合</td></tr>
       </table>
 
+      <h3>输出</h3>
+      <table class="help-table">
+        <tr><td>/stream</td><td>查看当前流式输出模式</td></tr>
+        <tr><td>/stream on</td><td>后续轮次流式输出</td></tr>
+        <tr><td>/stream off</td><td>后续轮次等待完整回复</td></tr>
+        <tr><td>/stream auto</td><td>恢复本次启动时的默认值</td></tr>
+      </table>
+      <div class="help-note">输入框下方也可以直接切换「流式输出」和「显示思考」。</div>
+
       <h3>后台任务</h3>
       <table class="help-table">
         <tr><td>/jobs</td><td>列出后台任务</td></tr>
@@ -10676,16 +11593,57 @@ let lastToolDetail = null;
 let exportSession = null;
 let jobBlocks = new Map();
 let jobPollTimers = new Map();
+let streamBubble = null;
+let streamText = "";
+let streamThinkingEl = null;
+let autoScroll = true;
 let modelInfoProvider = "";
 let modelInfoModel = "";
 
 const logEl = document.getElementById("log");
+
+function atLogBottom() {
+  return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 80;
+}
+
+function scrollLog(force) {
+  if (force || autoScroll) logEl.scrollTop = logEl.scrollHeight;
+}
+
+logEl.addEventListener("scroll", () => {
+  autoScroll = atLogBottom();
+});
+
+function restoreSideGroup(el, openByDefault) {
+  if (!el) return;
+  const key = "benben.group." + el.id;
+  try {
+    const saved = localStorage.getItem(key);
+    el.open = saved === null ? openByDefault : saved === "1";
+  } catch (err) {
+    el.open = openByDefault;
+  }
+  el.addEventListener("toggle", () => {
+    try {
+      localStorage.setItem(key, el.open ? "1" : "0");
+    } catch (err) {
+      // Private mode can reject storage; the group still works for this view.
+    }
+  });
+}
+
 const statusEl = document.getElementById("status");
 const inputEl = document.getElementById("input");
 const sendEl = document.getElementById("send");
 const stopEl = document.getElementById("stop");
 const compactEl = document.getElementById("compact");
 const thinkingToggleEl = document.getElementById("thinking-toggle");
+const streamToggleEl = document.getElementById("stream-toggle");
+const settingsGroupEl = document.getElementById("settings-group");
+const toolsGroupEl = document.getElementById("tools-group");
+const settingsSummaryEl = document.getElementById("settings-summary");
+restoreSideGroup(settingsGroupEl, false);
+restoreSideGroup(toolsGroupEl, false);
 const reasoningEl = document.getElementById("reasoning");
 const filesEl = document.getElementById("files");
 const filesLabel = document.getElementById("files-label");
@@ -10848,7 +11806,7 @@ function addLine(cls, text) {
   div.className = cls;
   div.textContent = text;
   logEl.appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollLog(true);
 }
 
 function createJobBlock(id) {
@@ -10885,7 +11843,7 @@ function createJobBlock(id) {
   wrapped.appendChild(output);
   wrapped.appendChild(actions);
   logEl.appendChild(wrapped);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollLog(true);
   block = { wrapped, state, output, actions };
   jobBlocks.set(id, block);
   return block;
@@ -10911,7 +11869,7 @@ function handleJobEvent(kind, payload) {
     const omitted = Number(payload.omitted) || 0;
     let prefix = omitted ? "[... 省略 " + omitted + " 行 ...]\n" : "";
     block.output.textContent = prefix + lines.join("\n");
-    logEl.scrollTop = logEl.scrollHeight;
+    scrollLog(true);
     return;
   }
   if (kind === "job_detach") {
@@ -10968,7 +11926,7 @@ function addToolDetail(text, callId) {
   details.appendChild(summary);
   details.appendChild(pre);
   logEl.appendChild(details);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollLog(true);
   lastToolDetail = details;
 }
 
@@ -10993,7 +11951,7 @@ function addToolResult(text, callId) {
   pre.className = "tool-result";
   pre.textContent = "结果:\n" + String(text || "(empty)");
   target.appendChild(pre);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollLog(true);
 }
 
 function formatToolCall(message) {
@@ -11146,12 +12104,62 @@ function renderMarkdown(text) {
   return output.join("");
 }
 
+function beginStreamBubble() {
+  endStreamThinking();
+  finishStreamBubble();
+  streamText = "";
+  const div = document.createElement("div");
+  div.className = "msg assistant";
+  logEl.appendChild(div);
+  streamBubble = div;
+  scrollLog();
+}
+
+function appendStreamDelta(text) {
+  if (!streamBubble) beginStreamBubble();
+  streamText += text;
+  if (streamBubble) streamBubble.textContent = streamText;
+  scrollLog();
+}
+
+function finishStreamBubble(fullText) {
+  if (!streamBubble) {
+    if (typeof fullText === "string" && fullText.length) addMarkdown(fullText);
+    return;
+  }
+  const value = typeof fullText === "string" ? fullText : streamText;
+  streamBubble.innerHTML = renderMarkdown(value);
+  streamBubble = null;
+  streamText = "";
+  scrollLog();
+}
+
+function beginStreamThinking() {
+  if (streamThinkingEl) return;
+  finishStreamBubble();
+  const div = document.createElement("div");
+  div.className = "tool";
+  div.textContent = "思考: ";
+  logEl.appendChild(div);
+  streamThinkingEl = div;
+}
+
+function appendStreamThinking(text) {
+  beginStreamThinking();
+  if (streamThinkingEl) streamThinkingEl.textContent += text;
+  scrollLog();
+}
+
+function endStreamThinking() {
+  streamThinkingEl = null;
+}
+
 function addMarkdown(text) {
   const div = document.createElement("div");
   div.className = "msg assistant";
   div.innerHTML = renderMarkdown(text);
   logEl.appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollLog(true);
 }
 
 function addUserMessage(text, images, lazy) {
@@ -11180,12 +12188,16 @@ function addUserMessage(text, images, lazy) {
     div.appendChild(element);
   }
   logEl.appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  scrollLog(true);
 }
 
 function renderHistory(messages) {
   logEl.textContent = "";
   lastToolDetail = null;
+  streamBubble = null;
+  streamText = "";
+  streamThinkingEl = null;
+  autoScroll = true;
   for (const message of messages) {
     if (message.role === "notice") {
       const details = document.createElement("details");
@@ -11668,6 +12680,7 @@ function setModelOptions(models, current) {
     modelEl.appendChild(option);
   }
   if (current) modelEl.value = current;
+  updateSettingsSummary();
 }
 
 async function loadModels() {
@@ -11725,6 +12738,9 @@ function applyRuntimeSettings(data) {
   if (typeof data.show_thinking === "boolean") {
     thinkingToggleEl.checked = data.show_thinking;
   }
+  if (typeof data.stream === "boolean") {
+    streamToggleEl.checked = data.stream;
+  }
   const reasoning = data.reasoning || {};
   const label = reasoning.label || "";
   const apiFormat = data.api_format || "openai-chat-completions";
@@ -11751,6 +12767,17 @@ thinkingToggleEl.onchange = async () => {
     statusEl.textContent = "显示思考: " + (data.show_thinking ? "on" : "off");
   } catch (err) {
     thinkingToggleEl.checked = !thinkingToggleEl.checked;
+    statusEl.textContent = String(err);
+  }
+};
+
+streamToggleEl.onchange = async () => {
+  try {
+    const data = await api("/api/stream", { enabled: streamToggleEl.checked });
+    streamToggleEl.checked = data.stream;
+    statusEl.textContent = "流式输出: " + (data.stream ? "on" : "off");
+  } catch (err) {
+    streamToggleEl.checked = !streamToggleEl.checked;
     statusEl.textContent = String(err);
   }
 };
@@ -11862,6 +12889,18 @@ function loadConnectionForm(name) {
   }
 }
 
+function updateSettingsSummary() {
+  if (!settingsSummaryEl) return;
+  const items = (connectionsData && connectionsData.connections) || [];
+  const runtime = items.find(item => item.runtime) || items.find(item => item.active);
+  const parts = [];
+  if (runtime && runtime.name) parts.push(runtime.name);
+  if (currentModel) parts.push(currentModel);
+  const text = parts.join(" · ");
+  settingsSummaryEl.textContent = text;
+  settingsSummaryEl.title = text;
+}
+
 function renderConnectionSelect(data) {
   const items = data.connections || [];
   connectionSelectEl.textContent = "";
@@ -11871,6 +12910,7 @@ function renderConnectionSelect(data) {
     option.textContent = "当前连接";
     connectionSelectEl.appendChild(option);
     connectionSelectEl.disabled = true;
+    updateSettingsSummary();
     return;
   }
   connectionSelectEl.disabled = false;
@@ -11882,6 +12922,7 @@ function renderConnectionSelect(data) {
   }
   const runtime = items.find(item => item.runtime) || items.find(item => item.active);
   if (runtime) connectionSelectEl.value = runtime.name;
+  updateSettingsSummary();
 }
 
 async function refreshConnections() {
@@ -12385,6 +13426,28 @@ function startJobFollow(id) {
   poll();
 }
 
+async function handleStreamCommand(argument) {
+  const action = (argument || "").trim().toLowerCase();
+  try {
+    if (!action || action === "status") {
+      const data = await api("/api/stream");
+      streamToggleEl.checked = data.stream;
+      addLine("tool", "流式输出: " + (data.stream ? "on" : "off"));
+      return;
+    }
+    if (!["on", "off", "auto"].includes(action)) {
+      addLine("tool", "usage: /stream [on|off|auto|status]");
+      return;
+    }
+    const enabled = action === "auto" ? true : action === "on";
+    const data = await api("/api/stream", { enabled: enabled });
+    streamToggleEl.checked = data.stream;
+    addLine("tool", "流式输出: " + (data.stream ? "on" : "off"));
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
+}
+
 async function handleJobsCommand(argument) {
   const parts = (argument || "").trim().split(/\s+/).filter(Boolean);
   const action = (parts[0] || "").toLowerCase();
@@ -12490,6 +13553,12 @@ async function send() {
     handleJobsCommand(jobsMatch[1] || "");
     return;
   }
+  const streamMatch = text.match(/^\/stream(?:\s+(.*))?$/);
+  if (streamMatch) {
+    inputEl.value = "";
+    handleStreamCommand(streamMatch[1] || "");
+    return;
+  }
   const sessionMatch = text.match(/^\/session(?:\s+(.*))?$/);
   if (sessionMatch) {
     inputEl.value = "";
@@ -12528,6 +13597,11 @@ async function send() {
   renderPreviews();
   sendEl.disabled = true;
   lastToolDetail = null;
+  streamBubble = null;
+  streamText = "";
+  streamThinkingEl = null;
+  autoScroll = true;
+  scrollLog(true);
   const controller = new AbortController();
   chatController = controller;
   stopEl.hidden = false;
@@ -12561,13 +13635,39 @@ async function send() {
         const line = block.split("\n").find((item) => item.startsWith("data: "));
         if (!line) continue;
         const event = JSON.parse(line.slice(6));
-        if (event.type === "content") addMarkdown(event.text);
-        else if (event.type === "tool") addToolDetail(event.text);
-        else if (event.type === "tool_result") addToolResult(event.text);
-        else if (event.type === "thinking") addLine("tool", "思考: " + event.text);
-        else if (event.type === "usage") addLine("tool", event.text);
-        else if (event.type === "warning") addLine("warning", "⚠ " + event.text);
+        if (event.type === "content_start") beginStreamBubble();
+        else if (event.type === "content_delta") appendStreamDelta(event.text);
+        else if (event.type === "thinking_delta") appendStreamThinking(event.text);
+        else if (event.type === "content") {
+          endStreamThinking();
+          finishStreamBubble(event.text);
+        }
+        else if (event.type === "tool") {
+          finishStreamBubble();
+          endStreamThinking();
+          addToolDetail(event.text);
+        }
+        else if (event.type === "tool_result") {
+          finishStreamBubble();
+          addToolResult(event.text);
+        }
+        else if (event.type === "thinking") {
+          finishStreamBubble();
+          addLine("tool", "思考: " + event.text);
+        }
+        else if (event.type === "usage") {
+          finishStreamBubble();
+          endStreamThinking();
+          addLine("tool", event.text);
+        }
+        else if (event.type === "warning") {
+          finishStreamBubble();
+          endStreamThinking();
+          addLine("warning", "⚠ " + event.text);
+        }
         else if (event.type.startsWith("job_")) {
+          finishStreamBubble();
+          endStreamThinking();
           try {
             handleJobEvent(event.type, JSON.parse(event.text));
           } catch (err) {
@@ -12575,15 +13675,23 @@ async function send() {
           }
         }
         else if (event.type === "error") {
+          finishStreamBubble();
+          endStreamThinking();
           addLine("warning", "⚠ " + event.text);
           failed = true;
           statusEl.textContent = "请求失败";
-        } else if (event.type === "done") doneEvent = event;
+        } else if (event.type === "done") {
+          finishStreamBubble();
+          endStreamThinking();
+          doneEvent = event;
+        }
       }
     }
     if (doneEvent) {
       currentSession = doneEvent.session;
-      if (!failed) statusEl.textContent = doneEvent.ok ? "" : "达到最大步数，任务未完成";
+      if (!failed) statusEl.textContent = doneEvent.stopped
+        ? "已停止"
+        : (doneEvent.ok ? "" : "达到最大步数，任务未完成");
       if (doneEvent.session !== previousSession) loadSessions();
       loadRuntimeSettings();
     } else if (!failed) {
@@ -12592,6 +13700,8 @@ async function send() {
   } catch (err) {
     statusEl.textContent = err && err.name === "AbortError" ? "已停止" : String(err);
   } finally {
+    finishStreamBubble();
+    endStreamThinking();
     const aborted = controller.signal.aborted;
     stopEl.hidden = true;
     stopEl.disabled = false;
@@ -12713,6 +13823,7 @@ def run_web(
         "messages": [system_message],
         "session": None,
         "show_thinking": show_thinking,
+        "stream_enabled": True,
         "last_activity": time.monotonic(),
     }
     runtime: dict[str, Any] = {"client": client, "connection": connection}
@@ -12941,7 +14052,12 @@ def run_web(
                         cancel_event=chat_state["cancel"],
                         verbose_tools=True,
                         context_window=request_model_info.context_window,
+                        stream=stream and bool(state.get("stream_enabled", True)),
+                        stream_flush_ms=0,
                     )
+                except ChatCancelled:
+                    emit("warning", "已停止")
+                    ok = False
                 except ChatError as exc:
                     detail = f"model request failed: {exc}"
                     if stream:
@@ -12960,6 +14076,7 @@ def run_web(
                 result = {
                     "session": state["session"].uuid,
                     "ok": ok,
+                    "stopped": chat_state["cancel"].is_set(),
                     "usage": active_client.last_turn_usage,
                     "truncated": active_client.last_turn_truncated,
                 }
@@ -13134,6 +14251,7 @@ def run_web(
                         "show_thinking": bool(
                             state.get("show_thinking", show_thinking)
                         ),
+                        "stream": bool(state.get("stream_enabled", True)),
                         "reasoning": {
                             "label": active_reasoning.label if active_reasoning else "",
                             "provider": active_reasoning.provider if active_reasoning else "",
@@ -13146,6 +14264,12 @@ def run_web(
                         "idle_compact": idle_compact_settings,
                         "messages": history_view(state["messages"], lazy_images=True, include_tools=True),
                     })
+                return
+            if parsed.path == "/api/stream":
+                self._json(200, {
+                    "stream": bool(state.get("stream_enabled", True)),
+                    "default": True,
+                })
                 return
             if parsed.path == "/api/runtime":
                 current_info = current_model_info()
@@ -13162,6 +14286,7 @@ def run_web(
                     "busy": bool(chat_state["active"]),
                     "api_format": active_connection.api_format,
                     "show_thinking": show,
+                    "stream": bool(state.get("stream_enabled", True)),
                     "reasoning": {
                         "label": active_reasoning.label if active_reasoning else "",
                         "provider": active_reasoning.provider if active_reasoning else "",
@@ -13552,6 +14677,15 @@ def run_web(
                     "info": info.to_dict(),
                     "needs_model_info": info.source in ("fallback", "remote"),
                 })
+                return
+
+            if parsed.path == "/api/stream":
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    self._error(400, "enabled must be a boolean")
+                    return
+                state["stream_enabled"] = enabled
+                self._json(200, {"stream": enabled})
                 return
 
             if parsed.path == "/api/thinking":
@@ -14291,6 +15425,48 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="lines shown per follow poll (default: 5)",
     )
+    stream_group = parser.add_mutually_exclusive_group()
+    stream_group.add_argument(
+        "--stream",
+        dest="stream",
+        action="store_true",
+        default=None,
+        help="stream model output (default: on in an interactive terminal)",
+    )
+    stream_group.add_argument(
+        "--no-stream",
+        dest="stream",
+        action="store_false",
+        help="wait for the full response (keeps terminal Markdown rendering)",
+    )
+    parser.add_argument(
+        "--stream-idle-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="drop a stream after this many seconds without events (default: 300)",
+    )
+    parser.add_argument(
+        "--stream-flush-ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="CLI stream flush interval in milliseconds (default: 40; 0 = every chunk)",
+    )
+    debug_stream_group = parser.add_mutually_exclusive_group()
+    debug_stream_group.add_argument(
+        "--debug-stream",
+        dest="debug_stream",
+        action="store_true",
+        default=None,
+        help="print SSE event types to stderr without printing content",
+    )
+    debug_stream_group.add_argument(
+        "--no-debug-stream",
+        dest="debug_stream",
+        action="store_false",
+        help="disable SSE debug output (default)",
+    )
     parser.add_argument(
         "-c",
         "--continue",
@@ -14416,6 +15592,7 @@ def main(argv: list[str] | None = None) -> int:
         return list_sessions()
 
     raw_reasoning = args.reasoning
+    raw_stream = args.stream
     raw_memory = args.memory
     raw_memory_daily = args.memory_daily
     raw_memory_daily_time = args.memory_daily_time
@@ -14518,6 +15695,15 @@ def main(argv: list[str] | None = None) -> int:
     if not 1 <= args.job_follow_lines <= 50:
         print("error: --job-follow-lines must be between 1 and 50", file=sys.stderr)
         return 2
+    if not 10 <= args.stream_idle_timeout <= 3600:
+        print(
+            "error: --stream-idle-timeout must be between 10 and 3600",
+            file=sys.stderr,
+        )
+        return 2
+    if not 0 <= args.stream_flush_ms <= 1000:
+        print("error: --stream-flush-ms must be between 0 and 1000", file=sys.stderr)
+        return 2
     if (
         args.auto_compact_threshold is not None
         and not 1 <= args.auto_compact_threshold <= 100
@@ -14556,14 +15742,30 @@ def main(argv: list[str] | None = None) -> int:
 
     reasoning_state: dict[str, Any] = {"config": reasoning}
 
+    if args.web:
+        stream_enabled = True
+    elif raw_stream is True:
+        stream_enabled = True
+    elif raw_stream is False:
+        stream_enabled = False
+    else:
+        stream_enabled = bool(args.stream) and sys.stdout.isatty()
+
+    stream_runtime = {"current": bool(stream_enabled), "default": bool(stream_enabled)}
+
     def make_client(active_connection: Connection) -> BaseChatClient:
-        return build_client(
+        client = build_client(
             active_connection,
             timeout=args.timeout,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             reasoning=reasoning_state["config"],
         )
+        client.stream_idle_timeout = float(args.stream_idle_timeout)
+        client.debug_stream = bool(args.debug_stream) or bool(
+            os.environ.get("BENBEN_DEBUG_STREAM")
+        )
+        return client
 
     connection: Connection | None = None
     if args.connect:
@@ -14886,6 +16088,8 @@ def main(argv: list[str] | None = None) -> int:
                 tools=tools,
                 verbose_tools=args.verbose_tools,
                 context_window=model_info.context_window,
+                stream=stream_runtime["current"],
+                stream_flush_ms=args.stream_flush_ms,
             ) else 1
 
         show_thinking = args.thinking
@@ -15017,6 +16221,14 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if user_input == "/schedule" or user_input.startswith("/schedule "):
                 run_schedule_command(scheduler, user_input[len("/schedule"):].strip())
+                continue
+            if user_input == "/stream" or user_input.startswith("/stream "):
+                run_stream_command(
+                    user_input[len("/stream"):].strip(),
+                    stream_runtime,
+                    args,
+                    client,
+                )
                 continue
             if user_input == "/jobs" or user_input.startswith("/jobs "):
                 run_jobs_command(
@@ -15909,6 +17121,8 @@ def main(argv: list[str] | None = None) -> int:
                     tools=tools,
                     verbose_tools=args.verbose_tools,
                     context_window=model_info.context_window,
+                    stream=stream_runtime["current"],
+                    stream_flush_ms=args.stream_flush_ms,
                 )
             except ChatError as exc:
                 print(f"error: {exc}", file=sys.stderr)

@@ -235,6 +235,10 @@ Windows 乱码处理：
 | `--max-background-jobs` / `--background-output-chars` | `8` / `20000` | 后台任务并发上限和每路输出保留字符数 |
 | `--job-follow` / `--no-job-follow` | 开 | 后台任务是否默认跟随输出 |
 | `--job-poll-seconds` / `--job-follow-lines` | `2` / `5` | 跟随轮询间隔和每次显示行数 |
+| `--stream` / `--no-stream` | 交互终端开 | 流式读取模型输出；管道和脚本默认关闭，`--no-stream` 保留完整 Markdown 渲染 |
+| `--stream-idle-timeout` | `300` | 流式期间多少秒没有任何事件视为超时 |
+| `--stream-flush-ms` | `40` | CLI 流式刷新间隔；`0` 表示每块都刷新 |
+| `--debug-stream` / `--no-debug-stream` | 关 | 只向 stderr 打印 SSE 事件类型，不打印正文 |
 | `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
@@ -249,7 +253,7 @@ Windows 乱码处理：
 | `--idle-compact-minutes` | `10` | 空闲分钟数 |
 | `--idle-compact-level` | 跟随 auto | 空闲压缩档位 |
 | `--idle-compact-min-percent` / `--idle-compact-min-messages` | `20` / `6` | 空闲压缩的最低上下文和消息门槛 |
-| `--plain` / `--no-plain` | 关 | 是否渲染 Markdown；`--no-plain` 可覆盖配置文件 |
+| `--plain` / `--no-plain` | 关 | 非流式时是否渲染 Markdown；`--no-plain` 可覆盖配置文件 |
 | `--verbose-tools` / `--no-verbose-tools` | 关 | 显示完整工具参数和工具结果（最多 20000 字符） |
 | `--thinking` / `--no-thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`；交互模式可用 `/thinking on\|off` 切换 |
 | `--all-skill-dirs` | 关 | 关闭 `only_own_skills`，重新扫描全部技能目录 |
@@ -319,6 +323,10 @@ Windows 乱码处理：
     "job_follow": true,
     "job_poll_seconds": 2,
     "job_follow_lines": 5,
+    "stream": true,
+    "stream_idle_timeout": 300,
+    "stream_flush_ms": 40,
+    "debug_stream": false,
     "web": {"host": "127.0.0.1", "port": 8765}
   }
 }
@@ -527,12 +535,12 @@ python3 benben-agent.py \
 - 默认认证是 `x-api-key` + `anthropic-version: 2023-06-01`；只认 Bearer 的兼容网关用 `--anthropic-auth bearer`；
 - Anthropic 必须传 `max_tokens`，默认 8192，可用 `--max-tokens` 调整；
 - 支持文本、工具调用、PNG/JPEG/GIF/WEBP 图片；BMP 会直接报错；
-- 非流式；支持 extended thinking（`--reasoning anthropic:low/medium/high`），不支持 prompt caching、PDF；
+- 支持流式文本、思考和工具调用；支持 extended thinking（`--reasoning anthropic:low/medium/high`），不支持 prompt caching、PDF；
 - 内网 A 系列本身走 OpenAI 兼容接口，不需要加 `--api-format anthropic-messages`。
 
 ## Responses 协议
 
-`--api-format openai-responses` 使用 OpenAI Responses API（`/v1/responses`），支持文本、图片和工具调用；非流式、无状态（`store: false`）。
+`--api-format openai-responses` 使用 OpenAI Responses API（`/v1/responses`），支持文本、图片、工具调用和流式输出；无状态（`store: false`）。
 
 ```bash
 python3 benben-agent.py \
@@ -550,8 +558,8 @@ python3 benben-agent.py \
 - `max_output_tokens` 默认 8192，可用 `--max-tokens` 调整；
 - 支持 PNG/JPEG/GIF/WEBP 图片，BMP 会报错；
 - `store` 固定为 `false`；
-- 支持 `reasoning.effort` 映射（`--reasoning openai:low/medium/high`）；
-- 暂不支持流式、内置工具（web_search/file_search/computer_use）；
+- 支持流式输出和 `reasoning.effort` 映射（`--reasoning openai:low/medium/high`）；
+- 不支持内置工具（web_search/file_search/computer_use）；
 - 内网网关也支持 `/v1/responses`，可以直接用 `--api-format openai-responses`。
 
 ## 会话持久化
@@ -831,6 +839,64 @@ once 2026-11-12 15:00
 
 网页侧边栏启用后会显示「定时任务」按钮，可以查看任务、运行、启停、查看记录和删除。运行完成后，新结果会以提示形式出现在对话区。
 
+## 流式输出
+
+模型回复支持逐块读取：
+
+- CLI 交互终端默认流式，正文按纯文本实时输出，不再做终端 Markdown 渲染
+- CLI 管道、重定向和脚本默认非流式，保持原有完整渲染
+- `--stream` 强制流式，`--no-stream` 强制非流式
+- Web 默认流式，可在输入框底部取消「流式输出」或执行 `/stream off`
+- 思考内容开启 `--thinking` 时同样流式显示
+- 工具参数在完整后显示，不实时打印半截 JSON
+
+运行时可切换：
+
+```text
+/stream              查看当前模式
+/stream on           后续轮次流式
+/stream off          后续轮次等待完整回复
+/stream auto         恢复本次启动时的默认值
+```
+
+CLI 和 Web 使用同一组指令。`/config save` 会把当前值写入 `defaults.stream`。
+
+支持三种协议：
+
+- OpenAI Chat Completions：`stream: true` + `stream_options.include_usage`
+- Anthropic Messages：`content_block_delta`
+- OpenAI Responses：`response.output_text.delta` 和 `response.completed`
+
+兼容处理：
+
+- 网关拒绝 `stream_options` 时自动去掉并重试
+- 网关不支持流式时自动回退非流式
+- 网关忽略 `stream` 直接返回 JSON 时按完整响应处理
+- 首字节前失败可重试；已经输出后中断会报错，不自动续写
+- 流式无事件超过 `stream_idle_timeout` 会断开
+- 取消或 Ctrl+C 不会把半截回复写入会话历史
+
+配置：
+
+```json
+{
+  "defaults": {
+    "stream": true,
+    "stream_idle_timeout": 300,
+    "stream_flush_ms": 40,
+    "debug_stream": false
+  }
+}
+```
+
+排障：
+
+```bash
+BENBEN_DEBUG_STREAM=1 python3 benben-agent.py --stream ...
+```
+
+只输出事件类型，不输出正文。
+
 ## 后台任务与跟随
 
 耗时命令不会一直阻塞会话。`run_command` 支持 `background` 和 `follow`：
@@ -955,12 +1021,12 @@ python3 benben-agent.py --web
 
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
-- 页面支持对话、新建/切换/删除历史会话（删除有确认弹框）、上传图片，左侧下拉框可以切换模型（等价于 CLI 的 `/model`，切换后立即生效）；
+- 页面支持对话、新建/切换/删除历史会话（删除有确认弹框）、上传图片；侧边栏会话区占据主要高度，连接和模型收在底部「连接与模型」折叠组里；
 - 侧边栏「帮助 / 指令」打开帮助弹窗，列出 Web 支持的斜杠命令和常用操作；输入 `/help` 也可以打开；
 - 会话列表支持右键菜单修改名称、导出 Markdown、删除会话；聊天框输入 `/session` 也可以管理会话；
-- 启用 `--schedule` 后侧边栏显示「定时任务」，可查看/运行/启停/删除任务和查看运行记录，后台每 5 秒轮询一次并提示新结果；
+- 启用 `--schedule` 后「工具与帮助」里显示「定时任务」，可查看/运行/启停/删除任务和查看运行记录，后台每 5 秒轮询一次并提示新结果；
 - 工具调用显示为可展开块，默认折叠；展开后可查看完整参数和工具结果，历史会话也会回放；
-- 输入框下方有「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级按协议显示 DeepSeek/Kimi/MiniMax/OpenAI/Anthropic 选项；
+- 输入框下方有「流式输出」「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级按协议显示 DeepSeek/Kimi/MiniMax/OpenAI/Anthropic 选项；
 - 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；
 - 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
@@ -969,7 +1035,7 @@ python3 benben-agent.py --web
 - 监听非回环地址会打印警告；
 - `--web` 与位置参数 prompt 同时出现时忽略 prompt 并提示。
 
-页面全部内嵌在 `benben-agent.py` 里，无 CDN、无前端构建，离线可用。assistant 回复会渲染常用 Markdown（标题、粗体、行内代码、代码块、列表、引用、链接、分隔线和表格），`![](...)` 图片也会直接显示；用户上传的图片在发送后显示缩略图，重新打开历史会话时图片以「点击加载」占位显示。网页通过 `/api/chat/stream` 做步骤级流式：工具调用和每个步骤的中间回答会逐步出现，但单次模型请求仍是非流式的，思考和正文会一起到达。旧的 `/api/chat` JSON 接口保留。
+页面全部内嵌在 `benben-agent.py` 里，无 CDN、无前端构建，离线可用。assistant 回复在流式开启时以纯文本逐块出现，结束后再重绘常用 Markdown（标题、粗体、行内代码、代码块、列表、引用、链接、分隔线和表格），`![](...)` 图片也会直接显示；用户上传的图片在发送后显示缩略图，重新打开历史会话时图片以「点击加载」占位显示。网页通过 `/api/chat/stream` 做 token 级流式：思考、正文、工具调用和每个步骤的中间回答都会逐步出现；关闭流式后事件在完成后一次性返回。旧的 `/api/chat` JSON 接口保留。
 
 ## 内置工具
 
@@ -1010,13 +1076,14 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 
 支持 PNG、JPEG、GIF（按静态图）、WEBP、BMP；单张不超过 10 MB，每条消息最多 4 张。全程只用标准库，不缩放、不转码，超过限制会直接报错。
 
-## 终端 Markdown 渲染
+## 终端输出与 Markdown 渲染
 
-标准输出是终端时，agent 的回复会渲染 Markdown：标题、粗体/斜体、行内代码、代码块、
-列表、引用、链接和表格；表格按中文显示宽度对齐。管道输出保持原始 Markdown，方便写入
-文件。加 `--plain` 可强制输出原文，`NO_COLOR=1` 可关闭颜色。渲染只影响终端显示，不改变
-发给模型的历史内容。颜色约定：输入提示符 `you> ` 为青色，回复标记 `agent> ` 为品红色，
-思考内容为灰色，工具调用行用暗色。
+交互终端默认流式输出，正文按纯文本实时显示，不做终端 Markdown 渲染。使用 `--no-stream`
+时等待完整响应，并按 `--plain` / `--no-plain` 决定是否渲染 Markdown：标题、粗体/斜体、
+行内代码、代码块、列表、引用、链接和表格；表格按中文显示宽度对齐。管道和重定向默认
+非流式，保持原始 Markdown，方便写入文件；`--stream` 可强制流式，`NO_COLOR=1` 可关闭颜色。
+渲染只影响终端显示，不改变发给模型的历史内容。颜色约定：输入提示符 `you> ` 为青色，
+回复标记 `agent> ` 为品红色，思考内容为灰色，工具调用行用暗色。
 
 ## 实现要点
 
@@ -1039,16 +1106,16 @@ python3 tests/run_all.py
 
 ## 限制
 
-- 只使用非流式模型请求，单次调用里的思考和正文会一起到达；网页的步骤级 SSE 只解决工具调用和中间回答的逐步显示。
+- 流式输出依赖网关支持；网关拒绝时会自动回退非流式，CLI 管道和脚本默认非流式。
 - 历史消息不会自动裁剪；长对话需要手动 `/compact`，否则可能超出模型上下文。
 - 模型必须支持 OpenAI 风格的 `tools` / `tool_calls`；不支持 function calling 的模型只能当聊天机器人用。
 - 图片不会缩放或转码，单张上限 10 MB，不支持 HEIC；图片会占用较多上下文 token。
 - MiniMax-M3.1-Flash 不能关闭思考，只能降低 `reasoning_effort`；Qwen、GLM、Claude、OpenAI/Codex、Gemini、Grok 未纳入思考映射。
-- Anthropic 协议目前是非流式的，不支持 Claude extended thinking、prompt caching 和 PDF 输入。
-- Responses 协议目前是非流式、无状态的，不支持内置工具（web_search/file_search/computer_use）和 `reasoning.effort` 映射。
+- Anthropic 协议支持流式文本、思考和工具调用，不支持 prompt caching 和 PDF 输入。
+- Responses 协议支持流式文本、reasoning 和函数调用，但无状态，不支持内置工具（web_search/file_search/computer_use）。
 - 会话文件默认只增不减，`/compact` 也只在末尾追加压缩记录，不删除原历史；文件包含完整对话内容，注意 `~/.benben-agent/sessions/` 的访问权限。
 - 交互模式下网络/API 错误只打印原因并保留历史，不会退出；可以直接重试，或 `/exit` 后用 `-c` 恢复。
-- 网页使用步骤级 SSE，长回答仍要等单次模型请求返回；只适合本机单用户使用，不做多用户隔离。
+- 网页使用 SSE 传输，流式关闭时会在完整响应后一次性返回；只适合本机单用户使用，不做多用户隔离。
 - 网页里 assistant 输出的远程 `https` 图片会直接加载，会向图片服务器暴露本机 IP；上传的图片以 base64 写入会话文件，带图会话会明显变大。
 
 ## 许可

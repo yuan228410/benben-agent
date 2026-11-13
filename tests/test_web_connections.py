@@ -44,7 +44,26 @@ class ModelHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        payload = json.loads(raw) if raw else {}
+        if payload.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            events = [
+                {"choices": [{"delta": {"content": "流"}, "finish_reason": None}]},
+                {"choices": [{"delta": {"content": "式"}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 2}},
+            ]
+            for event in events:
+                self.wfile.write(
+                    ("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode()
+                )
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
         body = json.dumps({
             "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
@@ -231,6 +250,35 @@ try:
     code, _ = api("/api/jobs/status", {"id": "job-nope"}, expect_error=True)
     check("jobs unknown id", code == 404, code)
     check("web html job block", "job-block" in html and "handleJobEvent" in html)
+    check(
+        "web html stream",
+        "beginStreamBubble" in html
+        and "appendStreamDelta" in html
+        and "content_delta" in html,
+    )
+    check(
+        "web html sidebar groups",
+        'id="sessions-group"' in html
+        and 'id="settings-group"' in html
+        and 'id="settings-summary"' in html,
+    )
+    check(
+        "web html stream toggle",
+        'id="stream-toggle"' in html and "/stream" in html,
+    )
+    check(
+        "web html stream first",
+        html.find('id="stream-toggle"') < html.find('id="thinking-toggle"'),
+    )
+    check(
+        "web html stream checked",
+        'id="stream-toggle" checked' in html,
+    )
+    check(
+        "web html groups init order",
+        html.find("const settingsGroupEl") < html.find("restoreSideGroup(settingsGroupEl")
+        and html.find("const toolsGroupEl") < html.find("restoreSideGroup(toolsGroupEl"),
+    )
 
     model_info_payload = api_json("/api/model/info")
     check("model info needs fill", model_info_payload["needs_model_info"] is True, model_info_payload)
@@ -284,6 +332,39 @@ try:
     sessions = api_json("/api/sessions")["sessions"]
     title_row = next(item for item in sessions if item["uuid"] == session_uuid)
     check("web title in list", title_row["title"] == "自定义标题", title_row)
+
+    code, stream_text = api(
+        "/api/chat/stream", {"message": "stream please", "images": []}
+    )
+    check("web stream status", code == 200, code)
+    check("web stream start", "content_start" in stream_text, stream_text[-800:])
+    check("web stream delta", "content_delta" in stream_text, stream_text[-800:])
+    check("web stream final", '"type": "content"' in stream_text, stream_text[-800:])
+    check("web stream done", '"type": "done"' in stream_text, stream_text[-800:])
+    start_at = stream_text.find("content_start")
+    delta_at = stream_text.find("content_delta")
+    done_at = stream_text.find('"type": "done"')
+    check(
+        "web stream order",
+        0 <= start_at < delta_at < done_at,
+        (start_at, delta_at, done_at),
+    )
+
+    stream_state = api_json("/api/stream")
+    check("stream default on", stream_state["stream"] is True, stream_state)
+    stream_off = api_json("/api/stream", {"enabled": False})
+    check("stream api off", stream_off["stream"] is False, stream_off)
+    runtime_state = api_json("/api/runtime")
+    check("runtime stream off", runtime_state["stream"] is False, runtime_state)
+    code, quiet_text = api(
+        "/api/chat/stream", {"message": "no stream please", "images": []}
+    )
+    check("web no-stream status", code == 200, code)
+    check("web no-stream no delta", "content_delta" not in quiet_text, quiet_text[-800:])
+    check("web no-stream final", '"type": "content"' in quiet_text, quiet_text[-800:])
+    check("web no-stream done", '"type": "done"' in quiet_text, quiet_text[-800:])
+    stream_on = api_json("/api/stream", {"enabled": True})
+    check("stream api on", stream_on["stream"] is True, stream_on)
 
     # Export a synthetic session with thinking and tools.
     sessions_dir = os.path.join(home, ".benben-agent", "sessions")
