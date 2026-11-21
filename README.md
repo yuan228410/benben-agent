@@ -26,6 +26,8 @@ you> 把 hello.txt 里的内容改成 Hello World
 ...
 you> /confirm on      # 需要时开启确认；只读命令不会询问
 you> /thinking on     # 显示模型的思考内容（默认关闭）
+you> /plan on         # 计划模式：先调查出计划，批准后再动手
+you> /plan guard approve   # 计划模式下改状态的操作需要确认
 you> /image shot.png  # 附带图片，随下一条消息发送
 you> /skill            # 列出已加载的 Agent Skills（启动时加 --skill）
 you> /skill log-triage 排查 502  # 强制用指定技能回答问题
@@ -173,7 +175,24 @@ python3 benben-agent.py --shell "C:\Program Files\PowerShell\7\pwsh.exe"
 
 模型也能回答“有哪些 shell”“当前用哪个”，并在用户要求时通过 `switch_shell` 工具切换。Web 聊天框输入 `/shell` 也可以查看或切换。
 
-系统提示词只在启动时生成一次，切换 shell 后不会重写，避免破坏 prompt 缓存。模型通过 `list_shells`、`switch_shell` 和 `run_command` 返回的 `shell:` 行获取实时 shell。
+系统提示词只在启动时生成一次，切换 shell 后不会重写，避免破坏 prompt 缓存。模型通过 `list_shells`、`switch_shell` 和 `run_command` 返回的 `shell:` 行获取当前 shell。注意 `run_command` 工具描述里嵌入的可用 shell 列表是启动时的快照，`switch_shell` 或 `/shell` 切换后不会刷新，需要最新列表时调用 `list_shells`。
+
+### 为单条命令指定 shell
+
+`run_command` 支持可选的 `shell` 参数，由模型自己判断本次用哪个 shell 执行：
+
+```json
+{"command": "grep -rn TODO .", "shell": "git-bash", "timeout_seconds": 30}
+```
+
+- 不传 `shell` 就用当前默认 shell，行为和以前一致。
+- 传了 `shell` 就只用这个 shell 执行，**不改动全局默认**，也不做自动回退——既然已经明确选了 shell，回退到别的 shell 会违背意图（比如 POSIX 命令在 PowerShell 里跑会出错）。
+- 命令要按所选 shell 的语法写：POSIX 用 `grep`/`sed`/`awk`，PowerShell 用 `Get-ChildItem`/`Select-String`，cmd 用 `dir`/`findstr`。
+- 只读判定按所选 shell 的语法计算：在 Git Bash 里 `cat` 属于只读命令，不需要批准；在 PowerShell 里所有命令都按可能修改状态处理。
+- shell 名不存在时直接报错，并附上当前可用 shell 列表。
+- 需要持久改变默认 shell 时用 `switch_shell` 或 `/shell`。
+
+`run_command` 的工具描述里会动态注入当前默认 shell 和可用 shell 列表，模型据此自行选择：用哪个 shell 是模型自己的判断，不必每次问用户。
 
 执行方式：
 
@@ -203,11 +222,13 @@ Windows 乱码处理：
 - 回退只对本次命令生效，不改变当前 shell；需要持久切换用 `/shell` 或 `switch_shell`。
 - 所有 shell 都不认识时，结果会给出 `[fallback] reason`、每个 shell 的简短错误，以及安装工具/更换命令的建议。
 - 普通失败（权限、文件不存在、语法错误等）不会触发回退，避免重复执行。
+- 显式指定了 `shell` 的命令不做回退；失败时提示换一个 shell 或改写成该 shell 的语法。
 
 ### 只读判断
 
 - POSIX / Git Bash：保留命令白名单判断。
 - PowerShell / cmd：一律视为可能修改状态。开启 `--confirm` 时所有命令都需要确认。
+- 判断按本次实际使用的 shell 走：指定 `shell: "git-bash"` 时用 POSIX 白名单，指定 PowerShell 时一律视为可能修改状态。
 
 ## 参数
 
@@ -258,6 +279,8 @@ Windows 乱码处理：
 | `--thinking` / `--no-thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`；交互模式可用 `/thinking on\|off` 切换 |
 | `--all-skill-dirs` | 关 | 关闭 `only_own_skills`，重新扫描全部技能目录 |
 | `--reasoning` | 不发送 | 思考控制，格式 `provider:level`；provider 支持 `deepseek`/`kimi`/`minimax`，level 支持 `off/minimal/low/medium/high/max`；详见下文 |
+| `--plan` / `--no-plan` | 关 | 计划模式：先调查出计划，批准后再动手；详见下文 |
+| `--plan-guard` | `off` | 计划模式守卫：`off`（只靠提示词）/ `approve`（改状态要确认）/ `deny`（直接拒绝） |
 | `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
 | `--list` | 关 | 列出已保存的会话并退出，不联网、不需要 API key |
 | `--web` | 关 | 启动浏览器界面；网页模式强制免确认 |
@@ -288,6 +311,8 @@ Windows 乱码处理：
     "confirm": false,
     "thinking": false,
     "reasoning": null,
+    "plan_mode": false,
+    "plan_guard": "off",
     "max_steps": 100,
     "timeout": 120.0,
     "temperature": null,
@@ -839,6 +864,60 @@ once 2026-11-12 15:00
 
 网页侧边栏启用后会显示「定时任务」按钮，可以查看任务、运行、启停、查看记录和删除。运行完成后，新结果会以提示形式出现在对话区。
 
+## 计划模式（Plan Mode）
+
+计划模式让模型先调查、再给计划，等你批准后才动手改东西。
+
+```bash
+python3 benben-agent.py --plan
+python3 benben-agent.py --plan --plan-guard approve
+```
+
+交互模式：
+
+```text
+/plan                          查看当前模式和守卫档位
+/plan on|off                   切换计划模式
+/plan guard off|approve|deny   设置守卫档位
+```
+
+Web 端：输入框下方有「计划模式」开关和「守卫」下拉框，聊天框输入 `/plan` 也能切换。
+
+### 工具不会被削减
+
+计划模式**不砍工具**。读文件、搜索、跑命令、写文件全都可用，区别只在于系统提示词要求模型这一轮只做调查和规划。
+
+- 可以跑调查性命令：看文件内容、查日志、看 git 状态和差异、跑构建或测试看报错、查依赖版本
+- 不要做：写改工作区文件、删除移动文件、安装升级依赖、改变 git 状态、改系统配置、写数据库、创建定时任务
+- 例外：确实需要产生副作用才能得到结论的命令（例如必须跑一次构建才能看到编译错误），写进计划里在批准环节一并确认
+
+约束靠提示词，不是权限封锁，所以默认档位是 `off`。
+
+### 提交与批准
+
+调查完成后模型调用 `submit_plan` 提交计划，内容包含目标、步骤（改哪个文件、跑什么命令）、风险与影响范围、验证方式。提交后本轮立即停止。
+
+- CLI：打印计划后提示 `Approve and execute? [Y/n]`。批准后自动退出计划模式、重建提示词和工具，并**立即按计划执行**，不用再发第二条消息
+- Web：渲染一个计划块，带「批准执行」和「继续规划」按钮。点「批准执行」同样自动执行
+- 一次性模式（`--prompt`）：没有人能批准，模型提交计划后程序直接结束并打印计划，退出码 0
+
+### 守卫档位
+
+| 档位 | 行为 |
+| --- | --- |
+| `off`（默认） | 只靠提示词约束，工具全部可用 |
+| `approve` | 改状态的操作需要用户批准。CLI 弹交互确认；网页端无法实时确认，改为拒绝并让模型转述给用户，等你批准计划后写操作自然恢复 |
+| `deny` | 计划模式下直接拒绝改状态的操作（写文件、改文件、非只读命令、写记忆、改定时任务等） |
+
+只读命令在 `approve` 和 `deny` 档下都不受影响。Windows 上 PowerShell/cmd 的命令一律按"会改状态"处理，POSIX 只读白名单只在 Git Bash 等 POSIX shell 下生效。
+
+### 注意事项
+
+- 切换模式会重建系统提示词和工具列表，会击穿一次 prompt 缓存（代价很小）
+- 计划模式下模型仍能调用写工具，`off` 档完全依赖模型遵守提示词；不放心就开 `approve` 或 `deny`
+- 计划保存在会话历史里，`-c` 恢复后仍能看到「计划 → 批准」的脉络；模式开关本身不随会话恢复
+- 定时任务不受影响：定时运行永远按任务自己的 `read_only` 设置执行
+
 ## 流式输出
 
 模型回复支持逐块读取：
@@ -1027,6 +1106,7 @@ python3 benben-agent.py --web
 - 启用 `--schedule` 后「工具与帮助」里显示「定时任务」，可查看/运行/启停/删除任务和查看运行记录，后台每 5 秒轮询一次并提示新结果；
 - 工具调用显示为可展开块，默认折叠；展开后可查看完整参数和工具结果，历史会话也会回放；
 - 输入框下方有「流式输出」「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级按协议显示 DeepSeek/Kimi/MiniMax/OpenAI/Anthropic 选项；
+- 输入框下方还有「计划模式」开关和「守卫」下拉框；计划模式下模型提交的计划会渲染成带「批准执行」「继续规划」按钮的计划块，聊天框输入 `/plan` 也能切换；
 - 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；
 - 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
@@ -1047,7 +1127,8 @@ python3 benben-agent.py --web
 | `glob` | 按通配符查找文件，支持 `**` 递归 | 否 |
 | `write_file` | 创建或覆盖文件 | 是 |
 | `edit_file` | 替换文件中的一段文本（类似 patch） | 是 |
-| `run_command` | 在工作区执行 shell 命令 | 是 |
+| `run_command` | 在工作区执行 shell 命令（可用 `shell` 参数指定本次用哪个 shell） | 是 |
+| `submit_plan` | 提交实施计划并等待用户批准（仅计划模式下提供） | 否 |
 | `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 否 |
 | `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 否 |
 | `run_skill_script` | 执行技能 `scripts/` 下的脚本（仅在启用脚本且存在脚本时提供） | 是 |
@@ -1107,7 +1188,7 @@ python3 tests/run_all.py
 ## 限制
 
 - 流式输出依赖网关支持；网关拒绝时会自动回退非流式，CLI 管道和脚本默认非流式。
-- 历史消息不会自动裁剪；长对话需要手动 `/compact`，否则可能超出模型上下文。
+- 历史消息默认不裁剪；长对话需要手动 `/compact`，或开启 `--auto-compact` / `--idle-compact`，否则可能超出模型上下文。
 - 模型必须支持 OpenAI 风格的 `tools` / `tool_calls`；不支持 function calling 的模型只能当聊天机器人用。
 - 图片不会缩放或转码，单张上限 10 MB，不支持 HEIC；图片会占用较多上下文 token。
 - MiniMax-M3.1-Flash 不能关闭思考，只能降低 `reasoning_effort`；Qwen、GLM、Claude、OpenAI/Codex、Gemini、Grok 未纳入思考映射。
@@ -1117,6 +1198,9 @@ python3 tests/run_all.py
 - 交互模式下网络/API 错误只打印原因并保留历史，不会退出；可以直接重试，或 `/exit` 后用 `-c` 恢复。
 - 网页使用 SSE 传输，流式关闭时会在完整响应后一次性返回；只适合本机单用户使用，不做多用户隔离。
 - 网页里 assistant 输出的远程 `https` 图片会直接加载，会向图片服务器暴露本机 IP；上传的图片以 base64 写入会话文件，带图会话会明显变大。
+- `run_command` 工具描述里嵌入的可用 shell 列表在启动时生成，`switch_shell` 或 `/shell` 切换后不会刷新；需要实时列表时调用 `list_shells`。
+- 计划模式默认只靠提示词约束模型（`--plan-guard off`），模型理论上仍能改动文件；开 `approve` 或 `deny` 才有硬性拦截，网页端的 `approve` 会降级为"拒绝并让模型转述给你"。
+- 切换计划模式会重建系统提示词和工具列表，击穿一次 prompt 缓存。
 
 ## 许可
 

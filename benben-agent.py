@@ -62,6 +62,8 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --reasoning PROVIDER:LEVEL
                             思考控制：deepseek|kimi|minimax|openai|anthropic
                             加 off|minimal|low|medium|high|max，例如 deepseek:low
+    --plan / --no-plan       计划模式：先调查出计划，批准后再动手（默认关闭）
+    --plan-guard MODE       计划模式守卫：off（只靠提示词，默认）| approve | deny
     -c, --continue [UUID]   恢复会话；省略 UUID 取最新，没有会话则新建
     --list                  列出已保存会话并退出，不联网
     --web                   启动网页界面；强制免确认
@@ -149,6 +151,8 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /confirm on|off               切换写操作确认
     /thinking on|off              切换思考内容显示
     /reasoning <provider>:<level> 设置模型思考参数；clear 清除
+    /plan on|off                   切换计划模式（先调查出计划，批准后再动手）
+    /plan guard off|approve|deny   设置计划模式守卫档位
     /model [name|number|list]     查看/切换模型
     /model info [name|number]     查看模型能力信息
     /model config [name|number]   配置/更新模型能力
@@ -514,6 +518,17 @@ class ShellInfo:
     def describe(self) -> str:
         return f"{self.name} ({self.path}, {self.kind})"
 
+    @property
+    def kind_label(self) -> str:
+        """Human-readable name of the shell kind."""
+        if self.kind == "posix":
+            return "POSIX"
+        if self.kind == "powershell":
+            return "PowerShell"
+        if self.kind == "cmd":
+            return "cmd"
+        return self.kind
+
     def to_dict(self) -> dict[str, str]:
         return {"name": self.name, "path": self.path, "kind": self.kind, "source": self.source}
 
@@ -811,6 +826,27 @@ def detect_shell_state(
     return ShellState(current, available)
 
 
+def shell_choice_hint(state: "ShellState | None") -> str:
+    """One-line summary of the shells a command may be run with."""
+    if state is None:
+        return ""
+    current = state.current
+    options = []
+    for item in state.available:
+        marker = " (current)" if item.path == current.path else ""
+        options.append(f"{item.name}={item.kind_label}{marker}")
+    if not options:
+        options.append(f"{current.name}={current.kind_label} (current)")
+    return (
+        f"Default shell is {current.name} ({current.kind_label}); "
+        f"available: {', '.join(options)}. "
+        "Choose the shell yourself: omit this parameter to use the default shell, "
+        "or set it to whichever shell the command is written for. "
+        "The command must use the syntax of the shell you pick; when you set this "
+        "parameter no other shell is tried."
+    )
+
+
 def shell_prompt_section(state: ShellState | None) -> str:
     if state is None:
         return "启动时 shell：未检测。"
@@ -844,10 +880,24 @@ def shell_prompt_section(state: ShellState | None) -> str:
             "不要使用 grep/awk/sed/ls 等 Unix 命令。"
         )
     lines.append(
+        "命令语法由 shell 决定：POSIX 用 grep/awk/sed/find/tail/head，"
+        "PowerShell 用 Get-ChildItem/Get-Content/Select-String，"
+        "cmd 用 dir/type/findstr。"
+    )
+    lines.append(
+        "run_command 的 shell 参数可指定本次用哪个 shell 执行（不影响全局默认）；"
+        "不传就用默认 shell。可以用 list_shells 查实时状态，"
+        "用 switch_shell 永久切换默认 shell。"
+    )
+    lines.append(
         "系统提示只在启动时生成，之后不会因为切换 shell 而更新。"
         "用户询问当前 shell 或可用 shell 时，调用 list_shells 获取实时状态；"
-        "用户要求切换时调用 switch_shell，切换后以工具返回的 shell 类型选择命令。"
-        "不要自行切换，除非用户明确要求，或当前 shell 明显无法执行任务且你已说明原因。"
+        "切换后以工具返回的 shell 类型选择命令。"
+        "run_command 的 shell 参数由你自己判断：默认用当前 shell，"
+        "命令语法不匹配时（需要 POSIX 的 grep/sed 而当前是 PowerShell，或反之）"
+        "就换一个能执行该命令的 shell，按那个 shell 的语法写命令。"
+        "选择合适的 shell 是你的职责，不必每次都问用户；"
+        "不要随意用 switch_shell 改全局默认，除非用户要求。"
     )
     return "\n".join(lines)
 
@@ -2478,6 +2528,8 @@ def default_settings() -> dict[str, Any]:
         "confirm": False,
         "thinking": False,
         "reasoning": None,
+        "plan_mode": False,
+        "plan_guard": "off",
         "max_steps": 100,
         "timeout": 120.0,
         "temperature": None,
@@ -2543,6 +2595,7 @@ def _normalize_defaults(raw: Any) -> dict[str, Any]:
         "shell_fallback",
         "confirm",
         "thinking",
+        "plan_mode",
         "plain",
         "verbose_tools",
         "skills",
@@ -2562,6 +2615,15 @@ def _normalize_defaults(raw: Any) -> dict[str, Any]:
             defaults[key] = raw[key]
         elif raw[key] is not None:
             warn(f"{key} must be true or false")
+
+    if "plan_guard" in raw:
+        value = raw["plan_guard"]
+        if isinstance(value, str) and value.strip() in PLAN_GUARD_MODES:
+            defaults["plan_guard"] = value.strip()
+        elif value is not None:
+            warn(
+                "plan_guard must be one of: " + ", ".join(PLAN_GUARD_MODES)
+            )
 
     if "cwd" in raw:
         value = raw["cwd"]
@@ -3635,6 +3697,10 @@ def resolve_settings(args: Any, config: dict[str, Any]) -> None:
     args.confirm = bool(pick("confirm", False))
     args.thinking = bool(pick("thinking", False))
     args.reasoning = pick("reasoning", None)
+    args.plan_mode = bool(pick("plan_mode", False))
+    args.plan_guard = str(pick("plan_guard", "off") or "off")
+    if args.plan_guard not in PLAN_GUARD_MODES:
+        args.plan_guard = "off"
     args.max_steps = int(pick("max_steps", 100))
     args.timeout = float(pick("timeout", 120.0))
     args.temperature = pick("temperature", None)
@@ -3720,6 +3786,8 @@ def settings_from_runtime(
         "confirm": bool(workspace.confirm),
         "thinking": bool(show_thinking),
         "reasoning": reasoning.label if reasoning is not None else None,
+        "plan_mode": bool(workspace.plan_mode),
+        "plan_guard": str(workspace.plan_guard),
         "max_steps": int(args.max_steps),
         "timeout": float(args.timeout),
         "temperature": args.temperature,
@@ -6132,6 +6200,7 @@ def build_system_prompt(
     scheduler_enabled: bool = False,
     scheduled_run: bool = False,
     memory_enabled: bool = False,
+    plan_mode: bool = False,
 ) -> str:
     prompt = SYSTEM_PROMPT.format(
         root=root,
@@ -6141,6 +6210,44 @@ def build_system_prompt(
         mode_note=_prompt_mode_note(mode),
     )
     sections: list[str] = []
+    sections.append(
+        "工作模式：\n"
+        "- 默认是执行模式：直接完成任务。\n"
+        "- 计划模式：先调查、再给计划、等用户批准后才动手。计划模式不削减工具能力，"
+        "读写和命令都能用；区别在于这一轮只做调查和规划，不实现。\n"
+        "- 你会收到一条明确说明当前模式的指令，按它行事。\n"
+        "- 用户说“直接做”“不用计划”“就改吧”时，不要坚持要计划，按要求执行。"
+    )
+    if plan_mode:
+        sections.append(
+            "当前处于计划模式。本轮目标是调查清楚并给出可执行计划，不要动手实现。\n"
+            "\n"
+            "可以做的：\n"
+            "- 读文件、搜内容、列目录（read_file / search / glob / list_dir）。\n"
+            "- 运行命令了解现状：看文件内容、查日志、看 git 状态和差异、跑构建或测试看报错、"
+            "查依赖版本、探测接口行为。这些命令即使会生成临时产物或构建缓存也可以跑。\n"
+            "- 读技能说明和参考文档。\n"
+            "\n"
+            "不要做的：\n"
+            "- 不要写或改工作区里的文件（不用 write_file / edit_file，"
+            "不用 > 重定向、sed -i、tee 覆盖）。\n"
+            "- 不要删除、移动、重命名文件。\n"
+            "- 不要安装或升级依赖（npm install / pip install / brew install / apt install）。\n"
+            "- 不要改变 git 状态（commit / checkout / reset / stash / push / clean / restore）。\n"
+            "- 不要改系统配置、注册服务、起常驻进程或后台服务。\n"
+            "- 不要写数据库，不要调用会改变远端状态的接口。\n"
+            "- 不要创建或修改定时任务。\n"
+            "\n"
+            "例外：如果某条调查命令确实必须产生副作用才能得到结论（例如必须跑一次构建"
+            "才能看到编译错误、必须起一次服务才能复现接口问题），就在计划里写清楚这条命令、"
+            "为什么需要它、会改什么，在批准环节一并确认。\n"
+            "\n"
+            "结束方式：\n"
+            "- 调查充分后调用 submit_plan 提交计划，然后停下等用户批准，不要继续实现。\n"
+            "- 计划必须包含：目标；步骤（每步做什么、改哪个文件、跑什么命令）；"
+            "风险与影响范围；验证方式（跑什么测试或命令算通过）。\n"
+            "- 提交后不要再调用任何写操作或会改状态的命令。"
+        )
     if skills:
         lines = ["可用技能（任务匹配时先调用 load_skill 读取完整说明）："]
         for skill in sorted(skills.values(), key=lambda item: item["name"]):
@@ -6261,6 +6368,53 @@ SCHEDULE_TOOL_NAMES = frozenset({
     "run_schedule_now",
     "schedule_history",
 })
+
+# Plan mode guard levels: off (prompt only), approve, deny.
+PLAN_GUARD_MODES = ("off", "approve", "deny")
+
+# Tools that always change state and never go through Workspace._approve.
+# run_command is not listed here: whether it mutates depends on the command,
+# so it is judged inside run_command with is_read_only_command().
+PLAN_GUARDED_TOOL_NAMES = frozenset({
+    "remember",
+    "save_episode",
+    "generate_daily_episode",
+    "create_schedule",
+    "delete_schedule",
+    "enable_schedule",
+    "run_schedule_now",
+    "job_cancel",
+})
+
+SUBMIT_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "submit_plan",
+        "description": (
+            "Submit an implementation plan for the user's approval. Call this "
+            "once, after the investigation is complete and BEFORE making any "
+            "change. The agent then stops and waits for the user to approve. "
+            "Only available in plan mode."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "string",
+                    "description": (
+                        "Markdown plan: 目标 / 步骤（每步做什么、改哪个文件、跑什么命令）/ "
+                        "风险与影响范围 / 验证方式"
+                    ),
+                },
+                "questions": {
+                    "type": "string",
+                    "description": "需要用户拍板的问题（可选）",
+                },
+            },
+            "required": ["plan"],
+        },
+    },
+}
 
 SCHEDULE_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -6544,8 +6698,10 @@ SWITCH_SHELL_SCHEMA: dict[str, Any] = {
     "function": {
         "name": "switch_shell",
         "description": (
-            "Switch the shell used by run_command and skill scripts for the rest of "
-            "this session. Use list_shells first when unsure."
+            "Switch the default shell used by run_command and skill scripts for the "
+            "rest of this session. Use list_shells first when unsure. To run a single "
+            "command with a different shell without changing the default, pass the "
+            "shell parameter of run_command instead."
         ),
         "parameters": {
             "type": "object",
@@ -6597,8 +6753,26 @@ def tool_schemas(workspace: "Workspace") -> list[dict[str, Any]]:
                     "build/test/install 60-180, large task up to "
                     f"{workspace.max_command_timeout}."
                 )
+                shell_hint = shell_choice_hint(workspace.shell_state)
+                if shell_hint:
+                    tool["function"]["parameters"]["properties"]["shell"][
+                        "description"
+                    ] = shell_hint
+                tool["function"]["description"] = (
+                    "Run a shell command in the workspace root. Requires user approval. "
+                    "Always estimate duration and set timeout_seconds. Do not run servers, "
+                    "daemons, tail -f, watch, or interactive programs in the foreground. "
+                    "Write the command in the syntax of the shell you select: "
+                    + shell_hint
+                )
             tools.append(tool)
-        tools.append(LIST_SHELLS_SCHEMA)
+        list_shells = copy.deepcopy(LIST_SHELLS_SCHEMA)
+        list_shells["function"]["description"] = (
+            "List detected shells and show the current shell with full paths. "
+            "Use this to pick the right shell for a command when run_command's "
+            "shell parameter lists several options."
+        )
+        tools.append(list_shells)
         tools.append(SWITCH_SHELL_SCHEMA)
         if workspace.allow_shell and not workspace.scheduled_run:
             tools.extend(JOB_SCHEMAS)
@@ -6614,6 +6788,8 @@ def tool_schemas(workspace: "Workspace") -> list[dict[str, Any]]:
             tools.append(RUN_SKILL_SCRIPT_SCHEMA)
     if workspace.scheduler is not None and not workspace.scheduled_run:
         tools.extend(SCHEDULE_SCHEMAS)
+    if workspace.plan_mode:
+        tools.append(SUBMIT_PLAN_SCHEMA)
     return tools
 
 
@@ -6775,6 +6951,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "With background=true, follow progress until completion. "
                             "Defaults to true in interactive CLI/web mode. "
                             "Ctrl+C/stop stops following but leaves the job running."
+                        ),
+                    },
+                    "shell": {
+                        "type": "string",
+                        "description": (
+                            "Shell to run this command with, e.g. git-bash, pwsh, cmd. "
+                            "Omit to use the default shell. When set, the command must "
+                            "use that shell's syntax and no automatic fallback is tried."
                         ),
                     },
                 },
@@ -7775,6 +7959,9 @@ class Workspace:
         self.read_only = False
         self.memory_only = False
         self.scheduled_run = False
+        self.plan_mode = False
+        self.plan_guard = "off"
+        self.plan_result: dict[str, Any] | None = None
         self.scheduler: "SchedulerService | None" = None
         self.memory: "MemoryService | None" = None
 
@@ -7797,12 +7984,39 @@ class Workspace:
         return full
 
     def _approve(self, action: str, detail: str, read_only: bool = False) -> bool:
-        if read_only or not self.confirm:
+        if read_only:
+            return True
+        if self.plan_mode and self.plan_guard != "off":
+            return self._plan_guard(action, detail)
+        if not self.confirm:
             return True
         if not self.interactive:
             print(f"[denied] {action} needs approval: {detail}", file=sys.stderr)
             return False
         print(f"\n[approval] {action}: {detail}", flush=True)
+        try:
+            answer = input("Allow? [Y/n] ")
+        except EOFError:
+            return False
+        return answer.strip().lower() not in ("n", "no")
+
+    def _plan_guard(self, action: str, detail: str) -> bool:
+        """Gate state-changing actions while plan mode is on."""
+        if self.plan_guard == "deny":
+            raise ToolError(
+                f"plan mode: {action} is blocked by the plan guard (deny). "
+                "Investigate and submit a plan first; the user can approve it "
+                "to continue."
+            )
+        # approve tier: web mode has no way to ask without blocking the
+        # request thread, so ask the model to relay the request instead.
+        if self.prompt_mode == "web" or not self.interactive:
+            raise ToolError(
+                f"plan mode: {action} needs explicit approval and nobody can "
+                "confirm it here. Tell the user exactly what you want to do "
+                "and ask them to approve the plan before you continue."
+            )
+        print(f"\n[plan approval] {action}: {detail}", flush=True)
         try:
             answer = input("Allow? [Y/n] ")
         except EOFError:
@@ -7995,6 +8209,23 @@ class Workspace:
         except OSError as exc:
             raise ToolError(str(exc)) from exc
         return f"wrote {len(content)} characters to {self._display(full)}"
+
+    def submit_plan(self, plan: str, questions: str = "") -> str:
+        """Record a plan and let the caller stop the agent loop for approval."""
+        if not self.plan_mode:
+            raise ToolError(
+                "submit_plan is only available in plan mode; "
+                "ask the user to enable it first (CLI: /plan on)"
+            )
+        text = (plan or "").strip()
+        if not text:
+            raise ToolError("plan must not be empty")
+        self.plan_result = {
+            "plan": text,
+            "questions": (questions or "").strip(),
+            "approved": False,
+        }
+        return "plan submitted; waiting for the user's approval"
 
     def edit_file(
         self,
@@ -8351,12 +8582,24 @@ class Workspace:
         timeout_seconds: int | None = None,
         background: bool = False,
         follow: bool | None = None,
+        shell: str | None = None,
     ) -> str:
         if not self.allow_shell:
             raise ToolError("the run_command tool is disabled")
         if not command.strip():
             raise ToolError("command must not be empty")
         current = self.shell_state.current
+        explicit = False
+        if shell is not None and str(shell).strip():
+            requested = str(shell).strip()
+            try:
+                current, _available = select_shell(
+                    requested,
+                    existing=self.shell_state.available,
+                )
+            except ShellError as exc:
+                raise ToolError(str(exc)) from exc
+            explicit = True
         read_only = is_read_only_command(command, current.kind)
         if not self._approve("run_command", command, read_only=read_only):
             raise ToolError("permission denied by user")
@@ -8383,7 +8626,7 @@ class Workspace:
             )
 
         candidates: list[ShellInfo] = [current]
-        if self.shell_fallback:
+        if self.shell_fallback and not explicit:
             seen = {os.path.normcase(os.path.realpath(current.path))}
             for item in self.shell_state.available:
                 key = os.path.normcase(os.path.realpath(item.path))
@@ -8479,19 +8722,38 @@ class Workspace:
             for candidate, result in attempts
         ]
         details.extend(f"{candidate.name}: {error}" for candidate, error in launch_errors)
-        if attempts:
+        if explicit:
+            reason = (
+                f"the selected shell {current.name} did not recognize the command; "
+                "it may not be installed, may be misspelled, or may use a different "
+                "syntax than this shell"
+            )
+            suggestion = (
+                "retry with a different shell (see the shell parameter for available "
+                "options) or rewrite the command in "
+                f"{current.name} syntax"
+            )
+            # No fallback was tried, so the note must not be labelled as one.
+            prefix = "[shell] "
+        elif attempts:
             reason = (
                 "no available shell recognized the command; "
                 "it may not be installed, may be misspelled, or may use unsupported syntax"
             )
+            suggestion = "install the missing tool, check spelling, or use switch_shell"
+            prefix = ""
         else:
             reason = "no available shell could be started; check the shell installation"
+            suggestion = "install the missing tool, check spelling, or use switch_shell"
+            prefix = ""
         note = (
-            "tried: "
+            prefix
+            + "tried: "
             + " | ".join(details)
             + "; reason: "
             + reason
-            + "; suggestion: install the missing tool, check spelling, or use switch_shell"
+            + "; suggestion: "
+            + suggestion
         )
         if skipped:
             note += "; fallback skipped without approval: " + ", ".join(skipped)
@@ -8593,6 +8855,12 @@ class Workspace:
             raise ToolError(f"tool {name} is disabled for this read-only task")
         if self.scheduled_run and name in SCHEDULE_TOOL_NAMES:
             raise ToolError("scheduled task tools are disabled inside a scheduled run")
+        if (
+            self.plan_mode
+            and self.plan_guard != "off"
+            and name in PLAN_GUARDED_TOOL_NAMES
+        ):
+            self._plan_guard(name, json.dumps(arguments, ensure_ascii=False)[:200])
         handlers = {
             "list_dir": self.list_dir,
             "read_file": self.read_file,
@@ -8600,6 +8868,7 @@ class Workspace:
             "glob": self.glob,
             "write_file": self.write_file,
             "edit_file": self.edit_file,
+            "submit_plan": self.submit_plan,
             "run_command": self.run_command,
             "job_status": self.job_status,
             "job_output": self.job_output,
@@ -10492,6 +10761,9 @@ def run_turn(
             print(_style(f"  [result] {indented}", DIM, supports_color()), flush=True)
         elif kind == "usage":
             print(_style(f"  {text}", DIM, supports_color()), file=sys.stderr, flush=True)
+        elif kind == "plan":
+            for line in (text or "").splitlines():
+                print(_style(f"  {line}", DIM, supports_color()), flush=True)
         elif kind == "warning":
             print(_style(f"  {text}", YELLOW, supports_color()), file=sys.stderr, flush=True)
         elif kind.startswith("job_"):
@@ -10630,6 +10902,12 @@ def run_turn(
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
                 if verbose_tools:
                     report("tool_result", _clip_tool_text(result))
+                if workspace.plan_result is not None:
+                    break
+
+            if workspace.plan_result is not None:
+                report("plan", workspace.plan_result.get("plan", ""))
+                return True
 
         print(f"[stopped] reached the limit of {max_steps} model calls without a final answer", file=sys.stderr)
         return False
@@ -10934,6 +11212,7 @@ def print_help() -> None:
     print("          /reset, /compact [N] | auto ... | idle ..., /skill [name [question]],")
     print("          /image [path|clear], /save [--tool] [--thinking] [file],")
     print("          /confirm on|off, /thinking on|off, /reasoning provider:level,")
+    print("          /plan [on|off|guard off|approve|deny],")
     print("          /model [name|number|list|list all|info|config|use <conn> [model]], /context,")
     print("          /shell [name|path|list|auto],")
     print("          /session [list|new|use <id>|export <id>|rename|delete|info],")
@@ -11143,6 +11422,16 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .compact-body h1, .compact-body h2, .compact-body h3 { margin: 8px 0 4px; font-size: 14px; }
 .compact-body ul, .compact-body ol { margin: 6px 0; padding-left: 22px; }
 .compact-body code { background: #f4f5f7; padding: 1px 4px; border-radius: 4px; }
+.plan { align-self: stretch; margin: -2px 0 12px; padding: 10px 12px; border: 1px solid #b9d2ff; border-radius: 8px; background: #f5f8ff; color: #344054; font-size: 13px; white-space: normal; }
+.plan-title { font-weight: 600; color: #2b5cd9; margin-bottom: 6px; }
+.plan-body h1, .plan-body h2, .plan-body h3 { margin: 8px 0 4px; font-size: 14px; }
+.plan-body ul, .plan-body ol { margin: 6px 0; padding-left: 22px; }
+.plan-body code { background: #eef2ff; padding: 1px 4px; border-radius: 4px; }
+.plan-actions { display: flex; gap: 8px; margin-top: 10px; }
+.plan-actions button { padding: 4px 12px; border: 1px solid #c9ced6; border-radius: 6px; background: #fff; color: #344054; cursor: pointer; font: inherit; font-size: 12px; }
+.plan-actions button.primary { border-color: #4a6cf7; background: #4a6cf7; color: #fff; }
+.plan-actions button:hover { filter: brightness(0.97); }
+.plan-actions button[disabled] { opacity: 0.6; cursor: default; }
 #status { min-height: 20px; padding: 0 18px; color: #8a919c; }
 #composer { border-top: 1px solid #e3e6ea; background: #fff; padding: 12px 18px; }
 #input { width: 100%; height: 72px; resize: vertical; padding: 8px; border: 1px solid #c9ced6; border-radius: 6px; font: inherit; }
@@ -11297,6 +11586,12 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         <span id="files-label"></span>
         <label class="toggle"><input type="checkbox" id="stream-toggle" checked> 流式输出</label>
         <label class="toggle"><input type="checkbox" id="thinking-toggle"> 显示思考</label>
+        <label class="toggle"><input type="checkbox" id="plan-toggle"> 计划模式</label>
+        <select id="plan-guard" title="计划模式守卫">
+          <option value="off">守卫:关</option>
+          <option value="approve">守卫:确认</option>
+          <option value="deny">守卫:拒绝</option>
+        </select>
         <select id="reasoning" title="思考等级">
           <option value="">默认</option>
           <optgroup label="DeepSeek">
@@ -11469,6 +11764,20 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         <tr><td>/jobs lines 5</td><td>设置跟随显示行数</td></tr>
       </table>
 
+      <h3>计划模式</h3>
+      <table class="help-table">
+        <tr><td>/plan</td><td>查看当前模式和守卫档位</td></tr>
+        <tr><td>/plan on</td><td>进入计划模式：先调查、出计划，等批准后再动手</td></tr>
+        <tr><td>/plan off</td><td>退出计划模式</td></tr>
+        <tr><td>/plan guard off</td><td>守卫关：只靠提示词约束，工具全部可用</td></tr>
+        <tr><td>/plan guard approve</td><td>守卫需确认：改状态的操作要用户批准</td></tr>
+        <tr><td>/plan guard deny</td><td>守卫拒绝：计划模式下禁止改状态的操作</td></tr>
+      </table>
+      <div class="help-note">
+        输入框下方的「计划模式」和「守卫」下拉框是同一套开关。计划模式下工具不会被削减，
+        模型靠提示词约束只做调查；提交计划后会显示「批准执行」按钮。
+      </div>
+
       <h3>连接、模型和 Shell</h3>
       <table class="help-table">
         <tr><td>/connect</td><td>打开连接设置</td></tr>
@@ -11639,6 +11948,8 @@ const stopEl = document.getElementById("stop");
 const compactEl = document.getElementById("compact");
 const thinkingToggleEl = document.getElementById("thinking-toggle");
 const streamToggleEl = document.getElementById("stream-toggle");
+const planToggleEl = document.getElementById("plan-toggle");
+const planGuardEl = document.getElementById("plan-guard");
 const settingsGroupEl = document.getElementById("settings-group");
 const toolsGroupEl = document.getElementById("tools-group");
 const settingsSummaryEl = document.getElementById("settings-summary");
@@ -12159,6 +12470,51 @@ function addMarkdown(text) {
   div.className = "msg assistant";
   div.innerHTML = renderMarkdown(text);
   logEl.appendChild(div);
+  scrollLog(true);
+}
+
+function addPlanBlock(text) {
+  const wrapped = document.createElement("div");
+  wrapped.className = "plan";
+  const title = document.createElement("div");
+  title.className = "plan-title";
+  title.textContent = "📋 计划";
+  const body = document.createElement("div");
+  body.className = "plan-body";
+  body.innerHTML = renderMarkdown(text || "");
+  const actions = document.createElement("div");
+  actions.className = "plan-actions";
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.className = "primary";
+  approve.textContent = "批准执行";
+  approve.onclick = async () => {
+    approve.disabled = true;
+    reject.textContent = "已批准";
+    reject.disabled = true;
+    try {
+      await setPlanMode(false);
+      statusEl.textContent = "计划已批准，正在执行";
+      await send("计划已批准，请按上面的计划执行。");
+    } catch (err) {
+      statusEl.textContent = String(err);
+      approve.disabled = false;
+    }
+  };
+  const reject = document.createElement("button");
+  reject.type = "button";
+  reject.textContent = "继续规划";
+  reject.onclick = () => {
+    actions.textContent = "";
+    statusEl.textContent = "继续规划：补充说明或修改计划";
+    inputEl.focus();
+  };
+  actions.appendChild(approve);
+  actions.appendChild(reject);
+  wrapped.appendChild(title);
+  wrapped.appendChild(body);
+  wrapped.appendChild(actions);
+  logEl.appendChild(wrapped);
   scrollLog(true);
 }
 
@@ -12741,6 +13097,13 @@ function applyRuntimeSettings(data) {
   if (typeof data.stream === "boolean") {
     streamToggleEl.checked = data.stream;
   }
+  if (typeof data.plan_mode === "boolean") {
+    planToggleEl.checked = data.plan_mode;
+  }
+  if (data.plan_guard) {
+    planGuardEl.value = data.plan_guard;
+  }
+  planGuardEl.disabled = !planToggleEl.checked;
   const reasoning = data.reasoning || {};
   const label = reasoning.label || "";
   const apiFormat = data.api_format || "openai-chat-completions";
@@ -12781,6 +13144,68 @@ streamToggleEl.onchange = async () => {
     statusEl.textContent = String(err);
   }
 };
+
+async function setPlanMode(enabled, guard) {
+  const payload = { enabled: enabled };
+  if (guard) payload.guard = guard;
+  const data = await api("/api/plan", payload);
+  planToggleEl.checked = data.plan_mode;
+  planGuardEl.value = data.plan_guard;
+  planGuardEl.disabled = !data.plan_mode;
+  statusEl.textContent = "计划模式: " + (data.plan_mode ? "on" : "off")
+    + " | 守卫: " + data.plan_guard;
+  return data;
+}
+
+planToggleEl.onchange = async () => {
+  try {
+    await setPlanMode(planToggleEl.checked);
+  } catch (err) {
+    planToggleEl.checked = !planToggleEl.checked;
+    statusEl.textContent = String(err);
+  }
+};
+
+planGuardEl.onchange = async () => {
+  const previous = planGuardEl.value;
+  try {
+    await setPlanMode(planToggleEl.checked, planGuardEl.value);
+  } catch (err) {
+    planGuardEl.value = previous;
+    statusEl.textContent = String(err);
+  }
+};
+
+async function handlePlanCommand(argument) {
+  const parts = argument.split(/\s+/).filter(Boolean);
+  if (parts[0] === "guard") {
+    const guard = (parts[1] || "").toLowerCase();
+    if (!guard) {
+      statusEl.textContent = "守卫: " + planGuardEl.value;
+      return;
+    }
+    if (!["off", "approve", "deny"].includes(guard)) {
+      statusEl.textContent = "用法: /plan guard off|approve|deny";
+      return;
+    }
+    try {
+      await setPlanMode(planToggleEl.checked, guard);
+    } catch (err) {
+      statusEl.textContent = String(err);
+    }
+    return;
+  }
+  if (parts[0] === "on" || parts[0] === "off") {
+    try {
+      await setPlanMode(parts[0] === "on");
+    } catch (err) {
+      statusEl.textContent = String(err);
+    }
+    return;
+  }
+  statusEl.textContent = "计划模式: " + (planToggleEl.checked ? "on" : "off")
+    + " | 守卫: " + planGuardEl.value;
+}
 
 reasoningEl.onchange = async () => {
   const previous = currentReasoning;
@@ -13538,50 +13963,57 @@ async function handleJobsCommand(argument) {
   }
 }
 
-async function send() {
-  const text = inputEl.value.trim();
+async function send(explicitText) {
+  const auto = typeof explicitText === "string";
+  const text = auto ? explicitText : inputEl.value.trim();
   if ((!text && uploads.length === 0) || reading > 0 || sendEl.disabled) return;
   if (!token) { statusEl.textContent = "缺少 token"; return; }
-  if (/^\/help\s*$/.test(text)) {
+  if (!auto && /^\/help\s*$/.test(text)) {
     inputEl.value = "";
     openHelpModal();
     return;
   }
-  const jobsMatch = text.match(/^\/jobs(?:\s+(.*))?$/);
+  const jobsMatch = auto ? null : text.match(/^\/jobs(?:\s+(.*))?$/);
   if (jobsMatch) {
     inputEl.value = "";
     handleJobsCommand(jobsMatch[1] || "");
     return;
   }
-  const streamMatch = text.match(/^\/stream(?:\s+(.*))?$/);
+  const streamMatch = auto ? null : text.match(/^\/stream(?:\s+(.*))?$/);
   if (streamMatch) {
     inputEl.value = "";
     handleStreamCommand(streamMatch[1] || "");
     return;
   }
-  const sessionMatch = text.match(/^\/session(?:\s+(.*))?$/);
+  const sessionMatch = auto ? null : text.match(/^\/session(?:\s+(.*))?$/);
   if (sessionMatch) {
     inputEl.value = "";
     handleSessionCommand(sessionMatch[1] || "");
     return;
   }
-  if (/^\/status$/.test(text)) {
+  if (!auto && /^\/status$/.test(text)) {
     inputEl.value = "";
     handleStatusCommand();
     return;
   }
-  const shellMatch = text.match(/^\/shell(?:\s+(.*))?$/);
+  const shellMatch = auto ? null : text.match(/^\/shell(?:\s+(.*))?$/);
   if (shellMatch) {
     inputEl.value = "";
     handleShellCommand(shellMatch[1] || "");
     return;
   }
-  if (/^\/connect(?:\s+.*)?$/.test(text)) {
+  const planMatch = auto ? null : text.match(/^\/plan(?:\s+(.*))?$/);
+  if (planMatch) {
+    inputEl.value = "";
+    handlePlanCommand(planMatch[1] || "");
+    return;
+  }
+  if (!auto && /^\/connect(?:\s+.*)?$/.test(text)) {
     inputEl.value = "";
     openConnectModal();
     return;
   }
-  const compactMatch = text.match(/^\/compact(?:\s+(\d+))?$/);
+  const compactMatch = auto ? null : text.match(/^\/compact(?:\s+(\d+))?$/);
   if (compactMatch) {
     inputEl.value = "";
     compactContext(compactMatch[1] ? parseInt(compactMatch[1], 10) : 2);
@@ -13590,11 +14022,13 @@ async function send() {
   const images = uploads.slice();
   const previousSession = currentSession;
   addUserMessage(text, images);
-  inputEl.value = "";
-  uploads = [];
-  filesEl.value = "";
-  filesLabel.textContent = "";
-  renderPreviews();
+  if (!auto) {
+    inputEl.value = "";
+    uploads = [];
+    filesEl.value = "";
+    filesLabel.textContent = "";
+    renderPreviews();
+  }
   sendEl.disabled = true;
   lastToolDetail = null;
   streamBubble = null;
@@ -13650,6 +14084,11 @@ async function send() {
         else if (event.type === "tool_result") {
           finishStreamBubble();
           addToolResult(event.text);
+        }
+        else if (event.type === "plan") {
+          finishStreamBubble();
+          endStreamThinking();
+          addPlanBlock(event.text);
         }
         else if (event.type === "thinking") {
           finishStreamBubble();
@@ -13817,6 +14256,7 @@ def run_web(
             workspace.prompt_mode,
             scheduler_enabled=scheduler is not None,
             memory_enabled=workspace.memory is not None,
+            plan_mode=workspace.plan_mode,
         ),
     }
     state: dict[str, Any] = {
@@ -13829,6 +14269,29 @@ def run_web(
     runtime: dict[str, Any] = {"client": client, "connection": connection}
     config_state: dict[str, Any] = {"config": config}
     tools = tool_schemas(workspace)
+
+    def apply_plan_mode(enabled: bool, guard: str | None = None) -> None:
+        """Switch plan mode and refresh the system prompt and the tool list."""
+        nonlocal tools, system_message
+        workspace.plan_mode = enabled
+        workspace.plan_result = None
+        if guard is not None:
+            workspace.plan_guard = guard
+        tools = tool_schemas(workspace)
+        system_message = {
+            "role": "system",
+            "content": build_system_prompt(
+                workspace.root,
+                workspace.skills,
+                workspace.shell_state,
+                workspace.prompt_mode,
+                scheduler_enabled=scheduler is not None,
+                memory_enabled=workspace.memory is not None,
+                plan_mode=workspace.plan_mode,
+            ),
+        }
+        with lock:
+            state["messages"] = [system_message] + state["messages"][1:]
 
     def current_model_info() -> ModelInfo:
         with config_lock:
@@ -14295,6 +14758,8 @@ def run_web(
                     },
                     "model_info": current_info.to_dict(),
                     "context": context_state,
+                    "plan_mode": bool(workspace.plan_mode),
+                    "plan_guard": str(workspace.plan_guard),
                 })
                 return
             self._error(404, "not found")
@@ -14697,6 +15162,25 @@ def run_web(
                 # long-running chat that holds the main lock.
                 state["show_thinking"] = show
                 self._json(200, {"show_thinking": show})
+                return
+
+            if parsed.path == "/api/plan":
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    self._error(400, "enabled must be a boolean")
+                    return
+                guard = payload.get("guard")
+                if guard is not None and guard not in PLAN_GUARD_MODES:
+                    self._error(
+                        400,
+                        "guard must be one of: " + ", ".join(PLAN_GUARD_MODES),
+                    )
+                    return
+                apply_plan_mode(enabled, guard)
+                self._json(200, {
+                    "plan_mode": workspace.plan_mode,
+                    "plan_guard": workspace.plan_guard,
+                })
                 return
 
             if parsed.path == "/api/reasoning":
@@ -15269,6 +15753,30 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "thinking control: deepseek|kimi|minimax|openai|anthropic : "
             "off|minimal|low|medium|high|max (default: send nothing)"
+        ),
+    )
+    plan_group = parser.add_mutually_exclusive_group()
+    plan_group.add_argument(
+        "--plan",
+        dest="plan_mode",
+        action="store_true",
+        default=None,
+        help="start in plan mode: investigate and submit a plan before changing anything",
+    )
+    plan_group.add_argument(
+        "--no-plan",
+        dest="plan_mode",
+        action="store_false",
+        help="do not start in plan mode",
+    )
+    parser.add_argument(
+        "--plan-guard",
+        dest="plan_guard",
+        choices=PLAN_GUARD_MODES,
+        default=None,
+        help=(
+            "plan mode guard: off (prompt only, default), approve (ask before "
+            "state-changing actions), deny (block them)"
         ),
     )
     auto_compact_group = parser.add_mutually_exclusive_group()
@@ -15869,6 +16377,8 @@ def main(argv: list[str] | None = None) -> int:
         discover_skills(workspace.root, only_own=args.only_own_skills) if args.skills else {}
     )
     workspace.allow_skill_scripts = args.skills and args.skill_scripts
+    workspace.plan_mode = bool(args.plan_mode)
+    workspace.plan_guard = str(args.plan_guard or "off")
     if args.web:
         workspace.prompt_mode = "web"
     elif args.prompt or args.image:
@@ -16011,6 +16521,7 @@ def main(argv: list[str] | None = None) -> int:
                 workspace.prompt_mode,
                 scheduler_enabled=scheduler is not None,
                 memory_enabled=memory is not None,
+                plan_mode=workspace.plan_mode,
             ),
         }
     ]
@@ -16026,6 +16537,57 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
             print(f"resumed session: {os.path.basename(session.path)} ({len(messages) - 1} messages)")
+
+    def apply_plan_mode(enabled: bool) -> None:
+        """Switch plan mode and refresh the system prompt and the tool list."""
+        nonlocal tools
+        workspace.plan_mode = enabled
+        workspace.plan_result = None
+        messages[0] = {
+            "role": "system",
+            "content": build_system_prompt(
+                workspace.root,
+                workspace.skills,
+                workspace.shell_state,
+                workspace.prompt_mode,
+                scheduler_enabled=scheduler is not None,
+                memory_enabled=memory is not None,
+                plan_mode=workspace.plan_mode,
+            ),
+        }
+        tools = tool_schemas(workspace)
+
+    def run_current_turn() -> None:
+        run_turn(
+            client, workspace, messages, args.max_steps, render_output,
+            show_thinking, session,
+            tools=tools,
+            verbose_tools=args.verbose_tools,
+            context_window=model_info.context_window,
+            stream=stream_runtime["current"],
+            stream_flush_ms=args.stream_flush_ms,
+        )
+
+    def approve_pending_plan() -> bool:
+        """Ask the user to approve a submitted plan; execute it when approved."""
+        pending = workspace.plan_result
+        if pending is None or pending.get("approved"):
+            return False
+        print(_style("  计划已提交，等待批准。", DIM, supports_color()), flush=True)
+        questions = str(pending.get("questions") or "").strip()
+        if questions:
+            print(_style(f"  待确认：{questions}", YELLOW, supports_color()), flush=True)
+        try:
+            answer = input("Approve and execute? [Y/n] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer in ("n", "no"):
+            print("计划未批准，保持计划模式；可以补充说明或修改计划。")
+            return False
+        pending["approved"] = True
+        apply_plan_mode(False)
+        messages.append(build_user_message("计划已批准，请按上面的计划执行。"))
+        return True
 
     try:
         if args.prompt or args.image:
@@ -16083,14 +16645,22 @@ def main(argv: list[str] | None = None) -> int:
                     f"({usage['percent']}%); consider /compact",
                     file=sys.stderr,
                 )
-            return 0 if run_turn(
+            ok = run_turn(
                 client, workspace, messages, args.max_steps, render_output, args.thinking, session,
                 tools=tools,
                 verbose_tools=args.verbose_tools,
                 context_window=model_info.context_window,
                 stream=stream_runtime["current"],
                 stream_flush_ms=args.stream_flush_ms,
-            ) else 1
+            )
+            pending = workspace.plan_result
+            if pending is not None:
+                print(
+                    "[plan] plan mode: nothing was executed; "
+                    "re-run without --plan to apply it",
+                    file=sys.stderr,
+                )
+            return 0 if ok else 1
 
         show_thinking = args.thinking
         pending_images: list[str] = []
@@ -16760,6 +17330,24 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 print(f"thinking is {'on' if show_thinking else 'off'}")
                 continue
+            if user_input == "/plan" or user_input.startswith("/plan "):
+                parts = user_input.split()
+                argument = parts[1].lower() if len(parts) > 1 else ""
+                if argument == "guard":
+                    if len(parts) != 3 or parts[2].lower() not in PLAN_GUARD_MODES:
+                        print(f"usage: /plan guard <{'|'.join(PLAN_GUARD_MODES)}>")
+                        continue
+                    workspace.plan_guard = parts[2].lower()
+                elif argument in ("on", "off"):
+                    apply_plan_mode(argument == "on")
+                elif argument:
+                    print("usage: /plan on|off | /plan guard off|approve|deny")
+                    continue
+                print(
+                    f"plan mode: {'on' if workspace.plan_mode else 'off'} | "
+                    f"guard: {workspace.plan_guard}"
+                )
+                continue
             if user_input == "/model" or user_input.startswith("/model "):
                 parts = user_input.split(maxsplit=1)
                 argument = parts[1].strip() if len(parts) > 1 else ""
@@ -17116,14 +17704,9 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             try:
-                run_turn(
-                    client, workspace, messages, args.max_steps, render_output, show_thinking, session,
-                    tools=tools,
-                    verbose_tools=args.verbose_tools,
-                    context_window=model_info.context_window,
-                    stream=stream_runtime["current"],
-                    stream_flush_ms=args.stream_flush_ms,
-                )
+                run_current_turn()
+                if approve_pending_plan():
+                    run_current_turn()
             except ChatError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 print("历史已保留，可以直接重试，或用 /exit 稍后用 -c 恢复", file=sys.stderr)
