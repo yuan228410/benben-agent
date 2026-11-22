@@ -698,6 +698,21 @@ python3 benben-agent.py --auto-compact --auto-compact-level aggressive
 --auto-compact-keep 3
 ```
 
+Web 端可以不重启直接改：侧边栏「压缩设置」，或 `POST /api/compact/config`。请求体形如：
+
+```json
+{
+  "auto": {"enabled": true, "level": "aggressive", "threshold": null, "target_ratio": null, "keep": null},
+  "idle": {"enabled": false, "minutes": 10, "level": null, "min_context_percent": 20, "min_messages": 6},
+  "persist": false
+}
+```
+
+- `null` 表示跟随档位预设；`level` 必须是上表 8 档之一
+- 阈值、目标、保留回合取值 1-100；空闲分钟数 1-1440
+- `persist` 为 `true` 时同时写入 `config.json` 的 `defaults.auto_compact` / `defaults.idle_compact`
+- `GET /api/compact/config` 读取当前档位表、解析后的生效值和原始覆盖值
+
 ### 空闲压缩
 
 默认关闭。开启后，如果距离上一次对话已经超过设定时间，用户下一次发消息前会先压缩旧上下文，再处理新消息：
@@ -1109,11 +1124,35 @@ python3 benben-agent.py --web
 - 输入框下方还有「计划模式」开关和「守卫」下拉框；计划模式下模型提交的计划会渲染成带「批准执行」「继续规划」按钮的计划块，聊天框输入 `/plan` 也能切换；
 - 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；
 - 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
+- 侧边栏「工具与帮助」里显示「压缩设置」，可配置自动压缩和空闲压缩的档位、阈值、目标百分比和保留回合数，改动立即生效，可勾选同时写入配置文件；聊天框输入 `/compact auto` 也会打开这个设置；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
 - 历史会话里的图片默认只显示「点击加载」占位，点击后才请求 `/api/image` 并打开灯箱，避免首屏传输大量 base64；刚上传的图片仍直接显示本地预览；
 - 网页模式强制免确认，`run_command` 是否可用仍由 `--no-shell` 决定；shell 开启时启动会打印提醒；
 - 监听非回环地址会打印警告；
 - `--web` 与位置参数 prompt 同时出现时忽略 prompt 并提示。
+
+### Web 端斜杠命令
+
+Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息发给模型：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/help` | 打开帮助弹窗 |
+| `/status` | 查看连接、模型、上下文、shell 和会话 |
+| `/connect` | 打开连接设置 |
+| `/model` | 查看当前模型和能力 |
+| `/model 名称` | 切换当前连接的模型 |
+| `/model list all` | 列出所有已保存连接和模型 |
+| `/model use 连接 [模型]` | 切换连接，可同时切换模型 |
+| `/shell` `/shell 名称` | 查看或切换 shell |
+| `/session ...` | 会话列表、切换、重命名、导出、删除 |
+| `/jobs ...` | 后台任务列表、状态、输出、跟随、停止 |
+| `/plan ...` | 计划模式开关和守卫档位 |
+| `/stream ...` | 流式输出开关 |
+| `/compact` `/compact N` | 压缩上下文 |
+| `/compact auto` | 打开压缩设置 |
+
+`/model info`、`/model config`、`/memory`、`/schedule`、`/config`、`/confirm`、`/thinking`、`/reasoning`、`/save`、`/image`、`/exit` 是 CLI 专属，Web 用对应按钮或设置项代替。
 
 页面全部内嵌在 `benben-agent.py` 里，无 CDN、无前端构建，离线可用。assistant 回复在流式开启时以纯文本逐块出现，结束后再重绘常用 Markdown（标题、粗体、行内代码、代码块、列表、引用、链接、分隔线和表格），`![](...)` 图片也会直接显示；用户上传的图片在发送后显示缩略图，重新打开历史会话时图片以「点击加载」占位显示。网页通过 `/api/chat/stream` 做 token 级流式：思考、正文、工具调用和每个步骤的中间回答都会逐步出现；关闭流式后事件在完成后一次性返回。旧的 `/api/chat` JSON 接口保留。
 
@@ -1122,16 +1161,28 @@ python3 benben-agent.py --web
 | 工具 | 作用 | 需要批准 |
 | --- | --- | --- |
 | `list_dir` | 列出目录内容 | 否 |
-| `read_file` | 按行读取文本文件（带行号，分页） | 否 |
-| `search` | 在工作区按正则搜索文件内容（返回 `文件:行号: 内容`） | 否 |
+| `read_file` | 按行读取文本文件（带行号，可分页） | 否 |
+| `search` | 在工作区按正则搜索文件内容（`输出=content` 返回 `文件:行号: 内容`；`输出=lines` 只返回 `文件:行号`） | 否 |
 | `glob` | 按通配符查找文件，支持 `**` 递归 | 否 |
 | `write_file` | 创建或覆盖文件 | 是 |
 | `edit_file` | 替换文件中的一段文本（类似 patch） | 是 |
 | `run_command` | 在工作区执行 shell 命令（可用 `shell` 参数指定本次用哪个 shell） | 是 |
+| `list_shells` | 列出检测到的 shell 和当前 shell | 否 |
+| `switch_shell` | 切换默认 shell | 否 |
+| `job_status` | 查看后台任务状态和最近输出 | 否 |
+| `job_output` | 读取后台任务的输出 | 否 |
+| `job_cancel` | 取消后台任务并杀进程树 | 否 |
+| `list_jobs` | 列出后台任务 | 否 |
 | `submit_plan` | 提交实施计划并等待用户批准（仅计划模式下提供） | 否 |
 | `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 否 |
 | `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 否 |
 | `run_skill_script` | 执行技能 `scripts/` 下的脚本（仅在启用脚本且存在脚本时提供） | 是 |
+| `create_schedule` | 创建定时任务（仅启用定时任务时提供） | 是 |
+| `list_schedules` | 列出定时任务（仅启用定时任务时提供） | 否 |
+| `delete_schedule` | 删除定时任务及运行记录（仅启用定时任务时提供） | 是 |
+| `enable_schedule` | 启用或暂停定时任务（仅启用定时任务时提供） | 是 |
+| `run_schedule_now` | 立即排队执行一次定时任务（仅启用定时任务时提供） | 否 |
+| `schedule_history` | 查看定时任务运行记录（仅启用定时任务时提供） | 否 |
 | `remember` | 写入长期记忆（仅启用记忆时提供） | 否 |
 | `recall` | 搜索长期记忆和情景记忆（仅启用记忆时提供） | 否 |
 | `save_episode` | 追加当天情景总结（仅启用记忆时提供） | 否 |
@@ -1139,9 +1190,40 @@ python3 benben-agent.py --web
 | `read_episode` | 读取情景记忆文件（仅启用记忆时提供） | 否 |
 | `generate_daily_episode` | 生成自动日总结（仅启用记忆时提供） | 否 |
 
-`run_command` 的 `timeout_seconds` 是必填参数：快速查询建议 10-30 秒，构建/测试/安装 60-180 秒，最大 300 秒。命令超时或用户按 Ctrl+C 时会杀掉整个进程树，保留已捕获的部分输出，并提示模型提高超时或拆分任务。不要在前台运行服务器、守护进程、`tail -f`、`watch` 或交互式编辑器。
+全部功能开启时共 29 个工具。
+
+`run_command` 的 `timeout_seconds` 是必填参数：快速查询建议 10-30 秒，构建/测试/安装 60-180 秒，最大 600 秒（`--max-command-timeout`）。命令超时或用户按 Ctrl+C 时会杀掉整个进程树，保留已捕获的部分输出，并提示模型提高超时或拆分任务。不要在前台运行服务器、守护进程、`tail -f`、`watch` 或交互式编辑器。
 
 默认不询问，写文件和命令直接执行。加 `--confirm` 后，写文件和会修改状态的命令会询问 `Allow? [Y/n]`（直接回车即允许）；只读命令（grep、tail、ps、df、journalctl、curl 等）任何时候都不询问。判断是保守白名单：未知命令、包装器（sudo、timeout、env）、重定向、命令替换和危险参数都按修改状态处理；`curl` 带 `-o/-d/-X` 等写文件或发数据的参数、`wget` 不带 `-O -`/`--spider` 时都要求批准。标准输入不是终端（例如管道、CI）时直接拒绝，并把原因返回给模型。交互模式里可以随时用 `/confirm on` 和 `/confirm off` 切换。模型最多执行 `--max-steps` 次模型调用，一次性任务达到上限会以退出码 1 结束，交互模式只提示后继续。交互模式下 Ctrl+C 需要连按两次才退出：第一次取消当前输入或中断正在执行的任务，2 秒内再按一次才退出。
+
+### 读取策略
+
+读代码文件不要一段一段地磨。下面是推荐的三步：
+
+1. **先看结构**：用 `search` 配 `pattern="^(class |def )"`、`include="*.py"`、`output="lines"`，一次拿到全部定义的 `文件:行号`。`output="lines"` 只返回行号不带正文，适合先把文件结构铺开。
+2. **再按行号取正文**：用 `read_file` 带上 `offset`/`limit` 精确取需要的段落。
+3. **一次读够**：`read_file` 单次最多 1000 行，能一次读完就别拆；确实读不完再带 `offset` 续读。`numbered=false` 可以拿到不带行号前缀的纯文本，token 更省。
+
+参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `read_file.limit` | `1000` | 一次最多读多少行，硬上限 1000 |
+| `read_file.numbered` | `true` | 是否给每行加行号前缀 |
+| `search.output` | `content` | `content` 返回 `文件:行号: 内容`；`lines` 只返回 `文件:行号` |
+| `search.max_results` | `100` | 最大匹配条数，上限 500 |
+
+系统提示词里也写了对应的预算规则：同一个文件 `read_file` 超过 3 次就要换方法，同一段内容不读第三遍。
+
+### 预览项目
+
+用户说“看下这个项目”“介绍下这个仓库”这类模糊请求时，默认按**预览**处理，只读关键文件，不通读：
+
+1. `list_dir` / `glob` 看清目录结构
+2. 挑 3-8 个关键文件读：README、入口文件、依赖清单、配置文件、主要模块目录
+3. 读完直接给结论：项目做什么、代码怎么组织、从哪跑起来、入口在哪
+
+系统提示词同时约束了：读之前先说明打算读哪几个；够用就停，不要逐个文件读或翻页看实现细节；整轮工具调用控制在十几次以内。用户点名要看的文件或明确要细节时才深入。
 
 ## 图片识别
 
@@ -1171,7 +1253,7 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - HTTP 使用 `urllib.request`，JSON 使用 `json`，命令使用 `subprocess`，没有任何第三方依赖。
 - `429`、`5xx` 和网络错误会按指数退避重试（最多 3 次），遵守 `Retry-After`。
 - 模型返回的工具调用参数如果不是合法 JSON，错误会作为工具结果回传给模型，让它自行修正。
-- 工具结果超过 20000 字符会截断；`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 400 行。
+- 工具结果超过 20000 字符会截断；`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 1000 行。
 - `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，不跟随符号链接逃出工作区；`glob` 在遍历阶段就剪枝，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
 - `write_file`、`edit_file` 和 `/save` 使用同目录临时文件 + `os.replace` 原子替换，中断时不会留下半个文件。
 - 文件路径经过 `realpath` 规范化，符号链接也无法逃逸出 `--cwd`。

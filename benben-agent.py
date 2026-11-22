@@ -191,6 +191,9 @@ schedule_history；启用记忆时增加 remember、recall、save_episode、
 list_episodes、read_episode、generate_daily_episode。
 工具结果默认截断到 20000 字符。
 
+读取大文件建议：先用 search（output="lines"）看结构，再用 read_file 按行号取正文；
+read_file 单次最多 1000 行，不要分很多次小段读。
+
 Shell：启动时自动检测。Linux/macOS 优先 $SHELL，其次系统默认（Linux bash、
 macOS zsh）；Windows 依次检测 pwsh、Windows PowerShell、Git Bash、cmd。
 可用 --shell 指定，交互模式用 /shell 查看或切换。命令被当前 shell 明确判定
@@ -258,7 +261,7 @@ DEFAULT_MODEL = "Deepseek-V4.1-Flash"
 # DeepSeek 官方接口需要在 OPENAI_API_KEY 或 --api-key 中提供 key，不在代码里内置。
 DEFAULT_API_KEY = ""
 MAX_TOOL_OUTPUT = 20_000
-MAX_FILE_LINES = 400
+MAX_FILE_LINES = 1_000
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGES = 4
 MAX_SEARCH_FILE = 2_000_000
@@ -940,8 +943,26 @@ SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你
 - 工具失败时先看 exit code、stderr、路径和权限，再调整后重试；不要原样重复同一条失败命令。
 - 同一命令或工具连续失败两次后停止重试，总结已完成、未完成和下一步；接近最大步数时
   主动收尾，不要无限尝试。
-- 找文件用 glob，按内容搜索用 search；工具调用要小而准，输出可能被截断，read_file 用
-  offset/limit，不要遍历整棵树或整份倾倒日志。
+- 找文件用 glob，按内容搜索用 search；输出可能被截断，read_file 用 offset/limit，
+  不要遍历整棵树或整份倾倒日志。
+- 读代码文件要有预算，不要一段一段地磨：
+  - 动手读之前先花一次调用把结构看清楚：search 配 pattern="^(class |def )"、
+    include="*.py"、output="lines"，一次拿到全部定义的“文件:行号”；再按行号用
+    read_file 精确取正文。
+  - read_file 一次最多能读 {file_lines} 行，能一次读完就别拆；确实读不完再带 offset
+    续读。
+  - 同一个文件 read_file 超过 3 次，说明方法错了：停下来换 search 或一条只读命令，
+    不要继续翻页。
+  - 同一段内容读了两次以上，不要再读第三遍，换个更省事的办法。
+- 预览项目（“看下这个项目”“介绍下这个仓库”“这个项目怎么样”这类请求）只读关键文件，
+  不要通读：
+  - 先 list_dir 或 glob 看清目录结构，再挑关键文件读：README、入口文件、依赖清单、
+    配置文件、主要的模块目录。关键文件一般 3-8 个就够。
+  - 读之前先说明打算读哪几个、为什么读；读完直接给结论，不要顺手再翻别的文件。
+  - 够用就停：能说清“这个项目是干什么的、代码怎么组织、从哪跑起来、入口在哪”就够
+    了。预览不是代码审查，不要逐个文件读，不要翻页看实现细节。
+  - 整轮预览的工具调用控制在十几次以内；超了说明在过度探索，收敛到结论。
+  - 用户点名要看的文件、或明确要细节时再深入；没点名就按预览处理。
 - 用户可能用 /image 或 --image 附上图片；直接依据图片内容回答，不要声称不支持图片。
 - 先用只读命令；除非用户明确要求，不要改变系统状态，也不要执行破坏性命令
   （rm -rf、git reset --hard 等）。
@@ -949,7 +970,7 @@ SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你
   [fallback] reason，向用户解释原因并建议安装工具或更换命令，不要反复重试。
   禁用回退时不会自动切换 shell。
 - 执行可能耗时的命令前，必须主动设置 timeout_seconds 并预估耗时：快速查询 10-30 秒，
-  构建/测试/安装 60-180 秒，大任务最多 300 秒；不要省略超时。
+  构建/测试/安装 60-180 秒，大任务最多 600 秒；不要省略超时。
 - 不要在前台运行会持续不退出的命令，如服务器、守护进程、tail -f、watch、
   交互式编辑器；改用非交互命令、加次数限制，或说明需要后台运行。
 - 命令超时或被用户中断后，先说明已运行时间、部分输出和下一步；不要原样重试。
@@ -5706,16 +5727,42 @@ def compact_history(
     }
 
 
-def auto_compact_config(args: Any) -> dict[str, Any]:
+def auto_compact_raw(args: Any) -> dict[str, Any]:
+    """Unresolved auto-compact settings; None overrides mean "follow the preset"."""
     level = getattr(args, "auto_compact_level", None) or AUTO_COMPACT_DEFAULT_LEVEL
     if level not in AUTO_COMPACT_PRESETS:
         level = AUTO_COMPACT_DEFAULT_LEVEL
-    preset = AUTO_COMPACT_PRESETS[level]
-    threshold = getattr(args, "auto_compact_threshold", None)
-    target = getattr(args, "auto_compact_target", None)
-    keep = getattr(args, "auto_compact_keep", None)
     return {
         "enabled": bool(getattr(args, "auto_compact_enabled", False)),
+        "level": level,
+        "threshold": getattr(args, "auto_compact_threshold", None),
+        "target_ratio": getattr(args, "auto_compact_target", None),
+        "keep": getattr(args, "auto_compact_keep", None),
+    }
+
+
+def idle_compact_raw(args: Any) -> dict[str, Any]:
+    """Unresolved idle-compact settings; a None level means "follow the auto level"."""
+    return {
+        "enabled": bool(getattr(args, "idle_compact_enabled", False)),
+        "minutes": int(getattr(args, "idle_compact_minutes", 10)),
+        "level": getattr(args, "idle_compact_level", None),
+        "min_context_percent": getattr(args, "idle_compact_min_percent", 20),
+        "min_messages": getattr(args, "idle_compact_min_messages", 6),
+    }
+
+
+def resolve_auto_compact(raw: dict[str, Any]) -> dict[str, Any]:
+    """Apply the level preset to unresolved auto-compact settings."""
+    level = raw.get("level") or AUTO_COMPACT_DEFAULT_LEVEL
+    if level not in AUTO_COMPACT_PRESETS:
+        level = AUTO_COMPACT_DEFAULT_LEVEL
+    preset = AUTO_COMPACT_PRESETS[level]
+    threshold = raw.get("threshold")
+    target = raw.get("target_ratio")
+    keep = raw.get("keep")
+    return {
+        "enabled": bool(raw.get("enabled", False)),
         "level": level,
         "threshold": int(preset["threshold"] if threshold is None else threshold),
         "target_ratio": int(preset["target_ratio"] if target is None else target),
@@ -5723,27 +5770,116 @@ def auto_compact_config(args: Any) -> dict[str, Any]:
     }
 
 
-def idle_compact_config(args: Any) -> dict[str, Any]:
-    auto = auto_compact_config(args)
-    level = getattr(args, "idle_compact_level", None) or auto["level"]
+def resolve_idle_compact(
+    raw_auto: dict[str, Any],
+    raw_idle: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the level preset to unresolved idle-compact settings."""
+    auto = resolve_auto_compact(raw_auto)
+    level = raw_idle.get("level") or auto["level"]
     if level not in AUTO_COMPACT_PRESETS:
         level = auto["level"]
     preset = AUTO_COMPACT_PRESETS[level]
-    target = getattr(args, "auto_compact_target", None)
-    keep = getattr(args, "auto_compact_keep", None)
+    target = raw_auto.get("target_ratio")
+    keep = raw_auto.get("keep")
     return {
-        "enabled": bool(getattr(args, "idle_compact_enabled", False)),
-        "minutes": int(getattr(args, "idle_compact_minutes", 10)),
+        "enabled": bool(raw_idle.get("enabled", False)),
+        "minutes": int(raw_idle.get("minutes", 10)),
         "level": level,
-        "target_ratio": int(
-            preset["target_ratio"] if target is None else target
-        ),
+        "target_ratio": int(preset["target_ratio"] if target is None else target),
         "keep": int(preset["keep"] if keep is None else keep),
-        "min_context_percent": int(
-            getattr(args, "idle_compact_min_percent", 20)
-        ),
-        "min_messages": int(getattr(args, "idle_compact_min_messages", 6)),
+        "min_context_percent": int(raw_idle.get("min_context_percent", 20)),
+        "min_messages": int(raw_idle.get("min_messages", 6)),
     }
+
+
+def auto_compact_config(args: Any) -> dict[str, Any]:
+    return resolve_auto_compact(auto_compact_raw(args))
+
+
+def idle_compact_config(args: Any) -> dict[str, Any]:
+    return resolve_idle_compact(auto_compact_raw(args), idle_compact_raw(args))
+
+
+def _compact_override(value: Any, name: str, low: int, high: int) -> int | None:
+    """Validate an optional override; None means "follow the preset"."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ValueError(
+            f"{name} must be an integer between {low} and {high}, or null"
+        )
+    return value
+
+
+def _compact_value(value: Any, name: str, low: int, high: int) -> int:
+    """Validate a plain integer setting."""
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ValueError(f"{name} must be an integer between {low} and {high}")
+    return value
+
+
+def apply_compact_overrides(
+    raw_auto: dict[str, Any],
+    raw_idle: dict[str, Any],
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Merge validated auto/idle overrides into unresolved compact settings."""
+    auto = dict(raw_auto)
+    idle = dict(raw_idle)
+    section = payload.get("auto")
+    if section is not None:
+        if not isinstance(section, dict):
+            raise ValueError("auto must be an object")
+        if "enabled" in section:
+            if not isinstance(section["enabled"], bool):
+                raise ValueError("auto.enabled must be a boolean")
+            auto["enabled"] = section["enabled"]
+        if "level" in section:
+            level = section["level"]
+            if level is not None and level not in AUTO_COMPACT_PRESETS:
+                raise ValueError(
+                    "auto.level must be one of: " + ", ".join(AUTO_COMPACT_PRESETS)
+                )
+            auto["level"] = level or AUTO_COMPACT_DEFAULT_LEVEL
+        if "threshold" in section:
+            auto["threshold"] = _compact_override(
+                section["threshold"], "auto.threshold", 1, 100
+            )
+        if "target_ratio" in section:
+            auto["target_ratio"] = _compact_override(
+                section["target_ratio"], "auto.target_ratio", 1, 100
+            )
+        if "keep" in section:
+            auto["keep"] = _compact_override(section["keep"], "auto.keep", 1, 100)
+    section = payload.get("idle")
+    if section is not None:
+        if not isinstance(section, dict):
+            raise ValueError("idle must be an object")
+        if "enabled" in section:
+            if not isinstance(section["enabled"], bool):
+                raise ValueError("idle.enabled must be a boolean")
+            idle["enabled"] = section["enabled"]
+        if "minutes" in section:
+            idle["minutes"] = _compact_value(
+                section["minutes"], "idle.minutes", 1, 1440
+            )
+        if "level" in section:
+            level = section["level"]
+            if level is not None and level not in AUTO_COMPACT_PRESETS:
+                raise ValueError(
+                    "idle.level must be one of: " + ", ".join(AUTO_COMPACT_PRESETS)
+                )
+            idle["level"] = level
+        if "min_context_percent" in section:
+            idle["min_context_percent"] = _compact_value(
+                section["min_context_percent"], "idle.min_context_percent", 1, 100
+            )
+        if "min_messages" in section:
+            idle["min_messages"] = _compact_value(
+                section["min_messages"], "idle.min_messages", 0, 10000
+            )
+    return auto, idle
 
 
 def print_auto_compact_status(args: Any) -> None:
@@ -6208,6 +6344,7 @@ def build_system_prompt(
         current_date=time.strftime("%Y-%m-%d"),
         shell_section=shell_prompt_section(shell_state),
         mode_note=_prompt_mode_note(mode),
+        file_lines=MAX_FILE_LINES,
     )
     sections: list[str] = []
     sections.append(
@@ -6818,7 +6955,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file inside the workspace, with line numbers.",
+            "description": (
+                "Read a text file inside the workspace, with line numbers. "
+                "One call can return up to the maximum line count, so read as much as "
+                "you need at once instead of paging through the file in many small reads."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -6831,6 +6972,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": f"Maximum number of lines. Default and max {MAX_FILE_LINES}.",
                     },
+                    "numbered": {
+                        "type": "boolean",
+                        "description": (
+                            "Prefix each line with its line number. Default true. "
+                            "Set false to get a plain dump without the number prefix."
+                        ),
+                    },
                 },
                 "required": ["path"],
             },
@@ -6840,7 +6988,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search",
-            "description": "Search file contents with a regex inside the workspace. Skips .git, node_modules and build directories.",
+            "description": (
+                "Search file contents with a regex inside the workspace. Skips .git, node_modules and build directories."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -6855,6 +7005,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "Maximum matching lines. Default 100, max 500.",
                     },
                     "ignore_case": {"type": "boolean", "description": "Case-insensitive search. Default false."},
+                    "output": {
+                        "type": "string",
+                        "description": (
+                            "'content' returns 'file:line: text' (default). "
+                            "'lines' returns only 'file:line' - use it to map a file's structure "
+                            "(for example pattern '^(class |def )' with include '*.py') in one call "
+                            "before deciding what to read."
+                        ),
+                    },
                 },
                 "required": ["pattern"],
             },
@@ -8050,7 +8209,13 @@ class Workspace:
                     break
         return "\n".join(entries) or "(empty directory)"
 
-    def read_file(self, path: str, offset: int = 1, limit: int = MAX_FILE_LINES) -> str:
+    def read_file(
+        self,
+        path: str,
+        offset: int = 1,
+        limit: int = MAX_FILE_LINES,
+        numbered: bool = True,
+    ) -> str:
         full = self._resolve(path)
         if not os.path.isfile(full):
             raise ToolError(f"not a file: {path}")
@@ -8068,8 +8233,14 @@ class Workspace:
             return f"(no lines at offset {offset})"
         if "\x00" in "".join(chunk[:8]):
             raise ToolError("this looks like a binary file; attach pictures with /image or --image")
-        numbered = [f"{number:>5} | {line.rstrip(chr(10))}" for number, line in enumerate(chunk, start=offset)]
-        result = "\n".join(numbered)
+        if numbered:
+            rendered = [
+                f"{number:>5} | {line.rstrip(chr(10))}"
+                for number, line in enumerate(chunk, start=offset)
+            ]
+        else:
+            rendered = [line.rstrip(chr(10)) for line in chunk]
+        result = "\n".join(rendered)
         if more:
             result += "\n... (more lines; use offset to continue)"
         return result
@@ -8081,6 +8252,7 @@ class Workspace:
         include: str = "",
         max_results: int = 100,
         ignore_case: bool = False,
+        output: str = "content",
     ) -> str:
         full = self._resolve(path)
         if not os.path.isdir(full):
@@ -8089,6 +8261,9 @@ class Workspace:
             regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
         except re.error as exc:
             raise ToolError(f"invalid regular expression: {exc}") from exc
+        mode = (output or "content").strip().lower()
+        if mode not in ("content", "lines"):
+            raise ToolError("output must be 'content' or 'lines'")
         limit = max(1, min(int(max_results), 500))
         name_glob = include.strip() or "*"
         hits: list[str] = []
@@ -8129,7 +8304,13 @@ class Workspace:
                             if "\x00" in line:
                                 break
                             if regex.search(line):
-                                hits.append(f"{self._display(file_path)}:{number}: {line.rstrip(chr(10))[:300]}")
+                                if mode == "lines":
+                                    hits.append(f"{self._display(file_path)}:{number}")
+                                else:
+                                    hits.append(
+                                        f"{self._display(file_path)}:{number}: "
+                                        f"{line.rstrip(chr(10))[:300]}"
+                                    )
                                 if len(hits) >= limit:
                                     hits.append(f"... (stopped at {limit} matches)")
                                     return "\n".join(hits)
@@ -11570,6 +11751,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
       <div class="group-body">
         <div class="side-actions">
           <button id="schedules-open" class="link-button" hidden>定时任务</button>
+          <button id="compact-config-open" class="link-button">压缩设置</button>
           <button id="help-open" class="link-button">帮助 / 指令</button>
         </div>
       </div>
@@ -11740,6 +11922,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         <tr><td>/compact</td><td>压缩上下文，保留默认用户回合数</td></tr>
         <tr><td>/compact 3</td><td>压缩后保留最近 3 个用户回合</td></tr>
         <tr><td>/compact 0</td><td>只保留摘要，不保留最近回合</td></tr>
+        <tr><td>/compact auto</td><td>打开压缩设置（自动压缩和空闲压缩）</td></tr>
       </table>
 
       <h3>输出</h3>
@@ -11781,6 +11964,8 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
       <h3>连接、模型和 Shell</h3>
       <table class="help-table">
         <tr><td>/connect</td><td>打开连接设置</td></tr>
+        <tr><td>/model</td><td>查看当前模型和能力</td></tr>
+        <tr><td>/model 名称</td><td>切换当前连接的模型</td></tr>
         <tr><td>/model list all</td><td>列出所有已保存连接和模型</td></tr>
         <tr><td>/model use 连接 [模型]</td><td>切换连接，可同时切换模型</td></tr>
         <tr><td>/status</td><td>查看连接、模型、上下文、shell 和会话</td></tr>
@@ -11788,7 +11973,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         <tr><td>/shell 名称|路径</td><td>切换 shell</td></tr>
         <tr><td>/shell auto</td><td>重新自动检测 shell</td></tr>
       </table>
-      <div class="help-note">模型切换使用侧边栏下拉框；模型能力使用「模型能力」按钮。</div>
+      <div class="help-note">模型切换也可以用侧边栏下拉框；模型能力使用「模型能力」按钮。</div>
 
       <h3>其他入口</h3>
       <table class="help-table">
@@ -11884,6 +12069,63 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
     <div class="modal-actions">
       <button id="schedule-refresh" class="primary" type="button">刷新</button>
       <button id="schedule-close-bottom" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+<div id="compact-config-modal" class="modal" hidden>
+  <div class="modal-card" style="width: 620px;">
+    <div class="modal-head">
+      <strong>压缩设置</strong>
+      <button id="compact-config-close" class="close" type="button" title="关闭">×</button>
+    </div>
+    <h3 style="margin:14px 0 6px;">自动压缩</h3>
+    <div class="form-row">
+      <label class="check"><input id="cc-auto-enabled" type="checkbox"> 上下文达到阈值时自动压缩</label>
+    </div>
+    <div class="form-row">
+      <label for="cc-auto-level">档位</label>
+      <select id="cc-auto-level"></select>
+    </div>
+    <div class="form-row">
+      <label for="cc-auto-threshold">触发阈值 %</label>
+      <input id="cc-auto-threshold" type="number" min="1" max="100" placeholder="跟随档位">
+    </div>
+    <div class="form-row">
+      <label for="cc-auto-target">压缩后保留 %</label>
+      <input id="cc-auto-target" type="number" min="1" max="100" placeholder="跟随档位">
+    </div>
+    <div class="form-row">
+      <label for="cc-auto-keep">最多保留用户回合</label>
+      <input id="cc-auto-keep" type="number" min="1" max="100" placeholder="跟随档位">
+    </div>
+    <h3 style="margin:14px 0 6px;">空闲压缩</h3>
+    <div class="form-row">
+      <label class="check"><input id="cc-idle-enabled" type="checkbox"> 空闲后压缩旧上下文</label>
+    </div>
+    <div class="form-row">
+      <label for="cc-idle-minutes">空闲分钟数</label>
+      <input id="cc-idle-minutes" type="number" min="1" max="1440">
+    </div>
+    <div class="form-row">
+      <label for="cc-idle-level">档位</label>
+      <select id="cc-idle-level"></select>
+    </div>
+    <div class="form-row">
+      <label for="cc-idle-min-percent">最低上下文 %</label>
+      <input id="cc-idle-min-percent" type="number" min="1" max="100">
+    </div>
+    <div class="form-row">
+      <label for="cc-idle-min-messages">最少消息数</label>
+      <input id="cc-idle-min-messages" type="number" min="0" max="10000">
+    </div>
+    <div class="form-row">
+      <label class="check"><input id="cc-persist" type="checkbox"> 同时写入配置文件</label>
+    </div>
+    <div id="compact-config-status" class="modal-status"></div>
+    <div class="modal-actions">
+      <button id="compact-config-save" class="primary" type="button">保存</button>
+      <button id="compact-config-reset" type="button">恢复默认</button>
+      <button id="compact-config-cancel" type="button">取消</button>
     </div>
   </div>
 </div>
@@ -11991,6 +12233,24 @@ const helpOpenEl = document.getElementById("help-open");
 const helpModalEl = document.getElementById("help-modal");
 const helpCloseEl = document.getElementById("help-close");
 const helpCloseBottomEl = document.getElementById("help-close-bottom");
+const compactConfigOpenEl = document.getElementById("compact-config-open");
+const compactConfigModalEl = document.getElementById("compact-config-modal");
+const compactConfigCloseEl = document.getElementById("compact-config-close");
+const compactConfigCancelEl = document.getElementById("compact-config-cancel");
+const compactConfigSaveEl = document.getElementById("compact-config-save");
+const compactConfigResetEl = document.getElementById("compact-config-reset");
+const compactConfigStatusEl = document.getElementById("compact-config-status");
+const ccAutoEnabledEl = document.getElementById("cc-auto-enabled");
+const ccAutoLevelEl = document.getElementById("cc-auto-level");
+const ccAutoThresholdEl = document.getElementById("cc-auto-threshold");
+const ccAutoTargetEl = document.getElementById("cc-auto-target");
+const ccAutoKeepEl = document.getElementById("cc-auto-keep");
+const ccIdleEnabledEl = document.getElementById("cc-idle-enabled");
+const ccIdleMinutesEl = document.getElementById("cc-idle-minutes");
+const ccIdleLevelEl = document.getElementById("cc-idle-level");
+const ccIdleMinPercentEl = document.getElementById("cc-idle-min-percent");
+const ccIdleMinMessagesEl = document.getElementById("cc-idle-min-messages");
+const ccPersistEl = document.getElementById("cc-persist");
 const modelInfoModalEl = document.getElementById("model-info-modal");
 const modelInfoTitleEl = document.getElementById("model-info-title");
 const modelInfoCloseEl = document.getElementById("model-info-close");
@@ -13006,6 +13266,127 @@ function closeHelpModal() {
   helpModalEl.hidden = true;
 }
 
+function fillCompactLevels(select, presets, current, allowEmpty) {
+  select.textContent = "";
+  if (allowEmpty) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "跟随自动压缩";
+    select.appendChild(option);
+  }
+  for (const name of Object.keys(presets || {})) {
+    const preset = presets[name];
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name + "（触发 " + preset.threshold + "% · 保留 "
+      + preset.target_ratio + "% · 回合 " + preset.keep + "）";
+    select.appendChild(option);
+  }
+  if (current) select.value = current;
+}
+
+function compactNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : null;
+}
+
+function compactRawValue(value) {
+  return value === null || value === undefined ? "" : value;
+}
+
+async function openCompactConfigModal() {
+  compactConfigStatusEl.textContent = "";
+  try {
+    const data = await api("/api/compact/config");
+    const presets = data.presets || {};
+    const raw = data.compact_raw || {};
+    const rawAuto = raw.auto || {};
+    const rawIdle = raw.idle || {};
+    fillCompactLevels(ccAutoLevelEl, presets, rawAuto.level || "", false);
+    fillCompactLevels(ccIdleLevelEl, presets, rawIdle.level || "", true);
+    ccAutoEnabledEl.checked = !!rawAuto.enabled;
+    ccAutoThresholdEl.value = compactRawValue(rawAuto.threshold);
+    ccAutoTargetEl.value = compactRawValue(rawAuto.target_ratio);
+    ccAutoKeepEl.value = compactRawValue(rawAuto.keep);
+    ccIdleEnabledEl.checked = !!rawIdle.enabled;
+    ccIdleMinutesEl.value = rawIdle.minutes === undefined || rawIdle.minutes === null
+      ? 10 : rawIdle.minutes;
+    ccIdleMinPercentEl.value = rawIdle.min_context_percent === undefined
+      || rawIdle.min_context_percent === null ? 20 : rawIdle.min_context_percent;
+    ccIdleMinMessagesEl.value = rawIdle.min_messages === undefined
+      || rawIdle.min_messages === null ? 6 : rawIdle.min_messages;
+    compactConfigModalEl.hidden = false;
+  } catch (err) {
+    statusEl.textContent = "压缩设置读取失败: " + String(err);
+  }
+}
+
+function closeCompactConfigModal() {
+  compactConfigModalEl.hidden = true;
+}
+
+async function saveCompactConfig() {
+  const minutes = compactNumber(ccIdleMinutesEl.value);
+  const minPercent = compactNumber(ccIdleMinPercentEl.value);
+  const minMessages = compactNumber(ccIdleMinMessagesEl.value);
+  if (minutes === null || minPercent === null || minMessages === null) {
+    compactConfigStatusEl.textContent = "空闲分钟数、最低上下文 % 和最少消息数必须是整数";
+    return;
+  }
+  const payload = {
+    auto: {
+      enabled: ccAutoEnabledEl.checked,
+      level: ccAutoLevelEl.value || null,
+      threshold: compactNumber(ccAutoThresholdEl.value),
+      target_ratio: compactNumber(ccAutoTargetEl.value),
+      keep: compactNumber(ccAutoKeepEl.value),
+    },
+    idle: {
+      enabled: ccIdleEnabledEl.checked,
+      minutes: minutes,
+      level: ccIdleLevelEl.value || null,
+      min_context_percent: minPercent,
+      min_messages: minMessages,
+    },
+    persist: ccPersistEl.checked,
+  };
+  compactConfigSaveEl.disabled = true;
+  compactConfigStatusEl.textContent = "正在保存…";
+  try {
+    const data = await api("/api/compact/config", payload);
+    statusEl.textContent = "压缩设置已更新" + (data.saved ? "（已写入配置文件）" : "");
+    closeCompactConfigModal();
+  } catch (err) {
+    compactConfigStatusEl.textContent = "保存失败: " + String(err);
+  } finally {
+    compactConfigSaveEl.disabled = false;
+  }
+}
+
+async function resetCompactConfig() {
+  compactConfigSaveEl.disabled = true;
+  compactConfigStatusEl.textContent = "正在恢复默认…";
+  try {
+    await api("/api/compact/config", {
+      auto: {
+        enabled: false, level: "normal",
+        threshold: null, target_ratio: null, keep: null,
+      },
+      idle: {
+        enabled: false, minutes: 10, level: null,
+        min_context_percent: 20, min_messages: 6,
+      },
+    });
+    closeCompactConfigModal();
+    statusEl.textContent = "压缩设置已恢复默认";
+  } catch (err) {
+    compactConfigStatusEl.textContent = "恢复失败: " + String(err);
+  } finally {
+    compactConfigSaveEl.disabled = false;
+  }
+}
+
 helpOpenEl.onclick = openHelpModal;
 helpCloseEl.onclick = closeHelpModal;
 helpCloseBottomEl.onclick = closeHelpModal;
@@ -13019,6 +13400,15 @@ modelInfoCancelEl.onclick = closeModelInfoModal;
 modelInfoSaveEl.onclick = saveModelInfo;
 modelInfoModalEl.addEventListener("click", (event) => {
   if (event.target === modelInfoModalEl) closeModelInfoModal();
+});
+
+compactConfigOpenEl.onclick = openCompactConfigModal;
+compactConfigCloseEl.onclick = closeCompactConfigModal;
+compactConfigCancelEl.onclick = closeCompactConfigModal;
+compactConfigSaveEl.onclick = saveCompactConfig;
+compactConfigResetEl.onclick = resetCompactConfig;
+compactConfigModalEl.addEventListener("click", (event) => {
+  if (event.target === compactConfigModalEl) closeCompactConfigModal();
 });
 
 function setModelOptions(models, current) {
@@ -13822,6 +14212,103 @@ async function handleShellCommand(argument) {
   }
 }
 
+function formatModelInfoLine(info) {
+  if (!info) return "no model capability info";
+  const parts = [];
+  parts.push(formatContextSize(info.context_window) + " context");
+  parts.push("max output " + formatContextSize(info.max_output_tokens));
+  parts.push(((info.input || []).join("+") || "text") + "→"
+    + ((info.output || []).join("+") || "text"));
+  parts.push(info.supports_tools ? "tools" : "no tools");
+  if (info.supports_reasoning === true) parts.push("reasoning");
+  else if (info.supports_reasoning === false) parts.push("no reasoning");
+  if (info.source && info.source !== "profile" && info.source !== "registry") {
+    parts.push("info from " + info.source);
+  }
+  return parts.join(" · ");
+}
+
+async function switchWebModel(name) {
+  const data = await api("/api/model", { model: name });
+  currentModel = data.model;
+  if (data.info) renderModelInfo(data.info, null);
+  addLine("tool", "model switched: " + data.model
+    + "\n" + formatModelInfoLine(data.info)
+    + (data.reasoning_warning ? "\nwarning: " + data.reasoning_warning : ""));
+  statusEl.textContent = "模型已切换: " + data.model;
+  await loadModels();
+  await loadRuntimeSettings();
+  if (data.needs_model_info) openCurrentModelInfo();
+}
+
+async function switchWebConnection(name, targetModel) {
+  const data = await api("/api/connections/use", { name: name });
+  currentModel = data.model;
+  let warning = data.reasoning_warning || "";
+  if (targetModel) {
+    const modelData = await api("/api/model", { model: targetModel });
+    currentModel = modelData.model;
+    if (modelData.info) renderModelInfo(modelData.info, null);
+    warning = modelData.reasoning_warning || warning;
+  }
+  addLine("tool", "connection switched: " + name + " · model: " + currentModel
+    + (warning ? "\nwarning: " + warning : ""));
+  statusEl.textContent = "连接已切换: " + name + " · " + currentModel;
+  await refreshConnections();
+  await loadModels();
+  await loadRuntimeSettings();
+}
+
+async function handleModelCommand(argument) {
+  const value = (argument || "").trim();
+  try {
+    if (!value) {
+      const data = await api("/api/state");
+      addLine("tool", "current model: " + data.model
+        + "\nconnection: " + (data.connection || "(custom)")
+        + "\napi: " + data.api_format
+        + "\n" + formatModelInfoLine(data.model_info));
+      return;
+    }
+    const head = value.split(/\s+/)[0].toLowerCase();
+    if (head === "list" || head === "all") {
+      const data = await api("/api/connections");
+      const items = data.connections || [];
+      if (!items.length) {
+        addLine("tool", "no saved connections; use 连接设置 to create one");
+        return;
+      }
+      const lines = ["saved connections:"];
+      for (const item of items) {
+        const marker = item.runtime ? "*" : " ";
+        const active = item.active ? " (active)" : "";
+        lines.push(marker + " " + item.name + active + " · " + (item.model || "?")
+          + " · " + (item.provider || "?") + " · " + (item.api_format || "?"));
+      }
+      addLine("tool", lines.join("\n"));
+      return;
+    }
+    if (head === "use" || head === "switch") {
+      const rest = value.split(/\s+/).slice(1);
+      if (!rest.length) {
+        addLine("tool", "usage: /model use <连接> [模型]");
+        return;
+      }
+      await switchWebConnection(rest[0], rest.slice(1).join(" "));
+      return;
+    }
+    if (head === "info" || head === "config") {
+      addLine("tool", "/model " + head + " 是 CLI 专属命令；"
+        + "Web 请用侧边栏的「模型能力」按钮");
+      return;
+    }
+    await switchWebModel(value);
+  } catch (err) {
+    statusEl.textContent = String(err);
+    addLine("tool", "error: " + String(err));
+  }
+}
+
 function stopJobTimer(id) {
   const timer = jobPollTimers.get(id);
   if (timer) {
@@ -14017,6 +14504,17 @@ async function send(explicitText) {
   if (compactMatch) {
     inputEl.value = "";
     compactContext(compactMatch[1] ? parseInt(compactMatch[1], 10) : 2);
+    return;
+  }
+  if (!auto && /^\/compact\b/.test(text)) {
+    inputEl.value = "";
+    openCompactConfigModal();
+    return;
+  }
+  const modelMatch = auto ? null : text.match(/^\/model(?:\s+([\s\S]*))?$/);
+  if (modelMatch) {
+    inputEl.value = "";
+    handleModelCommand((modelMatch[1] || "").trim());
     return;
   }
   const images = uploads.slice();
@@ -14236,8 +14734,18 @@ def run_web(
     if model_registry is None:
         model_registry = ModelRegistry()
     compact_settings = compact_settings or {}
-    auto_compact_settings = compact_settings.get("auto") or {}
-    idle_compact_settings = compact_settings.get("idle") or {}
+    compact_raw = {
+        "auto": dict(compact_settings.get("auto") or {}),
+        "idle": dict(compact_settings.get("idle") or {}),
+    }
+
+    def resolved_compact() -> dict[str, Any]:
+        raw_auto = compact_raw["auto"]
+        raw_idle = compact_raw["idle"]
+        return {
+            "auto": resolve_auto_compact(raw_auto),
+            "idle": resolve_idle_compact(raw_auto, raw_idle),
+        }
     token = secrets.token_urlsafe(16)
     token_bytes = token.encode("utf-8")
     lock = threading.Lock()
@@ -14444,7 +14952,7 @@ def run_web(
                     state["messages"],
                     state["session"],
                     request_model_info,
-                    idle_compact_settings,
+                    resolved_compact()["idle"],
                     state.get("last_activity"),
                 )
                 idle_ran = idle_stats is not None
@@ -14466,7 +14974,7 @@ def run_web(
                         state["messages"],
                         state["session"],
                         request_model_info,
-                        auto_compact_settings,
+                        resolved_compact()["auto"],
                     )
                     if auto_stats is not None:
                         if auto_stats.get("error"):
@@ -14723,8 +15231,12 @@ def run_web(
                         },
                         "model_info": current_info.to_dict(),
                         "context": context_state,
-                        "auto_compact": auto_compact_settings,
-                        "idle_compact": idle_compact_settings,
+                        "auto_compact": resolved_compact()["auto"],
+                        "idle_compact": resolved_compact()["idle"],
+                        "compact_raw": {
+                            "auto": dict(compact_raw["auto"]),
+                            "idle": dict(compact_raw["idle"]),
+                        },
                         "messages": history_view(state["messages"], lazy_images=True, include_tools=True),
                     })
                 return
@@ -14760,6 +15272,18 @@ def run_web(
                     "context": context_state,
                     "plan_mode": bool(workspace.plan_mode),
                     "plan_guard": str(workspace.plan_guard),
+                })
+                return
+            if parsed.path == "/api/compact/config":
+                resolved = resolved_compact()
+                self._json(200, {
+                    "presets": AUTO_COMPACT_PRESETS,
+                    "auto_compact": resolved["auto"],
+                    "idle_compact": resolved["idle"],
+                    "compact_raw": {
+                        "auto": dict(compact_raw["auto"]),
+                        "idle": dict(compact_raw["idle"]),
+                    },
                 })
                 return
             self._error(404, "not found")
@@ -15512,6 +16036,57 @@ def run_web(
                         "messages": history_view(state["messages"], lazy_images=True, include_tools=True),
                         **stats,
                     })
+                return
+
+            if parsed.path == "/api/compact/config":
+                try:
+                    new_auto, new_idle = apply_compact_overrides(
+                        compact_raw["auto"],
+                        compact_raw["idle"],
+                        payload,
+                    )
+                except ValueError as exc:
+                    self._error(400, str(exc))
+                    return
+                compact_raw["auto"] = new_auto
+                compact_raw["idle"] = new_idle
+                persist = bool(payload.get("persist"))
+                if persist:
+                    with config_lock:
+                        draft = copy.deepcopy(config_state["config"])
+                        defaults = draft.setdefault("defaults", {})
+                        defaults["auto_compact"] = {
+                            "enabled": bool(new_auto.get("enabled", False)),
+                            "level": new_auto.get("level") or AUTO_COMPACT_DEFAULT_LEVEL,
+                            "threshold": new_auto.get("threshold"),
+                            "target_ratio": new_auto.get("target_ratio"),
+                            "keep": new_auto.get("keep"),
+                        }
+                        defaults["idle_compact"] = {
+                            "enabled": bool(new_idle.get("enabled", False)),
+                            "minutes": int(new_idle.get("minutes", 10)),
+                            "level": new_idle.get("level"),
+                            "min_context_percent": int(
+                                new_idle.get("min_context_percent", 20)
+                            ),
+                            "min_messages": int(new_idle.get("min_messages", 6)),
+                        }
+                        try:
+                            save_config(draft, config_path)
+                        except ConfigError as exc:
+                            self._error(500, str(exc))
+                            return
+                        config_state["config"] = draft
+                resolved = resolved_compact()
+                self._json(200, {
+                    "auto_compact": resolved["auto"],
+                    "idle_compact": resolved["idle"],
+                    "compact_raw": {
+                        "auto": dict(compact_raw["auto"]),
+                        "idle": dict(compact_raw["idle"]),
+                    },
+                    "saved": persist,
+                })
                 return
 
             if parsed.path == "/api/chat/stop":
@@ -16507,8 +17082,8 @@ def main(argv: list[str] | None = None) -> int:
             scheduler,
             model_registry,
             {
-                "auto": auto_compact_config(args),
-                "idle": idle_compact_config(args),
+                "auto": auto_compact_raw(args),
+                "idle": idle_compact_raw(args),
             },
         )
     messages: list[dict[str, Any]] = [
