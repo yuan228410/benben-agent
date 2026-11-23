@@ -231,9 +231,15 @@ Windows 乱码处理：
 
 ### 只读判断
 
-- POSIX / Git Bash：保留命令白名单判断。
-- PowerShell / cmd：一律视为可能修改状态。开启 `--confirm` 时所有命令都需要确认。
-- 判断按本次实际使用的 shell 走：指定 `shell: "git-bash"` 时用 POSIX 白名单，指定 PowerShell 时一律视为可能修改状态。
+判定原则是**尽量少弹框，只拦真正会破坏系统的命令**。判断按本次实际使用的 shell 走。
+
+**POSIX / Git Bash**：用只读命令白名单，并补了 `awk` / `sed` / `xargs`（各自排除危险形态：`sed -i`、`awk` 里的 `system()`/重定向、`xargs rm`）。白名单会按 shell / 平台裁剪：Git Bash 不含 `journalctl`、`ss`、`rg` 等；macOS 不含 `dmesg`、`free`、`sha256sum` 等。
+
+**git**：大部分写操作不弹确认 —— 它们的结果都记在 git 里，一条命令就能撤销（`git add` / `commit` / `stash` / `branch` / `tag` / `fetch` / `merge` / `rebase` / `reset` / `switch`…）。只拦历史救不回来的：`reset --hard`、`clean -fd`、`restore`、`checkout`（难以区分切分支和丢弃改动，改用 `git switch`）、`push --force`、`gc --prune`、`reflog expire`、`stash drop/clear`、`branch -D`、`tag -d`、以及会执行任意代码的 `bisect run` / `config` 写入。
+
+**PowerShell**：按危险项过滤，默认放行。只拦危险动词（`set` / `new` / `remove` / `clear` / `add` / `start` / `stop` / `install` / `import` / `export`…）、危险 cmdlet（`Invoke-Expression`、`Out-File`、`Tee-Object`…）、危险别名（`iex` / `sc` / `rm` / `tee`…）、解释器和系统程序（`python` / `node` / `pwsh` / `cmd` / `rundll32` / `mshta`…）。`Get-Content $env:X`、`Where-Object { $_.Length -gt 5 }`、`git status` 这类常用写法都不弹确认。挡住的绕过通道：重定向 `>`、调用运算符 `&`、子表达式 `$(`、.NET 静态调用 `[`、方法调用 `(`（所以 `Where-Object { $_.Delete() }` 会被拦）。
+
+**cmd**：一律视为可能修改状态，开启 `--confirm` 时所有命令都要确认。cmd 的 `%VAR%` 展开先于解析，无法安全地做白名单。
 
 ## 参数
 
@@ -431,11 +437,16 @@ python3 benben-agent.py --memory --thinking --max-steps 50
 {
   "version": 1,
   "fallback": {
+    "name": "fallback",
     "context_window": 256000,
     "max_output_tokens": 8192,
     "supports_tools": true,
+    "supports_parallel_tools": null,
     "supports_reasoning": null,
-    "notes": "Used when the model is not listed in models.json"
+    "reasoning_providers": [],
+    "api_formats": [],
+    "notes": "Used when the model is not listed in models.json",
+    "updated": "2026-11-23"
   },
   "models": {
     "deepseek/deepseek-chat": {
@@ -456,13 +467,15 @@ python3 benben-agent.py --memory --thinking --max-steps 50
 }
 ```
 
+`fallback` 是自动生成的，可以手工改；`models` 里的条目由 `/model config` 或 Web「模型能力」写入。`fallback` 不写 `input`/`output` 时按文本模态处理，图片能力视为未知。
+
 查找顺序：
 
-1. `provider/model` 精确匹配
-2. 模型名匹配
-3. 连接 profile 里的 `model_info` 覆盖
-4. `models.json` 的 `fallback`
-5. 内置兜底
+1. `models.json` 里 `provider/model` 精确匹配
+2. `models.json` 里键名等于模型名的条目
+3. `models.json` 里任意 `前缀/模型名` 的条目
+4. 上面都没命中时用 `models.json` 的 `fallback`；文件缺失或损坏时用内置兜底
+5. 最后叠加连接 profile 里的 `model_info` 覆盖
 
 当前兜底上下文为 **256000 tokens**，最大输出 `8192`。模型能力信息不包含价格。
 
@@ -1105,7 +1118,7 @@ POST /api/skills/approve
 POST /api/skills/reject
 ```
 
-脚本按 shebang、扩展名（py/sh/js/rb/pl/php/ps1）或可执行文件运行；cwd 是当前工作区，并注入 `BENBEN_SKILL_DIR` 和 `BENBEN_WORKSPACE`。启用技能时脚本默认可用，`--no-skill-scripts` 关闭；`--confirm` 下每次执行都要确认；web 模式没有脚本审批，启动会打印警告。
+脚本按 shebang、扩展名（py/sh/bash/js/mjs/rb/pl/php/ps1/bat/cmd）或可执行文件运行；cwd 是当前工作区，并注入 `BENBEN_SKILL_DIR` 和 `BENBEN_WORKSPACE`。启用技能时脚本默认可用，`--no-skill-scripts` 关闭；`--confirm` 下每次执行都要确认。web 模式默认不审批脚本，启动会打印警告；加 `--confirm --web` 后脚本和写操作一样会弹审批框（见「Web 审批」）。
 
 技能默认关闭，用 `--skill` 开启；`--no-skill` 可显式关闭。关闭时不扫描技能目录，也不向模型暴露任何技能工具，CLI 和 Web 管理同样不可用。`--only-own-skills` 下只加载全局技能，创建/安装工作区技能会被拒绝。
 
@@ -1455,13 +1468,13 @@ python3 benben-agent.py --web --confirm
 写文件、修改状态的命令、技能脚本会暂停，浏览器弹出「需要确认」：
 
 ```text
-动作：write_file / run_command / run_skill_script
+动作：write_file / edit_file / run_command / run_skill_script
 内容：完整路径、命令或脚本
 [允许一次] [拒绝]
 ```
 
 - 只允许当前这一次，不提供“永久允许”
-- 120 秒内没有响应按拒绝处理
+- 120 秒内没有响应按拒绝处理；超时时间可用 `BENBEN_WEB_APPROVAL_TIMEOUT` 环境变量改（秒）
 - 点击停止、关闭页面或连接中断也按拒绝处理
 - 计划模式守卫为 `approve` 时使用同一个弹窗，不要求额外加 `--confirm`
 - Web 聊天始终使用 SSE 事件通道，审批事件可以中途送达；「流式输出」开关只影响正文显示方式
@@ -1491,7 +1504,9 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `/model use 连接 [模型]` | 切换连接，可同时切换模型 |
 | `/shell` `/shell 名称` | 查看或切换 shell |
 | `/session ...` | 会话列表、切换、重命名、导出、删除 |
+| `/workspace ...` | 查看或切换工作空间 |
 | `/jobs ...` | 后台任务列表、状态、输出、跟随、停止 |
+| `/mcp ...` | MCP 服务状态、工具列表、重启服务 |
 | `/plan ...` | 计划模式开关和守卫档位 |
 | `/skill` | 打开技能管理；`/skill create`、`/skill install` 直达表单 |
 | `/stream ...` | 流式输出开关 |
@@ -1504,46 +1519,53 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 
 ## 内置工具
 
-| 工具 | 作用 | 需要批准 |
+| 工具 | 作用 | 审批 |
 | --- | --- | --- |
-| `list_dir` | 列出目录内容 | 否 |
-| `read_file` | 按行读取文本文件（带行号，可分页） | 否 |
-| `search` | 按正则搜索文件内容，支持工作区外路径（`输出=content` 返回 `文件:行号: 内容`；`输出=lines` 只返回 `文件:行号`） | 否 |
-| `glob` | 按通配符查找文件，支持 `**` 递归 | 否 |
-| `write_file` | 创建或覆盖文件 | 是 |
-| `edit_file` | 替换文件中的一段文本（类似 patch） | 是 |
-| `run_command` | 在工作区执行 shell 命令（可用 `shell` 参数指定本次用哪个 shell） | 是 |
-| `list_shells` | 列出检测到的 shell 和当前 shell | 否 |
-| `switch_shell` | 切换默认 shell | 否 |
-| `job_status` | 查看后台任务状态和最近输出 | 否 |
-| `job_output` | 读取后台任务的输出 | 否 |
-| `job_cancel` | 取消后台任务并杀进程树 | 否 |
-| `list_jobs` | 列出后台任务 | 否 |
-| `submit_plan` | 提交实施计划并等待用户批准（仅计划模式下提供） | 否 |
-| `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 否 |
-| `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 否 |
-| `run_skill_script` | 执行技能 `scripts/` 下的脚本（仅在启用脚本且存在脚本时提供） | 是 |
-| `create_skill` | 创建或更新技能，默认写入全局技能目录（仅启用技能时提供） | 否 |
-| `install_skill` | 从目录、zip 或 git URL 安装技能（仅启用技能时提供） | 中高风险需要 |
-| `remove_skill` | 请求删除技能，批准后移动到备份（仅启用技能时提供） | 总是需要 |
-| `create_schedule` | 创建定时任务（仅启用定时任务时提供） | 是 |
-| `list_schedules` | 列出定时任务（仅启用定时任务时提供） | 否 |
-| `delete_schedule` | 删除定时任务及运行记录（仅启用定时任务时提供） | 是 |
-| `enable_schedule` | 启用或暂停定时任务（仅启用定时任务时提供） | 是 |
-| `run_schedule_now` | 立即排队执行一次定时任务（仅启用定时任务时提供） | 否 |
-| `schedule_history` | 查看定时任务运行记录（仅启用定时任务时提供） | 否 |
-| `remember` | 写入长期记忆（仅启用记忆时提供） | 否 |
-| `recall` | 搜索长期记忆和情景记忆（仅启用记忆时提供） | 否 |
-| `save_episode` | 追加当天情景总结（仅启用记忆时提供） | 否 |
-| `list_episodes` | 列出情景记忆文件（仅启用记忆时提供） | 否 |
-| `read_episode` | 读取情景记忆文件（仅启用记忆时提供） | 否 |
-| `generate_daily_episode` | 生成自动日总结（仅启用记忆时提供） | 否 |
+| `list_dir` | 列出目录内容 | 无 |
+| `read_file` | 按行读取文本文件（带行号，可分页） | 无 |
+| `search` | 按正则搜索文件内容，支持工作区外路径（`输出=content` 返回 `文件:行号: 内容`；`输出=lines` 只返回 `文件:行号`） | 无 |
+| `glob` | 按通配符查找文件，支持 `**` 递归 | 无 |
+| `write_file` | 创建或覆盖文件 | `--confirm` 时询问 |
+| `edit_file` | 替换文件中的一段文本（类似 patch） | `--confirm` 时询问 |
+| `run_command` | 在工作区执行 shell 命令（可用 `shell` 参数指定本次用哪个 shell） | `--confirm` 时询问（只读命令不问） |
+| `list_shells` | 列出检测到的 shell 和当前 shell | 无 |
+| `switch_shell` | 切换默认 shell | 无 |
+| `job_status` | 查看后台任务状态和最近输出 | 无 |
+| `job_output` | 读取后台任务的输出 | 无 |
+| `job_cancel` | 取消后台任务并杀进程树 | 计划模式守卫 |
+| `list_jobs` | 列出后台任务 | 无 |
+| `submit_plan` | 提交实施计划并等待用户批准（仅计划模式下提供） | 无 |
+| `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 无 |
+| `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 无 |
+| `run_skill_script` | 执行技能 `scripts/` 下的脚本（仅在启用脚本且存在脚本时提供） | `--confirm` 时询问 |
+| `create_skill` | 创建或更新技能，默认写入全局技能目录（仅启用技能时提供） | 计划模式守卫 |
+| `install_skill` | 从目录、zip 或 git URL 安装技能（仅启用技能时提供） | 中高风险待确认（低风险直接装） |
+| `remove_skill` | 请求删除技能，批准后移动到备份（仅启用技能时提供） | 待确认 |
+| `create_schedule` | 创建定时任务（仅启用定时任务时提供） | 计划模式守卫 |
+| `list_schedules` | 列出定时任务（仅启用定时任务时提供） | 无 |
+| `delete_schedule` | 删除定时任务及运行记录（仅启用定时任务时提供） | 计划模式守卫 |
+| `enable_schedule` | 启用或暂停定时任务（仅启用定时任务时提供） | 计划模式守卫 |
+| `run_schedule_now` | 立即排队执行一次定时任务（仅启用定时任务时提供） | 计划模式守卫 |
+| `schedule_history` | 查看定时任务运行记录（仅启用定时任务时提供） | 无 |
+| `remember` | 写入长期记忆（仅启用记忆时提供） | 计划模式守卫 |
+| `recall` | 搜索长期记忆和情景记忆（仅启用记忆时提供） | 无 |
+| `save_episode` | 追加当天情景总结（仅启用记忆时提供） | 计划模式守卫 |
+| `list_episodes` | 列出情景记忆文件（仅启用记忆时提供） | 无 |
+| `read_episode` | 读取情景记忆文件（仅启用记忆时提供） | 无 |
+| `generate_daily_episode` | 生成自动日总结（仅启用记忆时提供） | 计划模式守卫 |
 
-全部功能开启时共 29 个工具。
+全部功能开启时共 32 个工具（不含 MCP 动态注入的工具）。
+
+审批列的含义：
+
+- **无**：任何情况下都不询问。
+- **`--confirm` 时询问**：只有开了 `--confirm`（Web 端在「默认设置」里打开确认）时才会停下来问用户；默认直接执行。
+- **计划模式守卫**：不经过 `--confirm`，但计划模式下按 `--plan-guard` 处理（`approve` 询问、`deny` 直接拒绝）；`off` 档不拦。
+- **待确认**：走独立的待确认队列，不受 `--confirm` 影响，必须由用户在 CLI `/skill approve` 或 Web「技能 → 管理技能 → 待确认」里放行。`remove_skill` 一律走这条路径；`install_skill` 只在风险等级为 medium/high/unknown 时走。
 
 `run_command` 的 `timeout_seconds` 是必填参数：快速查询建议 10-30 秒，构建/测试/安装 60-180 秒，最大 600 秒（`--max-command-timeout`）。命令超时或用户按 Ctrl+C 时会杀掉整个进程树，保留已捕获的部分输出，并提示模型提高超时或拆分任务。不要在前台运行服务器、守护进程、`tail -f`、`watch` 或交互式编辑器。
 
-默认不询问，写文件和命令直接执行。加 `--confirm` 后，写文件和会修改状态的命令会询问 `Allow? [Y/n]`（直接回车即允许）；只读命令（grep、tail、ps、df、journalctl、curl 等）任何时候都不询问。判断是保守白名单：未知命令、包装器（sudo、timeout、env）、重定向、命令替换和危险参数都按修改状态处理；`curl` 带 `-o/-d/-X` 等写文件或发数据的参数、`wget` 不带 `-O -`/`--spider` 时都要求批准。标准输入不是终端（例如管道、CI）时直接拒绝，并把原因返回给模型。交互模式里可以随时用 `/confirm on` 和 `/confirm off` 切换。模型最多执行 `--max-steps` 次模型调用，一次性任务达到上限会以退出码 1 结束，交互模式只提示后继续。交互模式下 Ctrl+C 需要连按两次才退出：第一次取消当前输入或中断正在执行的任务，2 秒内再按一次才退出。
+默认不询问，写文件和命令直接执行。加 `--confirm` 后，写文件和会修改状态的命令会询问 `Allow? [Y/n]`（直接回车即允许）；只读命令和前述「结果可撤销」的 git 写操作任何时候都不询问。POSIX 下未知命令、包装器（sudo、timeout、env）、重定向、命令替换和危险参数按修改状态处理；`curl` 带 `-o/-d/-X` 等写文件或发数据的参数、`wget` 不带 `-O -`/`--spider` 时都要求批准。PowerShell 下按危险动词/别名/解释器过滤，详见「只读判断」。标准输入不是终端（例如管道、CI）时直接拒绝，并把原因返回给模型。交互模式里可以随时用 `/confirm on` 和 `/confirm off` 切换。模型最多执行 `--max-steps` 次模型调用，一次性任务达到上限会以退出码 1 结束，交互模式只提示后继续。交互模式下 Ctrl+C 需要连按两次才退出：第一次取消当前输入或中断正在执行的任务，2 秒内再按一次才退出。
 
 ### 读取策略
 
@@ -1604,9 +1626,9 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - 模型返回的工具调用参数如果不是合法 JSON，错误会作为工具结果回传给模型，让它自行修正。
 - 工具结果超过 20000 字符会截断；`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 1000 行。
 - `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，支持工作区外路径；`glob` 在遍历阶段就剪枝并限制 10 秒扫描预算，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
-- 文件工具不再限制在工作区内：`write_file`、`edit_file` 可以写任意可写路径。默认 `--confirm` 关闭，Web 模式没有工具审批；需要写操作确认时请加 `--confirm`，不要让不可信的网页或文件内容驱动写系统配置。
+- 文件工具不再限制在工作区内：`write_file`、`edit_file` 可以写任意可写路径。默认 `--confirm` 关闭，Web 模式默认也不审批；需要写操作确认时请加 `--confirm`（Web 用 `--confirm --web`），不要让不可信的网页或文件内容驱动写系统配置。
 - `write_file`、`edit_file` 和 `/save` 使用同目录临时文件 + `os.replace` 原子替换，中断时不会留下半个文件。
-- 文件路径经过 `realpath` 规范化，符号链接也无法逃逸出当前工作空间根目录。
+- 文件路径经过 `realpath` 规范化，相对路径按工作区根目录解析；绝对路径和 `~` 会原样解析到工作区之外，不会被限制在某个根目录内。
 - 交互模式会自动开启 Linux 终端的 `IUTF8` 标志，并容错解码输入，避免中文退格留下残缺字节导致 `UnicodeDecodeError`。
 
 ## 测试

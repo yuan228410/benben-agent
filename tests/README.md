@@ -9,6 +9,13 @@ python3 tests/run_all.py
 也可以单独运行：
 
 ```bash
+python3 tests/test_agent2.py
+python3 tests/test_vision.py
+python3 tests/test_skills.py
+python3 tests/test_compact.py
+python3 tests/test_sessions.py
+python3 tests/test_web_images.py
+python3 tests/test_robustness.py
 python3 tests/test_usage.py
 python3 tests/test_reasoning.py
 python3 tests/test_anthropic.py

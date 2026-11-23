@@ -75,7 +75,7 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --version               显示版本并退出
     --check                 自检配置、目录、权限和模型能力，不联网
     --doctor                自检并测试模型 API 连通性
-    --web                   启动网页界面；强制免确认
+    --web                   启动网页界面；默认免确认，加 --confirm 启用审批弹窗
     --host HOST             网页监听地址，默认 127.0.0.1
     --port PORT             网页端口，默认 8765；0 表示系统分配
     --skill                 启用 Agent Skills、技能管理工具和 CLI/Web 管理（默认关闭）
@@ -245,8 +245,9 @@ macOS zsh）；Windows 依次检测 pwsh、Windows PowerShell、Git Bash、cmd�
 可用 --shell 指定，交互模式用 /shell 查看或切换。命令被当前 shell 明确判定
 为不认识时，run_command 会按可用顺序尝试备用 shell，并在结果里标注 [fallback]。
 
-安全提示：agent 可以读写工作区文件并执行命令；网页模式没有审批，
-只监听本机并依赖启动时生成的 token。技能脚本以当前用户权限运行。
+安全提示：agent 可以读写工作区文件并执行命令；网页模式默认不审批，
+加 --confirm 才会弹审批框；只监听本机并依赖启动时生成的 token。
+技能脚本以当前用户权限运行。
 """
 
 from __future__ import annotations
@@ -367,7 +368,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.16.0"
+AGENT_VERSION = "0.19.0"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -434,6 +435,8 @@ class Connection:
 
 def default_config_path() -> str:
     return os.environ.get("BENBEN_CONFIG") or os.path.join(SESSION_DIR, CONFIG_FILENAME)
+
+
 HOME_SKILLS_DIR = os.path.join(SESSION_DIR, "skills")
 CROSS_SKILLS_DIR = os.path.expanduser("~/.agents/skills")
 CLAUDE_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
@@ -9395,15 +9398,30 @@ MCP_RESOURCE_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 READ_ONLY_COMMANDS = {
-    "basename", "cat", "cksum", "comm", "curl", "cut", "df", "dirname", "dmesg", "du",
-    "echo", "egrep", "expand", "false", "fgrep", "file", "find", "fmt", "fold",
-    "free", "grep", "head", "hexdump", "id", "jq", "journalctl", "join", "last",
-    "lsof", "ls", "md5sum", "netstat", "nl", "nm", "objdump", "od", "paste",
-    "printf", "ps", "pwd", "readelf", "readlink", "realpath", "rg", "sensors",
-    "sha1sum", "sha256sum", "sha512sum", "sort", "ss", "stat", "strings", "tac",
-    "tail", "tr", "tree", "true", "uname", "uniq", "unexpand", "uptime", "users",
-    "w", "wc", "wget", "which", "whoami", "xxd",
+    "awk", "basename", "cat", "cksum", "comm", "curl", "cut", "df", "dirname",
+    "dmesg", "du", "echo", "egrep", "expand", "false", "fgrep", "file", "find",
+    "fmt", "fold", "free", "grep", "head", "hexdump", "id", "jq", "journalctl",
+    "join", "last", "lsof", "ls", "md5sum", "netstat", "nl", "nm", "objdump",
+    "od", "paste", "printf", "ps", "pwd", "readelf", "readlink", "realpath",
+    "rg", "sed", "sensors", "sha1sum", "sha256sum", "sha512sum", "sort", "ss",
+    "stat", "strings", "tac", "tail", "tr", "tree", "true", "uname", "uniq",
+    "unexpand", "uptime", "users", "w", "wc", "wget", "which", "whoami",
+    "xargs", "xxd",
 }
+
+# Platform gaps in READ_ONLY_COMMANDS. Trimming only ever removes commands that
+# are already known to be read-only, so it cannot make a dangerous command look
+# safe; the worst case is one extra approval prompt.
+LINUX_ONLY_COMMANDS = frozenset({"dmesg", "free", "journalctl", "sensors", "ss"})
+BSD_MISSING_COMMANDS = frozenset({
+    "readelf", "tac", "md5sum", "sha1sum", "sha256sum", "sha512sum",
+})
+# Measured against Git for Windows' bash.exe: these are not bundled.
+GIT_BASH_MISSING_COMMANDS = frozenset({
+    "dmesg", "free", "hexdump", "jq", "journalctl", "last", "lsof", "nm",
+    "objdump", "readelf", "rg", "sensors", "ss", "strings", "tree", "uptime",
+    "w", "wget",
+})
 
 SORT_UNSAFE = ("--output", "--compress-program")
 FIND_UNSAFE = {
@@ -9415,6 +9433,18 @@ JOURNAL_UNSAFE = (
     "--setup-keys", "--update-catalog", "--purge",
 )
 DMESG_UNSAFE = {"--clear", "--console-off", "--console-on", "--level"}
+
+# sed only writes when asked to edit in place.
+SED_UNSAFE_PREFIXES = ("-i", "--in-place")
+# awk can run commands and redirect output from inside the program text.
+AWK_UNSAFE_RE = re.compile(r"system\s*\(|getline|\bprint(?:f)?\b[^;{}]*[>|]")
+AWK_PROGRAM_FILE_FLAGS = ("-f", "--file", "-E", "--exec", "--source")
+# xargs runs whatever command it is given, so the target must be read-only too.
+XARGS_VALUE_FLAGS = frozenset({
+    "-n", "--max-args", "-I", "--replace", "-i", "--replace-str", "-L",
+    "--max-lines", "-P", "--max-procs", "-s", "--max-chars", "-d",
+    "--delimiter", "-E", "--eof", "-a", "--arg-file", "--process-slot-var",
+})
 
 # curl/wget are read-only only when they cannot write files. wget writes to a
 # file by default, so it must explicitly target stdout (or use --spider).
@@ -9446,7 +9476,36 @@ UNSAFE_ARG_CHECKS = {
         arg in DMESG_UNSAFE
         or (arg.startswith("-") and not arg.startswith("--") and any(ch in arg[1:] for ch in "cCDEn"))
     ),
+    "sed": lambda arg: arg.startswith(SED_UNSAFE_PREFIXES),
 }
+
+
+def _awk_args_are_unsafe(args: list[str]) -> bool:
+    """awk may run commands or redirect output from inside its program text."""
+    for arg in args:
+        base = arg.split("=", 1)[0]
+        if base in AWK_PROGRAM_FILE_FLAGS:
+            # The program lives in a file we cannot inspect.
+            return True
+    return bool(AWK_UNSAFE_RE.search(" ".join(args)))
+
+
+def _xargs_target_is_read_only(args: list[str], allowed: set[str]) -> bool:
+    """xargs executes a command, so that command must be read-only as well."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if arg.startswith("-"):
+            base = arg.split("=", 1)[0]
+            index += 1 if ("=" in arg or base not in XARGS_VALUE_FLAGS) else 2
+            continue
+        break
+    if index >= len(args):
+        return True  # no command given: xargs defaults to echo
+    return _posix_words_are_read_only(args[index:], allowed)
 
 
 def _wget_reads_stdout(args: list[str]) -> bool:
@@ -9462,17 +9521,160 @@ def _wget_reads_stdout(args: list[str]) -> bool:
     return False
 
 
-def is_read_only_command(command: str, shell_kind: str = "posix") -> bool:
-    """Conservative check for shell commands that cannot change system state.
+# --------------------------------------------------------------------------- #
+# git read-only subcommands
+# --------------------------------------------------------------------------- #
 
-    PowerShell and cmd semantics differ too much for a safe allowlist, so any
-    command there is treated as potentially mutating.
+GIT_GLOBAL_FLAGS = frozenset({
+    "--bare", "--no-pager", "--paginate", "-p", "--literal-pathspecs",
+    "--no-replace-objects", "--html-path", "--man-path", "--info-path",
+    "--no-lazy-fetch", "--no-optional-locks",
+})
+GIT_GLOBAL_VALUE_FLAGS = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+})
+GIT_READ_ONLY_SUBCOMMANDS = frozenset({
+    "status", "diff", "log", "show", "blame", "shortlog", "describe",
+    "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "grep",
+    "cat-file", "for-each-ref", "show-ref", "symbolic-ref",
+    "name-rev", "merge-base", "cherry", "count-objects", "var", "version",
+    "annotate", "check-ignore", "check-attr", "diff-tree", "diff-files",
+    "diff-index", "whatchanged", "help",
+})
+# Writes whose effect is recorded in git and can be undone with one command:
+# `git reset` / `git branch -d` / `git stash pop` / `git revert`, etc.
+# They do not need an approval prompt just because they write.
+GIT_RECOVERABLE_SUBCOMMANDS = frozenset({
+    "add", "commit", "fetch", "mv", "switch", "cherry-pick", "revert",
+    "merge", "rebase", "reset", "am", "apply", "format-patch", "archive",
+    "bundle",
+})
+# Second-level subcommands: git <sub> <second>. Destructive ones (stash drop,
+# reflog expire, notes remove, ...) are simply absent, so they are blocked.
+GIT_CHAIN_SUBCOMMANDS = {
+    "remote": frozenset({"show", "get-url", "add", "remove", "rename",
+                         "set-url", "set-head", "prune"}),
+    "stash": frozenset({"list", "show", "push", "save", "apply", "pop",
+                        "branch", "create", "store"}),
+    "worktree": frozenset({"list", "add", "move", "repair"}),
+    "notes": frozenset({"list", "show", "add", "append", "copy", "edit"}),
+    "reflog": frozenset({"show", "list"}),
+    "bisect": frozenset({"start", "good", "bad", "skip", "reset", "view", "log"}),
+}
+GIT_WRITE_ARGS = frozenset({"--output", "--upload-pack", "--receive-pack", "--exec"})
+# Creating a tag is fine; deleting or overwriting one is not.
+GIT_TAG_WRITE_FLAGS = frozenset({"-d", "--delete", "-f", "--force"})
+GIT_RESET_DESTRUCTIVE_FLAGS = frozenset({"--hard"})
+GIT_CONFIG_READ_FLAGS = frozenset({
+    "--get", "--get-all", "--get-regexp", "--list", "-l", "--name-only",
+    "--show-origin", "--show-scope",
+})
+
+
+def _git_positionals(args: list[str]) -> list[str]:
+    return [arg for arg in args if not arg.startswith("-")]
+
+
+def is_read_only_git(args: list[str]) -> bool:
+    """True when git does not destroy uncommitted/untracked data or history.
+
+    Git already records most writes, so `add` / `commit` / `stash` / `branch`
+    and friends are safe to run without asking. What history cannot recover is
+    the boundary: uncommitted working-tree changes, untracked files, force-pushed
+    remote history, and the reflog/objects that make recovery possible.
     """
-    if shell_kind != "posix":
+    index = 0
+    total = len(args)
+    while index < total:
+        token = args[index]
+        if not token.startswith("-"):
+            break
+        base = token.lower().split("=", 1)[0]
+        if base in GIT_GLOBAL_VALUE_FLAGS:
+            index += 1 if "=" in token else 2
+            continue
+        if base in GIT_GLOBAL_FLAGS:
+            index += 1
+            continue
+        return False  # unknown global option: do not guess
+    if index >= total:
         return False
+    sub = args[index].lower()
+    rest = args[index + 1:]
+    lowered = [arg.lower() for arg in rest]
+    for arg in lowered:
+        if arg.split("=", 1)[0] in GIT_WRITE_ARGS:
+            return False
+    positionals = _git_positionals(rest)
+    if sub in GIT_READ_ONLY_SUBCOMMANDS:
+        if sub == "help" and not positionals:
+            return False  # bare `git help` opens a pager
+        return True
+    if sub in GIT_RECOVERABLE_SUBCOMMANDS:
+        if sub == "reset" and any(arg in GIT_RESET_DESTRUCTIVE_FLAGS for arg in lowered):
+            return False
+        return True
+    if sub == "branch":
+        # -d refuses unmerged branches; -D forces deletion. Case matters.
+        return "-D" not in rest
+    if sub == "tag":
+        return not any(arg in GIT_TAG_WRITE_FLAGS for arg in lowered)
+    if sub == "config":
+        # Writing config can install aliases/hooks that execute arbitrary code.
+        return any(arg in GIT_CONFIG_READ_FLAGS for arg in lowered)
+    if sub in GIT_CHAIN_SUBCOMMANDS:
+        second = positionals[0].lower() if positionals else None
+        if second is None:
+            return True  # bare remote/worktree/notes/reflog/bisect just list
+        return second in GIT_CHAIN_SUBCOMMANDS[sub]
+    # checkout mixes "switch branch" with "discard local changes" and is hard
+    # to tell apart; git switch is the unambiguous alternative.
+    return False
+
+
+def _posix_read_only_commands(shell_name: str, platform_name: str) -> set[str]:
+    """Drop allowlist entries that this shell/platform does not actually ship."""
+    allowed = set(READ_ONLY_COMMANDS)
+    if shell_name == "git-bash":
+        allowed -= GIT_BASH_MISSING_COMMANDS
+    elif platform_name == "Darwin":
+        allowed -= LINUX_ONLY_COMMANDS | BSD_MISSING_COMMANDS
+    # Windows + a non-git-bash POSIX shell may be WSL, which ships the full set.
+    return allowed
+
+
+def _posix_words_are_read_only(words: list[str], allowed: set[str]) -> bool:
+    if not words:
+        return True
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+        return False
+    program = words[0]
+    if program == "git":
+        return is_read_only_git(words[1:])
+    if "/" in program or program not in allowed:
+        return False
+    args = words[1:]
+    unsafe = UNSAFE_ARG_CHECKS.get(program)
+    if unsafe and any(unsafe(arg) for arg in args):
+        return False
+    if program == "curl" and any(arg.startswith(CURL_UNSAFE_ARG_PREFIXES) for arg in args):
+        return False
+    if program == "wget" and not _wget_reads_stdout(args):
+        return False
+    if program == "awk" and _awk_args_are_unsafe(args):
+        return False
+    if program == "xargs" and not _xargs_target_is_read_only(args, allowed):
+        return False
+    return True
+
+
+def _posix_read_only(command: str, shell_name: str, platform_name: str) -> bool:
     if not command.strip():
         return False
-    if "`" in command or "$" in command or ">" in command or "<<" in command or "<(" in command:
+    # $(...) runs a command; a plain $VAR only expands to a string and is never
+    # re-parsed as shell syntax, so it cannot introduce a new command. Blocking
+    # all '$' would also reject awk '{print $1}', which is pure text processing.
+    if "`" in command or "$(" in command or ">" in command or "<<" in command or "<(" in command:
         return False
     if re.search(r"(?<!&)&(?!&)", command):
         return False
@@ -9497,23 +9699,333 @@ def is_read_only_command(command: str, shell_kind: str = "posix") -> bool:
             return False
         segments[-1].append(token)
 
-    for words in segments:
-        if not words:
+    allowed = _posix_read_only_commands(shell_name, platform_name)
+    return all(_posix_words_are_read_only(words, allowed) for words in segments)
+
+
+# --------------------------------------------------------------------------- #
+# PowerShell read-only judgement (permissive: block only dangerous constructs)
+# --------------------------------------------------------------------------- #
+
+# Built-in aliases, normalised to their cmdlet so the verb rules below apply.
+PS_ALIAS_TABLE = {
+    "ac": "add-content", "asnp": "add-pssnapin", "cat": "get-content",
+    "cd": "set-location", "chdir": "set-location", "clc": "clear-content",
+    "clear": "clear-host", "clhy": "clear-history", "cli": "clear-item",
+    "clp": "clear-itemproperty", "cls": "clear-host", "clv": "clear-variable",
+    "cnsn": "connect-pssession", "compare": "compare-object",
+    "copy": "copy-item", "cp": "copy-item", "cpi": "copy-item",
+    "cpp": "copy-itemproperty", "curl": "invoke-webrequest",
+    "cvpa": "convert-path", "dbp": "disable-psbreakpoint", "del": "remove-item",
+    "diff": "compare-object", "dir": "get-childitem",
+    "dnsn": "disconnect-pssession", "ebp": "enable-psbreakpoint",
+    "echo": "write-output", "epal": "export-alias", "epcsv": "export-csv",
+    "epsn": "export-pssession", "erase": "remove-item",
+    "etsn": "enter-pssession", "exsn": "exit-pssession",
+    "fc": "format-custom", "fhx": "format-hex", "fl": "format-list",
+    "foreach": "foreach-object", "ft": "format-table", "fw": "format-wide",
+    "gal": "get-alias", "gbp": "get-psbreakpoint", "gc": "get-content",
+    "gcb": "get-clipboard", "gci": "get-childitem", "gcm": "get-command",
+    "gcs": "get-pscallstack", "gdr": "get-psdrive", "ghy": "get-history",
+    "gi": "get-item", "gin": "get-computerinfo", "gjb": "get-job",
+    "gl": "get-location", "gm": "get-member", "gmo": "get-module",
+    "gp": "get-itemproperty", "gps": "get-process",
+    "gpv": "get-itempropertyvalue", "group": "group-object",
+    "gsn": "get-pssession", "gsv": "get-service", "gtz": "get-timezone",
+    "gu": "get-unique", "gv": "get-variable", "gwmi": "get-wmiobject",
+    "h": "get-history", "history": "get-history", "help": "get-help",
+    "icm": "invoke-command", "iex": "invoke-expression",
+    "ihy": "invoke-history", "ii": "invoke-item", "ise": "powershell_ise.exe",
+    "ipal": "import-alias",
+    "ipcsv": "import-csv", "ipmo": "import-module",
+    "ipsn": "import-pssession", "irm": "invoke-restmethod",
+    "iwmi": "invoke-wmimethod", "iwr": "invoke-webrequest",
+    "kill": "stop-process", "lp": "out-printer", "ls": "get-childitem",
+    "man": "get-help", "md": "mkdir", "measure": "measure-object",
+    "mi": "move-item", "mount": "new-psdrive", "move": "move-item",
+    "mp": "move-itemproperty", "mv": "move-item", "nal": "new-alias",
+    "ndr": "new-psdrive", "ni": "new-item", "nmo": "new-module",
+    "npssc": "new-pssessionconfigurationfile", "nsn": "new-pssession",
+    "nv": "new-variable", "ogv": "out-gridview", "oh": "out-host",
+    "popd": "pop-location", "ps": "get-process", "pushd": "push-location",
+    "pwd": "get-location", "r": "invoke-history", "rbp": "remove-psbreakpoint",
+    "rcjb": "receive-job", "rcsn": "receive-pssession", "rd": "remove-item",
+    "rdr": "remove-psdrive", "ren": "rename-item", "ri": "remove-item",
+    "rjb": "remove-job", "rm": "remove-item", "rmdir": "remove-item",
+    "rmo": "remove-module", "rni": "rename-item", "rnp": "rename-itemproperty",
+    "rp": "remove-itemproperty", "rsn": "remove-pssession",
+    "rsnp": "remove-pssnapin", "rujb": "resume-job", "rv": "remove-variable",
+    "rvpa": "resolve-path", "rwmi": "remove-wmiobject", "sajb": "start-job",
+    "sal": "set-alias", "saps": "start-process", "sasv": "start-service",
+    "sbp": "set-psbreakpoint", "sc": "set-content", "select": "select-object",
+    "set": "set-variable", "shcm": "show-command", "si": "set-item",
+    "sl": "set-location", "sleep": "start-sleep", "sls": "select-string",
+    "sort": "sort-object", "sp": "set-itemproperty", "spjb": "stop-job",
+    "spps": "stop-process", "spsv": "stop-service", "sujb": "suspend-job",
+    "sv": "set-variable", "swmi": "set-wmiinstance", "tee": "tee-object",
+    "trcm": "trace-command", "type": "get-content", "where": "where-object",
+    "wjb": "wait-job", "write": "write-output",
+}
+
+# Verbs that change state. Anything else (Get/Test/Select/Where/Sort/Format/...)
+# is allowed through, so new cmdlets inherit the right behaviour for free.
+PS_DANGEROUS_VERBS = frozenset({
+    "set", "new", "remove", "clear", "add", "enable", "disable", "start",
+    "stop", "restart", "install", "uninstall", "register", "unregister",
+    "rename", "move", "copy", "save", "restore", "backup", "update", "upgrade",
+    "publish", "send", "push", "pop", "mount", "dismount", "optimize",
+    "repair", "resize", "initialize", "grant", "revoke", "block", "unblock",
+    "protect", "unprotect", "enter", "exit", "suspend", "resume", "wait",
+    "receive", "import", "export", "connect", "disconnect",
+})
+# Dangerous verb, harmless cmdlet.
+PS_SAFE_CMDLET_EXCEPTIONS = frozenset({
+    "set-location", "clear-host", "start-sleep", "import-csv", "import-clixml",
+})
+# Safe verb, dangerous cmdlet.
+PS_DANGEROUS_CMDLETS = frozenset({
+    "invoke-expression", "invoke-command", "invoke-item", "invoke-cimmethod",
+    "invoke-history", "invoke-wmimethod", "write-eventlog", "out-file",
+    "out-printer", "out-gridview", "tee-object", "measure-command",
+    "trace-command", "debug-runspace", "convertto-mp4", "convert-image",
+    "get-credential",
+})
+# Defence in depth for aliases that must never slip through.
+PS_DANGEROUS_ALIASES = frozenset({
+    "iex", "r", "ipmo", "rmo", "nmo", "sc", "rm", "del", "rd", "ri", "erase",
+    "mv", "move", "cp", "copy", "cpi", "cnp", "ni", "ac", "ah", "tee",
+    "sp", "rp", "sv", "set", "rvi", "rni", "start", "saps", "spps", "kill",
+    "sasv", "spsv", "sajb", "spjb", "sujb", "rujb", "rjb", "wjb", "rcjb",
+    "etn", "ips", "npsv", "epcsv", "icm", "ii", "ihy", "iwmi", "trcm",
+})
+# External programs run arbitrary code, so they are blocked by name.
+PS_DANGEROUS_EXECUTABLES = frozenset({
+    "python", "python2", "python3", "py", "node", "nodejs", "npm", "npx",
+    "bun", "deno", "perl", "ruby", "php", "dotnet", "java", "javaw",
+    "pwsh", "powershell", "powershell_ise", "powershell_ise.exe",
+    "cmd", "cmd.exe", "bash", "sh", "zsh", "dash", "ksh", "wsl",
+    "sudo", "su", "eval", "exec", "source", ".",
+    "rm", "rmdir", "del", "mv", "cp", "mkdir", "touch", "truncate", "shred",
+    "chmod", "chown", "mkfs", "dd", "install",
+    "taskkill", "pkill", "killall", "kill", "reg", "regedit", "wmic",
+    "bcdedit", "diskpart", "format", "shutdown", "msiexec", "certutil",
+    "bitsadmin", "explorer",
+    "rundll32", "regsvr32", "mshta", "wscript", "cscript",
+})
+PS_UNSAFE_PARAMS = frozenset({
+    "-outfile", "-method", "-body", "-infile", "-form", "-uploadfile",
+    "-credential", "-clientcertificate",
+})
+PS_WEB_UNSAFE_SHORT = ("-o", "-O", "-d", "-F", "-T", "-X", "-c", "-D", "-K", "-J")
+PS_WEB_UNSAFE_LONG = (
+    "--output", "--remote-name", "--data", "--form", "--json", "--upload-file",
+    "--request", "--cookie-jar", "--dump-header", "--config", "--output-dir",
+    "--trace", "--stderr",
+)
+PS_SCRIPT_SUFFIXES = (".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".wsf")
+
+_PS_OPERATORS = (";", "|")
+# Characters that let a command escape the name-based checks below.
+_PS_UNSAFE_CHARS = frozenset("&<>()[]")
+_PS_WORD_BREAK = frozenset(";&<>()[]'\"{}")
+
+
+def _tokenize_powershell(command: str) -> list[str] | None:
+    """Split a PowerShell command, or return None on a dangerous construct.
+
+    shlex cannot be used here: in POSIX mode it eats the backslashes in
+    C:\\path. Quotes are handled so that a '>' inside a string is not a
+    redirection and a plain $variable is not a subexpression.
+    """
+    tokens: list[str] = []
+    index = 0
+    total = len(command)
+    while index < total:
+        char = command[index]
+        if char.isspace():
+            index += 1
             continue
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+        if char == "'":
+            index += 1
+            buffer: list[str] = []
+            closed = False
+            while index < total:
+                current = command[index]
+                if current == "'":
+                    if index + 1 < total and command[index + 1] == "'":
+                        buffer.append("'")
+                        index += 2
+                        continue
+                    index += 1
+                    closed = True
+                    break
+                buffer.append(current)
+                index += 1
+            if not closed:
+                return None
+            tokens.append("".join(buffer))
+            continue
+        if char == '"':
+            index += 1
+            buffer = []
+            closed = False
+            while index < total:
+                current = command[index]
+                if current == "`":
+                    if index + 1 >= total:
+                        return None
+                    buffer.append(command[index + 1])
+                    index += 2
+                    continue
+                if current == "$" and index + 1 < total and command[index + 1] == "(":
+                    return None
+                if current == '"':
+                    if index + 1 < total and command[index + 1] == '"':
+                        buffer.append('"')
+                        index += 2
+                        continue
+                    index += 1
+                    closed = True
+                    break
+                buffer.append(current)
+                index += 1
+            if not closed:
+                return None
+            tokens.append("".join(buffer))
+            continue
+        if char == "$" and index + 1 < total and command[index + 1] == "(":
+            return None
+        if char in _PS_OPERATORS or char in "{}":
+            tokens.append(char)
+            index += 1
+            continue
+        if char in _PS_UNSAFE_CHARS:
+            return None
+        if char == "#":
+            break  # comment: the rest of the line cannot execute
+        buffer = []
+        while index < total:
+            current = command[index]
+            if current.isspace() or current in _PS_WORD_BREAK:
+                break
+            if current == "`":
+                if index + 1 >= total:
+                    return None
+                buffer.append(command[index + 1])
+                index += 2
+                continue
+            if current == "$" and index + 1 < total and command[index + 1] == "(":
+                return None
+            buffer.append(current)
+            index += 1
+        if not buffer:
+            return None
+        tokens.append("".join(buffer))
+    return tokens
+
+
+def _powershell_token_is_safe(token: str) -> bool:
+    name = token.lower()
+    if name in PS_DANGEROUS_ALIASES:
+        return False
+    canonical = PS_ALIAS_TABLE.get(name, name)
+    if "-" in canonical:
+        if canonical in PS_DANGEROUS_CMDLETS:
             return False
-        program = words[0]
-        if "/" in program or program not in READ_ONLY_COMMANDS:
+        verb = canonical.split("-", 1)[0]
+        return verb not in PS_DANGEROUS_VERBS or canonical in PS_SAFE_CMDLET_EXCEPTIONS
+    return canonical not in PS_DANGEROUS_EXECUTABLES
+
+
+def _powershell_git_mentions_are_safe(tokens: list[str]) -> bool:
+    """git can appear inside a script block too, so check every occurrence."""
+    index = 0
+    while index < len(tokens):
+        if tokens[index].lower() == "git":
+            args: list[str] = []
+            cursor = index + 1
+            while cursor < len(tokens) and tokens[cursor] not in ("{", "}"):
+                args.append(tokens[cursor])
+                cursor += 1
+            if not is_read_only_git(args):
+                return False
+            index = cursor
+            continue
+        index += 1
+    return True
+
+
+def _powershell_params_are_safe(tokens: list[str]) -> bool:
+    for token in tokens:
+        low = token.lower()
+        if any(low == param or low.startswith(param + "=") for param in PS_UNSAFE_PARAMS):
             return False
-        args = words[1:]
-        unsafe = UNSAFE_ARG_CHECKS.get(program)
-        if unsafe and any(unsafe(arg) for arg in args):
+    name = tokens[0].lower()
+    canonical = PS_ALIAS_TABLE.get(name, name)
+    web = canonical in ("invoke-webrequest", "invoke-restmethod") or name in (
+        "curl", "curl.exe", "wget", "wget.exe",
+    )
+    if web:
+        for token in tokens[1:]:
+            if token in PS_WEB_UNSAFE_SHORT or token.startswith(PS_WEB_UNSAFE_LONG):
+                return False
+    return True
+
+
+def _powershell_read_only(command: str) -> bool:
+    if not command.strip():
+        return False
+    tokens = _tokenize_powershell(command)
+    if tokens is None:
+        return False
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _PS_OPERATORS:
+            segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    segments.append(current)
+    segments = [segment for segment in segments if segment]
+    if not segments:
+        return False
+    for segment in segments:
+        first = segment[0].lower()
+        if first.startswith((".\\", "./", "..\\", "../")) or first.endswith(PS_SCRIPT_SUFFIXES):
+            return False  # invoking a script file runs arbitrary code
+        if not _powershell_git_mentions_are_safe(segment):
             return False
-        if program == "curl" and any(arg.startswith(CURL_UNSAFE_ARG_PREFIXES) for arg in args):
+        if not all(_powershell_token_is_safe(token) for token in segment):
             return False
-        if program == "wget" and not _wget_reads_stdout(args):
+        if not _powershell_params_are_safe(segment):
             return False
     return True
+
+
+def is_read_only_command(
+    command: str,
+    shell_kind: str = "posix",
+    *,
+    shell_name: str = "",
+    platform_name: str | None = None,
+) -> bool:
+    """True when a command only inspects state, so no approval is needed.
+
+    The bias is towards letting commands through: an over-strict rule makes
+    every command prompt, and users then turn confirmation off entirely.
+    Only genuinely destructive constructs are blocked.
+
+    cmd.exe is still treated as potentially mutating: its %VAR% expansion
+    happens before parsing, which makes a safe rule hard to state.
+    """
+    if shell_kind == "posix":
+        return _posix_read_only(
+            command, shell_name, platform_name or platform.system()
+        )
+    if shell_kind == "powershell":
+        return _powershell_read_only(command)
+    return False
 
 
 def _kill_process_tree(process: "subprocess.Popen[Any]") -> None:
@@ -12161,7 +12673,9 @@ class Workspace:
             except ShellError as exc:
                 raise ToolError(str(exc)) from exc
             explicit = True
-        read_only = is_read_only_command(command, current.kind)
+        read_only = is_read_only_command(
+            command, current.kind, shell_name=current.name
+        )
         if not self._approve("run_command", command, read_only=read_only):
             raise ToolError("permission denied by user")
         if timeout_seconds is None:
@@ -12212,7 +12726,9 @@ class Workspace:
                 not is_current
                 and self.confirm
                 and read_only
-                and not is_read_only_command(command, candidate.kind)
+                and not is_read_only_command(
+                    command, candidate.kind, shell_name=candidate.name
+                )
             ):
                 skipped.append(candidate.name)
                 continue
@@ -23932,12 +24448,27 @@ def run_web(
         )
     if active_client.reasoning is not None:
         print(f"[web] reasoning: {active_client.reasoning.label}", file=sys.stderr)
-    if workspace.allow_shell:
-        print("[web] shell tools enabled; web mode never asks for approval", file=sys.stderr)
-    if workspace.allow_skill_scripts and any(
-        skill["has_scripts"] for skill in workspace.skills.values()
-    ):
-        print("[web] warning: skill scripts can run without approval", file=sys.stderr)
+    if workspace.confirm:
+        print(
+            "[web] approval enabled; write_file/edit_file/run_command and skill "
+            "scripts ask for confirmation in the browser (streaming requests only)",
+            file=sys.stderr,
+        )
+    else:
+        if workspace.allow_shell:
+            print(
+                "[web] shell tools enabled; commands run without confirmation "
+                "(add --confirm to ask in the browser)",
+                file=sys.stderr,
+            )
+        if workspace.allow_skill_scripts and any(
+            skill["has_scripts"] for skill in workspace.skills.values()
+        ):
+            print(
+                "[web] warning: skill scripts run without approval "
+                "(add --confirm to ask in the browser)",
+                file=sys.stderr,
+            )
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(
             f"[web] warning: listening on {host} over plain HTTP; anyone who can "
