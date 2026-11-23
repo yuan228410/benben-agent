@@ -43,8 +43,10 @@ you> /shell           # 查看当前和可用 shell
 you> /shell zsh       # 切换 shell
 you> /status          # 查看连接、模型、shell、会话和工作区
 you> /session         # 列出最近会话
-you> /session use 1   # 切换到第 1 个会话
-you> /session new     # 开始新会话
+you> /session use 1   # 切换到第 1 个会话，并恢复其工作空间
+you> /session new     # 使用当前工作空间开始新会话
+you> /session new /path/project  # 指定工作空间开始新会话
+you> /workspace /path/project     # 切换工作空间并新建
 you> /session info    # 查看当前会话
 you> /session delete 2  # 删除非当前会话
 ...
@@ -245,7 +247,7 @@ Windows 乱码处理：
 | `--anthropic-auth` | `x-api-key` | Anthropic 认证方式：`x-api-key` 或 `bearer` |
 | `--max-steps` | `100` | 每轮最多调用模型多少次 |
 | `--timeout` | `120` | HTTP 超时（秒） |
-| `--cwd` | 当前目录 | 工具的根目录，文件访问被限制在该目录内 |
+| `--cwd` | 当前目录 | 工具的根目录，也是新会话的默认工作空间；文件访问被限制在该目录内 |
 | `-i, --image` | 无 | 给任务附加图片，可重复，最多 4 张、单张 10 MB |
 | `--confirm` / `--no-confirm` | 关 | 是否在写文件和会修改状态的命令前询问；只读命令从不询问，`--yes` 是 `--no-confirm` 的别名 |
 | `--no-shell` | 关 | 禁用 `run_command` |
@@ -619,7 +621,7 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 
 `-c` 后面的值只有是 8 位小写十六进制时才当作会话 id，否则按 prompt 处理。
 
-`--list` 显示 uuid、日期、消息数、模型、工作区和首条用户消息，按序号倒序。恢复只带回消息历史；模型仍由 `-m`/默认值决定，工具根目录仍是当前 `--cwd`。
+`--list` 显示 uuid、日期、消息数、模型、工作区和首条用户消息，按序号倒序。恢复会带回消息历史，并自动切换到会话记录的工作空间；`--cwd` 只作为新会话的默认工作空间。
 
 交互模式里用 `/session` 管理会话：
 
@@ -627,8 +629,9 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 /session                    列出最近会话
 /session list all           列出全部会话
 /session list <关键词>      按标题/UUID/模型过滤
-/session use <编号|uuid>    切换会话
-/session new                开始新会话（同 /reset）
+/session use <编号|uuid>    切换会话，并恢复其工作空间
+/session new                使用当前工作空间开始新会话（默认为启动全局工作空间）
+/session new <工作空间>     指定工作空间开始新会话
 /session info               查看当前会话
 /session info <编号|uuid>   查看指定会话
 /session export <编号|uuid> [--tool] [--thinking] [文件]
@@ -637,26 +640,48 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 /session delete <编号|uuid> 删除会话（不能删除当前会话）
 ```
 
+工作空间指令：
+
+```text
+/workspace                  查看当前和最近工作空间
+/workspace list             列出最近工作空间
+/workspace use <编号>       切换到最近工作空间并开始新会话
+/workspace <路径>           指定工作空间并开始新会话
+```
+
+工作空间规则：
+
+- 支持 `~` 和相对路径，相对路径按当前工作空间解析；
+- 必须是已存在的目录；
+- 不指定时使用当前全局工作空间（启动时的 `--cwd` 或配置文件里的 `cwd`）；
+- 切换工作空间会清空当前会话历史，下一次消息写入新会话文件；
+- 旧工作空间里仍在运行的后台任务会继续运行，并给出提示；
+- `/config save` 会把当前工作空间保存为默认 `cwd`。
+
+Web 端点击「+ 新建」会打开工作空间对话框，默认填当前全局工作空间，也可以从最近工作空间里选择或手动输入。Web 输入 `/session new <路径>` 或 `/workspace <路径>` 行为相同。
+
 `/session export` 默认只导出对话正文；`--tool` 同时导出工具调用和工具结果，`--thinking` 导出思考内容。不指定文件时写入当前工作区的 `session-<uuid>.md`。
 
-`/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏提供会话列表和新建；删除会话放在右键菜单里，右键还可以修改名称或导出 Markdown，聊天框输入 `/session` 也可以管理。
+`/reset` 仍会清空上下文并结束当前会话文件，下一条消息写入新文件。Web 侧边栏提供会话列表和新建，新建时可以选择工作空间；删除会话放在右键菜单里，右键还可以修改名称或导出 Markdown，聊天框输入 `/session` 也可以管理。
 
 ### 用量统计
 
 每次回答结束会在 stderr 打印一行用量（Web 端同样透传到聊天界面）：
 
 ```text
-[usage] turn: input=2757 cached=2656 new=101 hit=96% | context=2757/1000000 (0%) | total: calls=2 input=5413 new=2571 cached=2842 hit=52% output=91 reasoning=0 tokens=5504
+[usage] last: input=2757 cached=2656 new=101 hit=96% | context=2848/1000000 (0%) | total: calls=2 input=5413 new=2571 cached=2842 hit=52% output=91 reasoning=0 tokens=5504
 ```
 
 | 段 | 字段 | 含义 |
 | --- | --- | --- |
-| `turn:` | `input` / `cached` / `new` / `hit` | 最后一次模型调用的用量；`new = input - cached` 是实际新读入，`hit` 是缓存命中率 |
-| `context=` | `tokens/window (percent)` | 当前上下文占用。优先用上次请求的真实 prompt token 推算（真实值 + 本地估算增量），没有可用基线时才回退到字符估算 |
+| `last:` | `input` / `cached` / `new` / `hit` | 最后一次模型调用的用量；`new = input - cached` 是实际新读入，`hit` 是缓存命中率 |
+| `context=` | `tokens/window (percent)` | 下一轮上下文占用；以最后一次真实 prompt token 为锚点，加上本轮输出和本地估算增量。没有可用基线时才回退到字符估算并带 `~` |
 | `total:` | `calls` / `input` / `cached` / `hit` / `output` / `reasoning` / `tokens` | 本次回答内所有模型调用的累计；`calls` 是调用次数，`tokens = input + output` |
 
-- 只调用一次模型时 `turn` 与 `total` 数值相同；触发工具调用后 `calls` 增长，`total` 是累加值；
-- `hit` 里 `turn` 反映最后一轮命中情况，`total` 会被首轮冷启动拉低；
+- 只调用一次模型时 `last` 与 `total` 数值相同；触发工具调用后 `calls` 增长，`total` 是累加值；
+- `last` 是“最后一次调用”，不是整轮累计；
+- `hit` 里 `last` 反映最后一次调用命中情况，`total` 会被首轮冷启动拉低；
+- `reasoning` 是 `output` 的子集，不会再次计入 `tokens`；
 - `/context` 命令同样优先用真实值推算；压缩会重置基线并回退到估算。
 
 ### 压缩上下文
@@ -1115,7 +1140,7 @@ python3 benben-agent.py --web
 
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
-- 页面支持对话、新建/切换/删除历史会话（删除有确认弹框）、上传图片；侧边栏会话区占据主要高度，连接和模型收在底部「连接与模型」折叠组里；
+- 页面支持对话、新建/切换/删除历史会话（新建时可选择工作空间，删除有确认弹框）、上传图片；侧边栏会话区占据主要高度，连接和模型收在底部「连接与模型」折叠组里；
 - 侧边栏「帮助 / 指令」打开帮助弹窗，列出 Web 支持的斜杠命令和常用操作；输入 `/help` 也可以打开；
 - 会话列表支持右键菜单修改名称、导出 Markdown、删除会话；聊天框输入 `/session` 也可以管理会话；
 - 启用 `--schedule` 后「工具与帮助」里显示「定时任务」，可查看/运行/启停/删除任务和查看运行记录，后台每 5 秒轮询一次并提示新结果；
@@ -1256,7 +1281,7 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - 工具结果超过 20000 字符会截断；`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 1000 行。
 - `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，不跟随符号链接逃出工作区；`glob` 在遍历阶段就剪枝，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
 - `write_file`、`edit_file` 和 `/save` 使用同目录临时文件 + `os.replace` 原子替换，中断时不会留下半个文件。
-- 文件路径经过 `realpath` 规范化，符号链接也无法逃逸出 `--cwd`。
+- 文件路径经过 `realpath` 规范化，符号链接也无法逃逸出当前工作空间根目录。
 - 交互模式会自动开启 Linux 终端的 `IUTF8` 标志，并容错解码输入，避免中文退格留下残缺字节导致 `UnicodeDecodeError`。
 
 ## 测试

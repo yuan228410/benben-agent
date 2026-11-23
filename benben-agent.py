@@ -27,7 +27,7 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --anthropic-auth MODE   Anthropic 认证：x-api-key 或 bearer，默认 x-api-key
     --max-steps N           每轮最多调用模型多少次，默认 100
     --timeout SECONDS       HTTP 超时，默认 120
-    --cwd DIR               工具的工作区根目录，默认当前目录
+    --cwd DIR               工具的工作区根目录，也是新会话的默认工作空间
     --profile NAME          使用已保存的连接（不修改配置里的 active）
     --config PATH           配置文件路径，默认 ~/.benben-agent/config.json
     --no-config             启动时忽略配置文件（/connect 保存时仍保留其他连接）
@@ -110,12 +110,16 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /session                      列出最近会话
     /session list all             列出全部会话
     /session use <number|uuid>    切换会话
-    /session new                  开始新会话
+    /session new [工作空间]        开始新会话，可指定工作空间
     /session info [number|uuid]   查看当前或指定会话
     /session export <number|uuid> [--tool] [--thinking] [file]
                                   导出会话 Markdown
     /session rename <title>       修改当前会话标题
     /session delete <number|uuid> 删除会话（不能删除当前会话）
+    /workspace                    查看当前和最近工作空间
+    /workspace list               列出最近工作空间
+    /workspace use <number>       切换到最近工作空间并新建会话
+    /workspace <path>             指定工作空间并新建会话
     /schedule                     查看定时任务
     /schedule history <id> [n]    查看运行记录
     /schedule run <id>            立即排队执行
@@ -1012,6 +1016,10 @@ class ChatCancelled(Exception):
 
 class StreamNotSupported(Exception):
     """Raised when an endpoint rejects a streaming request; callers fall back."""
+
+
+class WorkspaceError(Exception):
+    """Raised when a workspace path cannot be used."""
 
 
 class ToolError(Exception):
@@ -4669,10 +4677,18 @@ def merge_usage(total: dict[str, int], usage: Any) -> None:
     """Accumulate OpenAI-style usage dicts, including reasoning and cached tokens."""
     if not isinstance(usage, dict):
         return
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+    for key in ("prompt_tokens", "completion_tokens"):
         value = usage.get(key)
         if isinstance(value, int):
             total[key] = total.get(key, 0) + value
+    total_value = usage.get("total_tokens")
+    if not isinstance(total_value, int) or total_value <= 0:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+            total_value = prompt_tokens + completion_tokens
+    if isinstance(total_value, int) and total_value >= 0:
+        total["total_tokens"] = total.get("total_tokens", 0) + total_value
     details = usage.get("completion_tokens_details")
     if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
         total["reasoning_tokens"] = total.get("reasoning_tokens", 0) + details["reasoning_tokens"]
@@ -5332,6 +5348,16 @@ def _session_meta(path: str) -> tuple[str, str]:
     if isinstance(record, dict) and record.get("_type") == "meta":
         return record.get("model") or "?", record.get("workspace") or "?"
     return "?", "?"
+
+
+def session_workspace(uuid: str) -> str | None:
+    paths = _find_session_paths(uuid)
+    if not paths:
+        return None
+    _, workspace = _session_meta(paths[0])
+    if not workspace or workspace == "?":
+        return None
+    return workspace
 
 
 def _session_title(path: str) -> str:
@@ -8096,6 +8122,8 @@ class Workspace:
         self.confirm = confirm
         self.allow_shell = allow_shell
         self.skills = skills or {}
+        self.skills_enabled = False
+        self.only_own_skills = False
         self.allow_skill_scripts = allow_skill_scripts
         self.shell_state = shell_state or detect_shell_state()
         self.shell_fallback = shell_fallback
@@ -9079,6 +9107,132 @@ class Workspace:
         if handler is None:
             raise ToolError(f"unknown tool: {name}")
         return handler(**arguments)
+
+
+# --------------------------------------------------------------------------- #
+# Workspace switching
+# --------------------------------------------------------------------------- #
+
+
+def normalize_workspace(path: str, base: str | None = None) -> str:
+    value = os.path.expanduser(str(path or "").strip())
+    if not value:
+        raise WorkspaceError("workspace path must not be empty")
+    if not os.path.isabs(value):
+        value = os.path.join(base or os.getcwd(), value)
+    root = os.path.realpath(value)
+    if not os.path.exists(root):
+        raise WorkspaceError(f"workspace does not exist: {path}")
+    if not os.path.isdir(root):
+        raise WorkspaceError(f"workspace is not a directory: {path}")
+    if not os.access(root, os.R_OK | os.X_OK):
+        raise WorkspaceError(f"workspace is not readable: {path}")
+    return root
+
+
+def running_job_count(workspace: "Workspace") -> int:
+    try:
+        return sum(
+            1
+            for job in workspace.jobs.list_snapshots()
+            if job.get("status") == "running"
+        )
+    except ToolError:
+        return 0
+
+
+def switch_workspace(
+    workspace: "Workspace",
+    path: str,
+    *,
+    skills_enabled: bool | None = None,
+    only_own_skills: bool | None = None,
+    args: Any | None = None,
+) -> str:
+    """Point an existing workspace at another directory.
+
+    Background jobs keep their original working directory; callers should
+    warn when jobs are still running.
+    """
+    new_root = normalize_workspace(path, workspace.root)
+    if new_root == workspace.root:
+        return new_root
+    workspace.root = new_root
+    if skills_enabled is None:
+        skills_enabled = bool(getattr(workspace, "skills_enabled", False))
+    if only_own_skills is None:
+        only_own_skills = bool(getattr(workspace, "only_own_skills", False))
+    if skills_enabled:
+        workspace.skills = discover_skills(
+            new_root, only_own=only_own_skills
+        )
+        workspace.skills_enabled = True
+        workspace.only_own_skills = bool(only_own_skills)
+    if workspace.memory is not None:
+        workspace.memory.workspace = new_root
+    if args is not None:
+        args.cwd = new_root
+    return new_root
+
+
+def recent_workspaces(workspace: "Workspace", limit: int = 8) -> list[str]:
+    seen = [workspace.root]
+    for row in session_summaries():
+        raw = row.get("workspace")
+        if not raw or raw == "?":
+            continue
+        try:
+            root = os.path.realpath(os.path.expanduser(str(raw)))
+        except OSError:
+            continue
+        if root not in seen and os.path.isdir(root):
+            seen.append(root)
+    return seen[: max(1, int(limit))]
+
+
+def print_workspace_status(workspace: "Workspace") -> None:
+    print(f"workspace: {workspace.root}")
+    rows = recent_workspaces(workspace)
+    if len(rows) > 1:
+        print("recent workspaces:")
+        for index, root in enumerate(rows, 1):
+            marker = " *" if root == workspace.root else ""
+            print(f"  {index}. {root}{marker}")
+
+
+def apply_workspace_switch(
+    workspace: "Workspace",
+    path: str,
+    args: Any | None = None,
+    *,
+    announce: bool = True,
+) -> bool:
+    previous = workspace.root
+    running = running_job_count(workspace)
+    new_root = switch_workspace(
+        workspace,
+        path,
+        skills_enabled=(
+            bool(getattr(args, "skills", False)) if args is not None else None
+        ),
+        only_own_skills=(
+            bool(getattr(args, "only_own_skills", False)) if args is not None else None
+        ),
+        args=args,
+    )
+    if new_root == previous:
+        if announce:
+            print(f"workspace unchanged: {new_root}")
+        return False
+    if announce:
+        print(f"workspace: {new_root}")
+        if running:
+            print(
+                f"note: {running} background job(s) are still running "
+                "in the previous workspace",
+                file=sys.stderr,
+            )
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -10955,7 +11109,8 @@ def run_turn(
     workspace.job_event = lambda kind, text: report(kind, text)
     workspace.cancel_event = cancel_event
     usage_total: dict[str, int] = {}
-    usage_turn: dict[str, int] = {}
+    last_call_usage: dict[str, int] = {}
+    last_reply: dict[str, Any] | None = None
     call_count = 0
     truncated = False
     reasoning_warned = False
@@ -11020,7 +11175,7 @@ def run_turn(
             add_usage(client.last_usage)
             turn_usage = normalize_usage(client.last_usage)
             if turn_usage:
-                usage_turn = turn_usage
+                last_call_usage = turn_usage
             # 记录真实值与本地估算的基线，供下次调用前推算上下文占用
             client.last_prompt_tokens = turn_usage.get("prompt_tokens")
             client.last_prompt_estimate = estimate_tokens(messages)
@@ -11030,6 +11185,7 @@ def run_turn(
             reply = clean_assistant_message(reply)
             if isinstance(reasoning, str) and reasoning.strip():
                 reply["_thinking"] = reasoning
+            last_reply = reply
             messages.append(reply)
 
             if show_thinking and isinstance(reasoning, str) and reasoning.strip():
@@ -11099,29 +11255,60 @@ def run_turn(
         workspace.cancel_event = None
         client.last_turn_usage = dict(usage_total)
         client.last_turn_truncated = truncated
-        if usage_total or usage_turn or context_window:
+        if usage_total or last_call_usage or context_window:
             parts = []
-            # 单轮：最后一次模型调用的用量，与 context 同量纲，反映"当前这一轮"
-            if usage_turn:
-                turn_cached = usage_turn.get('cached_tokens', 0)
-                turn_input = usage_turn.get('prompt_tokens', 0)
-                turn_hit = (turn_cached * 100 // turn_input) if turn_input > 0 else 0
+            # last: 最后一次模型调用；total: 整轮所有调用累计。
+            if last_call_usage:
+                last_cached = max(
+                    0, int(last_call_usage.get("cached_tokens", 0) or 0)
+                )
+                last_input = max(
+                    0, int(last_call_usage.get("prompt_tokens", 0) or 0)
+                )
+                last_hit = (
+                    min(100, last_cached * 100 // last_input)
+                    if last_input > 0
+                    else 0
+                )
                 parts.append(
-                    f"turn: input={turn_input} "
-                    f"cached={turn_cached} "
-                    f"new={turn_input - turn_cached} "
-                    f"hit={turn_hit}%"
+                    f"last: input={last_input} "
+                    f"cached={last_cached} "
+                    f"new={max(0, last_input - last_cached)} "
+                    f"hit={last_hit}%"
                 )
             if context_window:
                 window = max(1, int(context_window))
-                # 优先用最后一次调用的真实 prompt token 数；没有才回退到本地估算
-                # （回退时带 `~` 前缀表示是估算值）
                 context_tokens = 0
                 is_estimate = True
-                if usage_turn:
-                    real_tokens = usage_turn.get('prompt_tokens', 0)
-                    if isinstance(real_tokens, int) and real_tokens > 0:
-                        context_tokens = real_tokens
+                if last_call_usage:
+                    real_tokens = int(
+                        last_call_usage.get("prompt_tokens", 0) or 0
+                    )
+                    if real_tokens > 0:
+                        completion_tokens = max(
+                            0,
+                            int(
+                                last_call_usage.get("completion_tokens", 0)
+                                or 0
+                            ),
+                        )
+                        # Anchor to the real prompt count and add the real
+                        # completion. Any messages appended after the final
+                        # reply (for example tool results) are estimated.
+                        context_tokens = real_tokens + completion_tokens
+                        baseline = getattr(
+                            client, "last_prompt_estimate", None
+                        )
+                        if (
+                            isinstance(baseline, int)
+                            and baseline >= 0
+                            and last_reply is not None
+                        ):
+                            delta = estimate_tokens(messages) - baseline
+                            reply_estimate = estimate_tokens([last_reply])
+                            context_tokens += max(
+                                0, delta - reply_estimate
+                            )
                         is_estimate = False
                 if is_estimate:
                     context_tokens = estimate_tokens(messages)
@@ -11130,20 +11317,34 @@ def run_turn(
                 parts.append(
                     f"context={tilde}{context_tokens}/{window} ({percent}%)"
                 )
-            # 累计：整轮任务内所有模型调用的用量之和，反映"总消耗"
+            # 累计：整轮任务内所有模型调用的用量之和，反映"总消耗"。
             if usage_total:
-                total_cached = usage_total.get('cached_tokens', 0)
-                total_input = usage_total.get('prompt_tokens', 0)
-                total_hit = (total_cached * 100 // total_input) if total_input > 0 else 0
+                total_cached = max(
+                    0, int(usage_total.get("cached_tokens", 0) or 0)
+                )
+                total_input = max(
+                    0, int(usage_total.get("prompt_tokens", 0) or 0)
+                )
+                total_output = max(
+                    0, int(usage_total.get("completion_tokens", 0) or 0)
+                )
+                total_hit = (
+                    min(100, total_cached * 100 // total_input)
+                    if total_input > 0
+                    else 0
+                )
+                total_tokens = usage_total.get("total_tokens", 0)
+                if not isinstance(total_tokens, int) or total_tokens <= 0:
+                    total_tokens = total_input + total_output
                 parts.append(
                     f"total: calls={call_count} "
                     f"input={total_input} "
-                    f"new={total_input - total_cached} "
+                    f"new={max(0, total_input - total_cached)} "
                     f"cached={total_cached} "
                     f"hit={total_hit}% "
-                    f"output={usage_total.get('completion_tokens', 0)} "
+                    f"output={total_output} "
                     f"reasoning={usage_total.get('reasoning_tokens', 0)} "
-                    f"tokens={usage_total.get('total_tokens', 0)}"
+                    f"tokens={total_tokens}"
                 )
             report("usage", "[usage] " + " | ".join(parts))
         if truncated:
@@ -11396,7 +11597,8 @@ def print_help() -> None:
     print("          /plan [on|off|guard off|approve|deny],")
     print("          /model [name|number|list|list all|info|config|use <conn> [model]], /context,")
     print("          /shell [name|path|list|auto],")
-    print("          /session [list|new|use <id>|export <id>|rename|delete|info],")
+    print("          /session [list|new [workspace]|use <id>|export <id>|rename|delete|info],")
+    print("          /workspace [list|use <n>|<path>],")
     print("          /schedule [list|history <id>|run <id>|on <id>|off <id>|delete <id>],")
     print("          /jobs [list|status|output|follow|detach|stop|clean|poll|lines],")
     print("          /stream [on|off|auto|status],")
@@ -11682,6 +11884,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .modal-actions button.danger { color: #d92d20; }
 .modal-actions button:disabled { color: #b0b6c0; cursor: default; }
 .modal-warning { margin-bottom: 10px; padding: 7px 9px; border-radius: 6px; background: #fff7e6; color: #93640b; font-size: 12px; }
+.modal-note { margin: 6px 0 10px; color: #8a919c; font-size: 12px; }
 .modal-status { min-height: 18px; color: #667085; font-size: 12px; white-space: pre-wrap; }
 .help-body h3 { margin: 14px 0 6px; font-size: 14px; }
 .help-body h3:first-child { margin-top: 0; }
@@ -11870,6 +12073,25 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   <button id="session-export" type="button">导出会话</button>
   <button id="session-delete" class="danger" type="button">删除会话</button>
 </div>
+<div id="new-session-modal" class="modal" hidden>
+  <div class="modal-card" style="width: 520px;">
+    <div class="modal-head">
+      <strong>新建会话</strong>
+      <button id="new-session-close" class="close" type="button" title="关闭">×</button>
+    </div>
+    <div class="form-row">
+      <label for="new-session-workspace">工作空间</label>
+      <input id="new-session-workspace" list="workspace-options" autocomplete="off" placeholder="留空则使用当前全局工作空间">
+      <datalist id="workspace-options"></datalist>
+    </div>
+    <div class="modal-note">支持 ~ 和相对路径；留空使用当前工作空间。</div>
+    <div id="new-session-status" class="modal-status"></div>
+    <div class="modal-actions">
+      <button id="new-session-start" class="primary" type="button">新建</button>
+      <button id="new-session-cancel" type="button">取消</button>
+    </div>
+  </div>
+</div>
 <div id="export-modal" class="modal" hidden>
   <div class="modal-card">
     <div class="modal-head">
@@ -11909,13 +12131,22 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
       <table class="help-table">
         <tr><td>/session</td><td>列出最近会话</td></tr>
         <tr><td>/session list all</td><td>列出全部会话</td></tr>
-        <tr><td>/session new</td><td>新建会话</td></tr>
-        <tr><td>/session use 编号|uuid</td><td>切换会话</td></tr>
+        <tr><td>/session new [工作空间]</td><td>新建会话，可指定工作空间</td></tr>
+        <tr><td>/session use 编号|uuid</td><td>切换会话并恢复其工作空间</td></tr>
         <tr><td>/session info</td><td>查看当前会话</td></tr>
         <tr><td>/session rename 新标题</td><td>修改当前会话标题</td></tr>
         <tr><td>/session delete 编号|uuid</td><td>删除会话</td></tr>
       </table>
       <div class="help-note">也可以右键会话：修改名称、导出会话、删除会话。</div>
+
+      <h3>工作空间</h3>
+      <table class="help-table">
+        <tr><td>/workspace</td><td>查看当前和最近工作空间</td></tr>
+        <tr><td>/workspace list</td><td>列出最近工作空间</td></tr>
+        <tr><td>/workspace use 编号</td><td>切换工作空间并开始新会话</td></tr>
+        <tr><td>/workspace 路径</td><td>指定工作空间并开始新会话</td></tr>
+      </table>
+      <div class="help-note">新建按钮会打开工作空间对话框；留空使用当前全局工作空间。</div>
 
       <h3>上下文</h3>
       <table class="help-table">
@@ -12135,6 +12366,9 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 <script>
 const token = new URLSearchParams(location.search).get("token") || "";
 let currentSession = null;
+let currentWorkspace = "";
+let globalWorkspace = "";
+let sessionsData = [];
 let currentModel = "";
 let currentReasoning = "";
 let uploads = [];
@@ -12201,6 +12435,13 @@ const reasoningEl = document.getElementById("reasoning");
 const filesEl = document.getElementById("files");
 const filesLabel = document.getElementById("files-label");
 const sessionsEl = document.getElementById("sessions");
+const newSessionModalEl = document.getElementById("new-session-modal");
+const newSessionWorkspaceEl = document.getElementById("new-session-workspace");
+const newSessionOptionsEl = document.getElementById("workspace-options");
+const newSessionStatusEl = document.getElementById("new-session-status");
+const newSessionStartEl = document.getElementById("new-session-start");
+const newSessionCancelEl = document.getElementById("new-session-cancel");
+const newSessionCloseEl = document.getElementById("new-session-close");
 const sessionMenuEl = document.getElementById("session-menu");
 const sessionRenameEl = document.getElementById("session-rename");
 const sessionExportEl = document.getElementById("session-export");
@@ -13117,18 +13358,22 @@ window.addEventListener("blur", hideSessionMenu);
 async function loadSessions() {
   try {
     const data = await api("/api/sessions");
+    sessionsData = data.sessions || [];
     sessionsEl.textContent = "";
-    for (const s of data.sessions) {
+    for (const s of sessionsData) {
       const row = document.createElement("div");
       row.className = "session-row";
       const button = document.createElement("button");
       button.className = "session" + (s.uuid === currentSession ? " active" : "");
+      if (s.workspace) button.title = "工作空间: " + s.workspace;
       const title = document.createElement("span");
       title.className = "title";
       title.textContent = s.title;
       const meta = document.createElement("span");
       meta.className = "meta";
-      meta.textContent = s.uuid + " · " + s.date + " · " + s.count + " 条";
+      const workspaceName = (s.workspace || "").split(/[\\\\/]/).filter(Boolean).pop();
+      meta.textContent = s.uuid + " · " + s.date + " · " + s.count + " 条" +
+        (workspaceName ? " · " + workspaceName : "");
       button.appendChild(title);
       button.appendChild(meta);
       button.onclick = () => openSession(s.uuid);
@@ -13486,6 +13731,12 @@ function applyRuntimeSettings(data) {
   }
   if (typeof data.stream === "boolean") {
     streamToggleEl.checked = data.stream;
+  }
+  if (typeof data.workspace === "string" && data.workspace) {
+    currentWorkspace = data.workspace;
+  }
+  if (typeof data.default_workspace === "string" && data.default_workspace) {
+    globalWorkspace = data.default_workspace;
   }
   if (typeof data.plan_mode === "boolean") {
     planToggleEl.checked = data.plan_mode;
@@ -13947,8 +14198,14 @@ async function openSession(uuid) {
   try {
     const data = await api("/api/open", { session: uuid });
     currentSession = data.session;
+    if (data.workspace) currentWorkspace = data.workspace;
     renderHistory(data.messages);
     loadSessions();
+    if (data.workspace_warning) {
+      statusEl.textContent = "⚠ " + data.workspace_warning;
+    } else if (data.workspace_changed) {
+      statusEl.textContent = "workspace: " + currentWorkspace;
+    }
   } catch (err) {
     statusEl.textContent = String(err);
   }
@@ -13968,18 +14225,58 @@ async function removeSession(uuid, title) {
   }
 }
 
-async function newSession() {
+function renderWorkspaceOptions() {
+  newSessionOptionsEl.textContent = "";
+  const seen = [];
+  if (globalWorkspace) seen.push(globalWorkspace);
+  if (currentWorkspace && !seen.includes(currentWorkspace)) seen.push(currentWorkspace);
+  for (const row of sessionsData) {
+    const workspace = row.workspace || "";
+    if (workspace && !seen.includes(workspace)) seen.push(workspace);
+  }
+  for (const workspace of seen) {
+    const option = document.createElement("option");
+    option.value = workspace;
+    newSessionOptionsEl.appendChild(option);
+  }
+}
+
+function openNewSessionDialog() {
+  renderWorkspaceOptions();
+  newSessionWorkspaceEl.value = globalWorkspace || currentWorkspace;
+  newSessionStatusEl.textContent = "";
+  newSessionModalEl.hidden = false;
+  newSessionWorkspaceEl.focus();
+  newSessionWorkspaceEl.select();
+}
+
+function closeNewSessionDialog() {
+  newSessionModalEl.hidden = true;
+}
+
+async function newSession(workspace, fromDialog = false) {
+  const value = (workspace === undefined ? "" : workspace || "").trim();
+  const body = value ? { workspace: value } : {};
   try {
-    await api("/api/new", {});
+    const data = await api("/api/new", body);
     currentSession = null;
+    currentWorkspace = data.workspace || currentWorkspace;
     renderHistory([]);
     uploads = [];
     filesEl.value = "";
     filesLabel.textContent = "";
     renderPreviews();
-    loadSessions();
+    closeNewSessionDialog();
+    await loadSessions();
+    statusEl.textContent = "新会话 · " + currentWorkspace;
+    return data;
   } catch (err) {
-    statusEl.textContent = String(err);
+    if (fromDialog) {
+      newSessionStatusEl.textContent = String(err);
+    } else {
+      statusEl.textContent = String(err);
+    }
+    return null;
   }
 }
 
@@ -14079,6 +14376,46 @@ function resolveSessionRef(ref, rows) {
   return null;
 }
 
+function recentWorkspaceRows() {
+  const rows = [];
+  if (currentWorkspace) rows.push(currentWorkspace);
+  for (const row of sessionsData) {
+    const workspace = row.workspace || "";
+    if (workspace && !rows.includes(workspace)) rows.push(workspace);
+  }
+  return rows;
+}
+
+async function handleWorkspaceCommand(argument) {
+  const value = (argument || "").trim();
+  const parts = value.split(/\s+/).filter(Boolean);
+  const action = (parts[0] || "").toLowerCase();
+  const rows = recentWorkspaceRows();
+  if (!action || action === "list" || action === "status") {
+    const lines = ["workspace: " + (currentWorkspace || "?")];
+    if (rows.length > 1) {
+      lines.push("recent workspaces:");
+      rows.forEach((workspace, index) => {
+        lines.push("  " + (index + 1) + ". " + workspace +
+          (workspace === currentWorkspace ? " *" : ""));
+      });
+    }
+    addLine("tool", lines.join("\n"));
+    return;
+  }
+  let target = value;
+  if (action === "use") {
+    const index = Number(parts[1] || "");
+    if (!Number.isInteger(index) || index < 1 || index > rows.length) {
+      addLine("tool", "usage: /workspace use <number>");
+      return;
+    }
+    target = rows[index - 1];
+  }
+  const data = await newSession(target);
+  if (data) addLine("tool", "workspace: " + data.workspace);
+}
+
 async function handleSessionCommand(argument) {
   const value = (argument || "").trim();
   const parts = value.split(/\s+/).filter(Boolean);
@@ -14106,8 +14443,8 @@ async function handleSessionCommand(argument) {
       return;
     }
     if (action === "new") {
-      await newSession();
-      addLine("tool", "new session; the next message starts a new one");
+      const data = await newSession(parts.slice(1).join(" "));
+      if (data) addLine("tool", "new session · " + (data.workspace || currentWorkspace));
       return;
     }
     if (action === "use") {
@@ -14168,7 +14505,7 @@ async function handleSessionCommand(argument) {
       await removeSession(row.uuid, row.title);
       return;
     }
-    addLine("tool", "usage: /session [list|new|use <id>|rename <title>|delete <id>|info]");
+    addLine("tool", "usage: /session [list|new [workspace]|use <id>|rename <title>|delete <id>|info]");
   } catch (err) {
     statusEl.textContent = String(err);
   }
@@ -14472,6 +14809,12 @@ async function send(explicitText) {
     handleStreamCommand(streamMatch[1] || "");
     return;
   }
+  const workspaceMatch = auto ? null : text.match(/^\/workspace(?:\s+(.*))?$/);
+  if (workspaceMatch) {
+    inputEl.value = "";
+    handleWorkspaceCommand(workspaceMatch[1] || "");
+    return;
+  }
   const sessionMatch = auto ? null : text.match(/^\/session(?:\s+(.*))?$/);
   if (sessionMatch) {
     inputEl.value = "";
@@ -14662,7 +15005,23 @@ async function send(explicitText) {
   }
 }
 
-document.getElementById("new").onclick = newSession;
+document.getElementById("new").onclick = openNewSessionDialog;
+newSessionCloseEl.onclick = closeNewSessionDialog;
+newSessionCancelEl.onclick = closeNewSessionDialog;
+newSessionStartEl.onclick = async () => {
+  newSessionStartEl.disabled = true;
+  try {
+    await newSession(newSessionWorkspaceEl.value, true);
+  } finally {
+    newSessionStartEl.disabled = false;
+  }
+};
+newSessionWorkspaceEl.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    newSessionStartEl.click();
+  }
+});
 compactEl.onclick = () => compactContext(2);
 sendEl.onclick = send;
 stopEl.onclick = async () => {
@@ -14694,6 +15053,8 @@ inputEl.addEventListener("keydown", (event) => {
     const state = await api("/api/state");
     currentSession = state.session;
     currentModel = state.model || "";
+    currentWorkspace = state.workspace || currentWorkspace;
+    globalWorkspace = state.default_workspace || globalWorkspace;
     if (currentModel) setModelOptions([currentModel], currentModel);
     renderHistory(state.messages);
     renderModelInfo(state.model_info, state.context);
@@ -14774,18 +15135,13 @@ def run_web(
         "stream_enabled": True,
         "last_activity": time.monotonic(),
     }
+    default_workspace = workspace.root
     runtime: dict[str, Any] = {"client": client, "connection": connection}
     config_state: dict[str, Any] = {"config": config}
     tools = tool_schemas(workspace)
 
-    def apply_plan_mode(enabled: bool, guard: str | None = None) -> None:
-        """Switch plan mode and refresh the system prompt and the tool list."""
-        nonlocal tools, system_message
-        workspace.plan_mode = enabled
-        workspace.plan_result = None
-        if guard is not None:
-            workspace.plan_guard = guard
-        tools = tool_schemas(workspace)
+    def refresh_web_system_message() -> None:
+        nonlocal system_message, tools
         system_message = {
             "role": "system",
             "content": build_system_prompt(
@@ -14798,8 +15154,27 @@ def run_web(
                 plan_mode=workspace.plan_mode,
             ),
         }
+        tools = tool_schemas(workspace)
         with lock:
-            state["messages"] = [system_message] + state["messages"][1:]
+            if state["messages"]:
+                state["messages"][0] = system_message
+
+    def apply_plan_mode(enabled: bool, guard: str | None = None) -> None:
+        """Switch plan mode and refresh the system prompt and the tool list."""
+        workspace.plan_mode = enabled
+        workspace.plan_result = None
+        if guard is not None:
+            workspace.plan_guard = guard
+        refresh_web_system_message()
+
+    def switch_web_workspace(path: str) -> tuple[bool, str | None]:
+        try:
+            changed = apply_workspace_switch(workspace, path, announce=False)
+        except WorkspaceError as exc:
+            return False, str(exc)
+        if changed:
+            refresh_web_system_message()
+        return changed, None
 
     def current_model_info() -> ModelInfo:
         with config_lock:
@@ -15217,6 +15592,7 @@ def run_web(
                         "api_format": active_connection.api_format,
                         "config_path": config_path,
                         "workspace": workspace.root,
+                        "default_workspace": default_workspace,
                         "shell": workspace.shell_state.to_dict(),
                         "busy": bool(chat_state["active"]),
                         "show_thinking": bool(
@@ -15262,6 +15638,8 @@ def run_web(
                     "api_format": active_connection.api_format,
                     "show_thinking": show,
                     "stream": bool(state.get("stream_enabled", True)),
+                    "workspace": workspace.root,
+                    "default_workspace": default_workspace,
                     "reasoning": {
                         "label": active_reasoning.label if active_reasoning else "",
                         "provider": active_reasoning.provider if active_reasoning else "",
@@ -15311,11 +15689,26 @@ def run_web(
                 return
 
             if parsed.path == "/api/new":
+                requested = payload.get("workspace")
+                changed = False
+                if requested is not None:
+                    if not isinstance(requested, str) or not requested.strip():
+                        self._error(400, "workspace must be a non-empty string")
+                        return
+                    changed, error = switch_web_workspace(requested)
+                    if error:
+                        self._error(400, error)
+                        return
                 with lock:
                     state["messages"] = [system_message]
                     state["session"] = None
                     state["last_activity"] = time.monotonic()
-                self._json(200, {"session": None, "messages": []})
+                self._json(200, {
+                    "session": None,
+                    "messages": [],
+                    "workspace": workspace.root,
+                    "workspace_changed": changed,
+                })
                 return
 
             if parsed.path == "/api/session/title":
@@ -15553,6 +15946,19 @@ def run_web(
                 if not isinstance(uuid, str):
                     self._error(400, "session must be a string")
                     return
+                changed = False
+                workspace_warning: str | None = None
+                saved_ws = session_workspace(uuid)
+                if saved_ws:
+                    try:
+                        target_root = normalize_workspace(saved_ws, workspace.root)
+                    except WorkspaceError as exc:
+                        workspace_warning = str(exc)
+                    else:
+                        if target_root != workspace.root:
+                            changed, error = switch_web_workspace(target_root)
+                            if error:
+                                workspace_warning = error
                 with lock:
                     messages = [system_message]
                     try:
@@ -15563,7 +15969,13 @@ def run_web(
                     state["messages"] = messages
                     state["session"] = session
                     state["last_activity"] = time.monotonic()
-                    self._json(200, {"session": session.uuid, "messages": history_view(messages, lazy_images=True, include_tools=True)})
+                    self._json(200, {
+                        "session": session.uuid,
+                        "messages": history_view(messages, lazy_images=True, include_tools=True),
+                        "workspace": workspace.root,
+                        "workspace_changed": changed,
+                        "workspace_warning": workspace_warning,
+                    })
                 return
 
             if parsed.path == "/api/model/info":
@@ -16951,6 +17363,8 @@ def main(argv: list[str] | None = None) -> int:
     workspace.skills = (
         discover_skills(workspace.root, only_own=args.only_own_skills) if args.skills else {}
     )
+    workspace.skills_enabled = bool(args.skills)
+    workspace.only_own_skills = bool(args.only_own_skills)
     workspace.allow_skill_scripts = args.skills and args.skill_scripts
     workspace.plan_mode = bool(args.plan_mode)
     workspace.plan_guard = str(args.plan_guard or "off")
@@ -17086,7 +17500,26 @@ def main(argv: list[str] | None = None) -> int:
                 "idle": idle_compact_raw(args),
             },
         )
-    messages: list[dict[str, Any]] = [
+    messages: list[dict[str, Any]] = []
+    resume_uuid: str | None = None
+    if args.resume is not None:
+        resume_uuid = args.resume or latest_session_uuid()
+        if resume_uuid is None:
+            print("no saved sessions; starting a new session", file=sys.stderr)
+        else:
+            saved_ws = session_workspace(resume_uuid)
+            if saved_ws:
+                try:
+                    if normalize_workspace(saved_ws, workspace.root) != workspace.root:
+                        apply_workspace_switch(workspace, saved_ws, args)
+                        tools = tool_schemas(workspace)
+                except WorkspaceError as exc:
+                    print(
+                        f"warning: saved workspace unavailable: {exc}; "
+                        f"keeping {workspace.root}",
+                        file=sys.stderr,
+                    )
+    messages = [
         {
             "role": "system",
             "content": build_system_prompt(
@@ -17101,23 +17534,20 @@ def main(argv: list[str] | None = None) -> int:
         }
     ]
     session = None
-    if args.resume is not None:
-        resume_uuid = args.resume or latest_session_uuid()
-        if resume_uuid is None:
-            print("no saved sessions; starting a new session", file=sys.stderr)
-        else:
-            try:
-                session = load_session(resume_uuid, messages)
-            except SessionError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 1
-            print(f"resumed session: {os.path.basename(session.path)} ({len(messages) - 1} messages)")
+    if resume_uuid is not None:
+        try:
+            session = load_session(resume_uuid, messages)
+        except SessionError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"resumed session: {os.path.basename(session.path)} "
+            f"({len(messages) - 1} messages)"
+        )
 
-    def apply_plan_mode(enabled: bool) -> None:
-        """Switch plan mode and refresh the system prompt and the tool list."""
+    def refresh_system_prompt() -> None:
+        """Rebuild the system prompt after workspace or plan changes."""
         nonlocal tools
-        workspace.plan_mode = enabled
-        workspace.plan_result = None
         messages[0] = {
             "role": "system",
             "content": build_system_prompt(
@@ -17131,6 +17561,12 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         tools = tool_schemas(workspace)
+
+    def apply_plan_mode(enabled: bool) -> None:
+        """Switch plan mode and refresh the system prompt and the tool list."""
+        workspace.plan_mode = enabled
+        workspace.plan_result = None
+        refresh_system_prompt()
 
     def run_current_turn() -> None:
         run_turn(
@@ -17328,6 +17764,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(f"connection: {connection.name or 'custom'} [{connection.sources.get('base_url', 'default')}]")
                 print(f"model: {client.model}")
+                print(f"workspace: {workspace.root}")
                 print(f"model info: {model_info_summary(model_info)}")
                 usage = context_usage(messages, model_info, client)
                 print(
@@ -17517,12 +17954,23 @@ def main(argv: list[str] | None = None) -> int:
                     continue
 
                 if action == "new":
-                    if session is None and len(messages) <= 1:
+                    switched = False
+                    if rest:
+                        try:
+                            switched = apply_workspace_switch(
+                                workspace, rest, args
+                            )
+                        except WorkspaceError as exc:
+                            print(f"error: {exc}", file=sys.stderr)
+                            continue
+                    if session is None and len(messages) <= 1 and not switched:
                         print("already in a new session")
                     else:
                         messages = messages[:1]
                         pending_images = []
                         session = None
+                        if switched:
+                            refresh_system_prompt()
                         print("history cleared; the next message starts a new session")
                     continue
 
@@ -17558,15 +18006,23 @@ def main(argv: list[str] | None = None) -> int:
                             file=sys.stderr,
                         )
                     saved_ws = row.get("workspace")
-                    if (
-                        saved_ws
-                        and saved_ws not in ("?", "")
-                        and os.path.realpath(saved_ws) != workspace.root
-                    ):
-                        print(
-                            f"note: saved workspace is {saved_ws}, current workspace is {workspace.root}",
-                            file=sys.stderr,
-                        )
+                    if saved_ws and saved_ws not in ("?", ""):
+                        try:
+                            target_root = normalize_workspace(
+                                saved_ws, workspace.root
+                            )
+                        except WorkspaceError as exc:
+                            print(
+                                f"warning: saved workspace unavailable: {exc}; "
+                                f"keeping {workspace.root}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            if target_root != workspace.root:
+                                apply_workspace_switch(
+                                    workspace, target_root, args
+                                )
+                                refresh_system_prompt()
                     continue
 
                 if action == "info":
@@ -17709,16 +18165,49 @@ def main(argv: list[str] | None = None) -> int:
 
                 if action == "help":
                     print(
-                        "usage: /session [list [all|keyword]|new|use <id|number>|"
+                        "usage: /session [list [all|keyword]|new [workspace]|use <id|number>|"
                         "info [id|number]|export <id|number> [--tool] [--thinking] [file]|"
                         "rename <title>|delete <id|number>]"
                     )
                     continue
 
                 print(
-                    "usage: /session [list|new|use <id>|export <id> [--tool] [--thinking] [file]|"
+                    "usage: /session [list|new [workspace]|use <id>|export <id> [--tool] [--thinking] [file]|"
                     "rename <title>|delete <id>|info|help]"
                 )
+                continue
+            if user_input == "/workspace" or user_input.startswith("/workspace "):
+                argument = user_input[len("/workspace"):].strip()
+                parts = argument.split(maxsplit=1)
+                action = parts[0].lower() if parts else ""
+                rest = parts[1].strip() if len(parts) > 1 else ""
+                if action in ("", "list", "status"):
+                    print_workspace_status(workspace)
+                    continue
+                if action == "use":
+                    rows = recent_workspaces(workspace)
+                    try:
+                        index = int(rest)
+                    except ValueError:
+                        print("usage: /workspace use <number>")
+                        continue
+                    if not 1 <= index <= len(rows):
+                        print(f"error: choose 1-{len(rows)}")
+                        continue
+                    target = rows[index - 1]
+                else:
+                    target = argument
+                try:
+                    changed = apply_workspace_switch(workspace, target, args)
+                except WorkspaceError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    continue
+                if changed:
+                    messages = messages[:1]
+                    pending_images = []
+                    session = None
+                    refresh_system_prompt()
+                    print("history cleared; the next message starts a new session")
                 continue
             if user_input == "/reset":
                 messages = messages[:1]
@@ -17779,14 +18268,18 @@ def main(argv: list[str] | None = None) -> int:
                     percent = min(
                         100, int(stats["after_tokens"] * 100 / window)
                     )
-                    u_cached = usage.get('cached_tokens', 0)
-                    u_input = usage.get('prompt_tokens', 0)
-                    u_hit = (u_cached * 100 // u_input) if u_input > 0 else 0
+                    u_cached = max(0, int(usage.get('cached_tokens', 0) or 0))
+                    u_input = max(0, int(usage.get('prompt_tokens', 0) or 0))
+                    u_hit = (
+                        min(100, u_cached * 100 // u_input)
+                        if u_input > 0
+                        else 0
+                    )
                     print(
-                        "[usage] turn: "
+                        "[usage] last: "
                         f"input={u_input} "
                         f"cached={u_cached} "
-                        f"new={u_input - u_cached} "
+                        f"new={max(0, u_input - u_cached)} "
                         f"hit={u_hit}% "
                         f"| context=~{stats['after_tokens']}/{window} ({percent}%)",
                         file=sys.stderr,

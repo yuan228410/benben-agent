@@ -137,7 +137,8 @@ def api(path, body=None, expect_error=False):
     except urllib.error.HTTPError as exc:
         if expect_error:
             return exc.code, exc.read().decode("utf-8")
-        raise
+        detail = exc.read().decode("utf-8")
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
     return 200, text
 
 
@@ -273,6 +274,12 @@ try:
     check(
         "web html stream checked",
         'id="stream-toggle" checked' in html,
+    )
+    check(
+        "web html new workspace",
+        'id="new-session-modal"' in html
+        and 'id="new-session-workspace"' in html
+        and "/workspace" in html,
     )
     check(
         "web html groups init order",
@@ -501,6 +508,93 @@ try:
         "model": "x",
     }, expect_error=True)
     check("bad format rejected", code == 400, code)
+
+    # Workspace selection for new sessions and resume.
+    original_state = api_json("/api/state")
+    original_workspace = original_state["workspace"]
+    original_default = original_state["default_workspace"]
+    check(
+        "web default workspace",
+        original_default == original_workspace,
+        original_state,
+    )
+    workspace_a = os.path.join(home, "workspace-a")
+    workspace_b = os.path.join(home, "workspace-b")
+    os.makedirs(workspace_a, exist_ok=True)
+    os.makedirs(workspace_b, exist_ok=True)
+    new_a = api_json("/api/new", {"workspace": workspace_a})
+    check(
+        "web new workspace",
+        new_a["workspace"] == os.path.realpath(workspace_a),
+        new_a,
+    )
+    check("web new workspace changed", new_a["workspace_changed"] is True, new_a)
+    check(
+        "web state workspace",
+        api_json("/api/state")["workspace"] == os.path.realpath(workspace_a),
+    )
+    check(
+        "web default workspace stable",
+        api_json("/api/state")["default_workspace"] == os.path.realpath(original_default),
+        original_default,
+    )
+    code, _ = api(
+        "/api/new",
+        {"workspace": os.path.join(home, "missing-workspace")},
+        expect_error=True,
+    )
+    check("web bad workspace rejected", code == 400, code)
+    sessions_dir = os.path.join(home, ".benben-agent", "sessions")
+    os.makedirs(sessions_dir, exist_ok=True)
+    workspace_session = "aa11bb22"
+    with open(
+        os.path.join(sessions_dir, f"999-20261123-{workspace_session}.jsonl"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps({
+            "_type": "meta",
+            "version": 1,
+            "uuid": workspace_session,
+            "sequence": 999,
+            "created": "2026-11-23T10:00:00",
+            "model": "m",
+            "workspace": os.path.realpath(workspace_a),
+        }) + "\n")
+        handle.write(json.dumps({
+            "role": "user",
+            "content": "workspace a chat",
+        }) + "\n")
+    new_b = api_json("/api/new", {"workspace": workspace_b})
+    check(
+        "web switch workspace b",
+        new_b["workspace"] == os.path.realpath(workspace_b),
+        new_b,
+    )
+    opened = api_json("/api/open", {"session": workspace_session})
+    check("web open workspace changed", opened["workspace_changed"] is True, opened)
+    check(
+        "web open workspace path",
+        opened["workspace"] == os.path.realpath(workspace_a),
+        opened,
+    )
+    check(
+        "web open workspace state",
+        api_json("/api/state")["workspace"] == os.path.realpath(workspace_a),
+    )
+    default_new = api_json("/api/new", {})
+    check(
+        "web new default workspace",
+        default_new["workspace"] == os.path.realpath(workspace_a),
+        default_new,
+    )
+    check("web new default unchanged", default_new["workspace_changed"] is False, default_new)
+    restored = api_json("/api/new", {"workspace": original_workspace})
+    check(
+        "web workspace restored",
+        restored["workspace"] == os.path.realpath(original_workspace),
+        restored,
+    )
 
     # Shell listing and switching.
     shells = api_json("/api/shells")

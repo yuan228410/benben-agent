@@ -3,6 +3,7 @@ import tempfile
 import importlib.util
 import json
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -54,8 +55,9 @@ print("events:", events)
 check("turn ok", ok)
 usage_text = next((t for k, t in events if k == "usage"), "")
 check("usage event", bool(usage_text), events)
-# 新格式：turn / total 分段，含 hit 命中率、new 新增、calls 调用次数
-check("usage turn segment", "turn:" in usage_text, usage_text)
+# 新格式：last / total 分段，含 hit 命中率、new 新增、calls 调用次数
+check("usage last segment", "last:" in usage_text, usage_text)
+check("usage no turn label", "turn:" not in usage_text, usage_text)
 check("usage total segment", "total:" in usage_text, usage_text)
 check("usage calls", "calls=1" in usage_text, usage_text)
 check("usage hit rate", "hit=20%" in usage_text, usage_text)
@@ -92,6 +94,48 @@ check(
     ),
     events3,
 )
+context_text = next((t for k, t in events3 if k == "usage"), "")
+context_match = re.search(r"context=~?(\d+)/1000", context_text)
+check(
+    "usage context includes output",
+    bool(context_match) and int(context_match.group(1)) > 10,
+    context_text,
+)
+
+
+class ClampedUsageClient:
+    model = "m"
+    reasoning = None
+    last_finish_reason = "stop"
+    last_reasoning_ignored = False
+    last_usage = {}
+    last_turn_usage = {}
+    last_turn_truncated = False
+    last_prompt_tokens = None
+    last_prompt_estimate = None
+
+    def chat(self, messages, tools, on_delta=None, cancel_event=None):
+        self.last_usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 20},
+        }
+        return {"role": "assistant", "content": "ok"}
+
+
+clamped_events = []
+agent.run_turn(
+    ClampedUsageClient(),
+    ws,
+    [{"role": "user", "content": "hi"}],
+    1,
+    emit=lambda kind, text: clamped_events.append((kind, text)),
+    context_window=100,
+)
+clamped_text = next((t for k, t in clamped_events if k == "usage"), "")
+check("usage new clamped", "new=0" in clamped_text, clamped_text)
+check("usage hit clamped", "hit=100%" in clamped_text, clamped_text)
+check("usage total fallback", "tokens=12" in clamped_text, clamped_text)
 
 # --- normalize_usage：不同网关的缓存字段都要归一化 ---
 n1 = agent.normalize_usage({
@@ -108,6 +152,12 @@ n2 = agent.normalize_usage({
     "prompt_cache_hit_tokens": 40,
 })
 check("normalize hit-tokens cached", n2.get("cached_tokens") == 40, n2)
+
+n3 = agent.normalize_usage({
+    "prompt_tokens": 10,
+    "completion_tokens": 5,
+})
+check("normalize total fallback", n3.get("total_tokens") == 15, n3)
 
 check("normalize non-dict", agent.normalize_usage(None) == {}, agent.normalize_usage(None))
 check("normalize empty", agent.normalize_usage({}) == {}, agent.normalize_usage({}))

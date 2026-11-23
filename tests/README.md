@@ -30,6 +30,7 @@ python3 tests/test_session_repair.py
 python3 tests/test_background_jobs.py
 python3 tests/test_model_switch.py
 python3 tests/test_streaming.py
+python3 tests/test_workspace.py
 ```
 
 测试会：
@@ -70,3 +71,4 @@ python3 tests/test_streaming.py
 | `test_background_jobs.py` | 自动转后台、跟随输出、进程取消、前台 Ctrl+C、`/jobs` |
 | `test_model_switch.py` | `/model list all`、跨连接切换、`--save` 持久化 |
 | `test_streaming.py` | OpenAI/Anthropic/Responses 流式组装、UTF-8、降级、重试、取消、CLI `/stream`、Web 事件 |
+| `test_workspace.py` | 工作空间校验、`/session new <path>`、`/workspace`、`-c` 恢复自动切换 |
