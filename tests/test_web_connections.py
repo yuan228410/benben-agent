@@ -596,6 +596,72 @@ try:
         restored,
     )
 
+    # Session trash, restore and prune API.
+    trash_uuid = "bb22cc33"
+    with open(
+        os.path.join(sessions_dir, f"998-20261123-{trash_uuid}.jsonl"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps({
+            "_type": "meta",
+            "version": 1,
+            "uuid": trash_uuid,
+            "sequence": 998,
+            "created": "2026-11-23T10:00:00",
+            "model": "m",
+            "workspace": os.path.realpath(original_workspace),
+        }) + "\n")
+        handle.write(json.dumps({"role": "user", "content": "trash me"}) + "\n")
+    deleted_payload = api_json("/api/delete", {"session": trash_uuid})
+    check("web delete trashes", deleted_payload.get("trashed") is True, deleted_payload)
+    trash_payload = api_json("/api/trash")
+    check(
+        "web trash list",
+        any(row["uuid"] == trash_uuid for row in trash_payload["sessions"]),
+        trash_payload,
+    )
+    check("web trash size", trash_payload["total_size"] > 0, trash_payload)
+    restored_payload = api_json("/api/session/restore", {"session": trash_uuid})
+    check("web restore", restored_payload["restored"] == trash_uuid, restored_payload)
+    check(
+        "web restore list",
+        any(row["uuid"] == trash_uuid for row in api_json("/api/sessions")["sessions"]),
+    )
+    api_json("/api/delete", {"session": trash_uuid})
+    emptied = api_json("/api/session/trash/empty", {})
+    check("web empty trash", emptied["removed"] >= 1, emptied)
+    prune_uuid = "cc33dd44"
+    with open(
+        os.path.join(sessions_dir, f"997-20261123-{prune_uuid}.jsonl"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps({
+            "_type": "meta",
+            "version": 1,
+            "uuid": prune_uuid,
+            "sequence": 997,
+            "created": "2026-11-23T10:00:00",
+            "model": "m",
+            "workspace": os.path.realpath(original_workspace),
+        }) + "\n")
+        handle.write(json.dumps({"role": "user", "content": "prune me"}) + "\n")
+    before_prune = len(api_json("/api/sessions")["sessions"])
+    dry = api_json("/api/session/prune", {"keep_count": 0, "confirm": False})
+    check("web prune dry-run", dry["dry_run"] is True, dry)
+    check("web prune candidates", len(dry["sessions"]) > 0, dry)
+    check(
+        "web prune keeps files",
+        len(api_json("/api/sessions")["sessions"]) == before_prune,
+    )
+    code, _ = api(
+        "/api/session/prune",
+        {"keep_count": -1},
+        expect_error=True,
+    )
+    check("web prune invalid", code == 400, code)
+
     # Shell listing and switching.
     shells = api_json("/api/shells")
     current_name = shells["current"]["name"]

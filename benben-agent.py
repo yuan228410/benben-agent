@@ -66,6 +66,8 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     --plan-guard MODE       计划模式守卫：off（只靠提示词，默认）| approve | deny
     -c, --continue [UUID]   恢复会话；省略 UUID 取最新，没有会话则新建
     --list                  列出已保存会话并退出，不联网
+    --check                 自检配置、目录、权限和模型能力，不联网
+    --doctor                自检并测试模型 API 连通性
     --web                   启动网页界面；强制免确认
     --host HOST             网页监听地址，默认 127.0.0.1
     --port PORT             网页端口，默认 8765；0 表示系统分配
@@ -115,7 +117,11 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /session export <number|uuid> [--tool] [--thinking] [file]
                                   导出会话 Markdown
     /session rename <title>       修改当前会话标题
-    /session delete <number|uuid> 删除会话（不能删除当前会话）
+    /session delete <number|uuid> 删除会话（移到回收站）
+    /session trash [empty]        查看或清空回收站
+    /session restore <uuid>       从回收站恢复会话
+    /session prune [--keep N] [--older-than 30d] [--max-size 500M] [--yes]
+                                  批量移动旧会话到回收站
     /workspace                    查看当前和最近工作空间
     /workspace list               列出最近工作空间
     /workspace use <number>       切换到最近工作空间并新建会话
@@ -272,6 +278,7 @@ MAX_SEARCH_FILE = 2_000_000
 MAX_GLOB_RESULTS = 500
 SESSION_DIR = os.path.expanduser("~/.benben-agent")
 SESSIONS_DIR = os.path.join(SESSION_DIR, "sessions")
+TRASH_DIR = os.path.join(SESSIONS_DIR, "trash")
 SCHEDULES_DIR = os.path.join(SESSION_DIR, "schedules")
 SCHEDULE_TASKS_FILE = os.path.join(SCHEDULES_DIR, "tasks.json")
 SCHEDULE_RUNS_DIR = os.path.join(SCHEDULES_DIR, "runs")
@@ -4877,6 +4884,228 @@ def _find_session_paths(uuid: str) -> list[str]:
     return sorted(set(files))
 
 
+def _ensure_trash_dir() -> None:
+    os.makedirs(TRASH_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(TRASH_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _trash_paths() -> list[str]:
+    return sorted(glob_mod.glob(os.path.join(TRASH_DIR, "*.jsonl")))
+
+
+def _session_row_from_path(path: str, *, trashed: bool = False) -> dict[str, Any] | None:
+    match = _SESSION_FILE_RE.search(os.path.basename(path))
+    if not match:
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    sequence, date, uuid = int(match.group(1)), match.group(2), match.group(3)
+    model, workspace = _session_meta(path)
+    row: dict[str, Any] = {
+        "uuid": uuid,
+        "sequence": sequence,
+        "date": date,
+        "count": _session_count(path),
+        "model": model,
+        "workspace": workspace,
+        "title": _session_title(path),
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "path": path,
+    }
+    if trashed:
+        row["deleted"] = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)
+        )
+    return row
+
+
+def trash_session(uuid: str) -> str:
+    matches = _find_session_paths(uuid)
+    if not matches:
+        raise SessionError(f"session not found: {uuid}")
+    if len(matches) > 1:
+        raise SessionError(f"ambiguous session id: {uuid}")
+    _ensure_trash_dir()
+    source = matches[0]
+    target = os.path.join(TRASH_DIR, os.path.basename(source))
+    if os.path.exists(target):
+        raise SessionError(f"session already exists in trash: {uuid}")
+    try:
+        os.replace(source, target)
+        os.utime(target, None)
+    except OSError as exc:
+        raise SessionError(str(exc)) from exc
+    return target
+
+
+def trashed_session_rows() -> list[dict[str, Any]]:
+    rows = []
+    for path in _trash_paths():
+        row = _session_row_from_path(path, trashed=True)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=lambda row: row["mtime"], reverse=True)
+    return rows
+
+
+def restore_session(uuid: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{8}", uuid):
+        raise SessionError("session id must be 8 lowercase hex characters")
+    matches = glob_mod.glob(os.path.join(TRASH_DIR, f"*-{uuid}.jsonl"))
+    if not matches:
+        raise SessionError(f"session not found in trash: {uuid}")
+    if len(matches) > 1:
+        raise SessionError(f"ambiguous session id: {uuid}")
+    _ensure_sessions_dir()
+    source = matches[0]
+    target = os.path.join(SESSIONS_DIR, os.path.basename(source))
+    if os.path.exists(target):
+        raise SessionError(f"session already exists: {uuid}")
+    try:
+        os.replace(source, target)
+        os.utime(target, None)
+    except OSError as exc:
+        raise SessionError(str(exc)) from exc
+    return target
+
+
+def purge_trash(days: int | None = None) -> list[str]:
+    removed: list[str] = []
+    cutoff = None if days is None else time.time() - max(0, days) * 86400
+    for path in _trash_paths():
+        if cutoff is not None:
+            try:
+                if os.stat(path).st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
+def prune_sessions(
+    *,
+    keep_days: int | None = None,
+    keep_count: int | None = None,
+    max_bytes: int | None = None,
+    protect: set[str] | None = None,
+    dry_run: bool = True,
+) -> list[dict[str, Any]]:
+    if keep_days is None and keep_count is None and max_bytes is None:
+        raise ValueError("prune requires keep_days, keep_count or max_bytes")
+    rows = []
+    for path in _session_files():
+        row = _session_row_from_path(path)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=lambda row: (row["mtime"], row["sequence"]), reverse=True)
+    selected: dict[str, dict[str, Any]] = {}
+    if keep_count is not None:
+        for row in rows[max(0, int(keep_count)):]:
+            selected[row["uuid"]] = row
+    if keep_days is not None:
+        cutoff = time.time() - max(0, int(keep_days)) * 86400
+        for row in rows:
+            if row["mtime"] < cutoff:
+                selected[row["uuid"]] = row
+    if max_bytes is not None:
+        total = 0
+        limit = max(0, int(max_bytes))
+        for row in rows:
+            if row["uuid"] in selected:
+                continue
+            if total + row["size"] > limit:
+                selected[row["uuid"]] = row
+            else:
+                total += row["size"]
+    for uuid in protect or set():
+        selected.pop(uuid, None)
+    selected_rows = sorted(selected.values(), key=lambda row: row["mtime"])
+    if not dry_run:
+        for row in selected_rows:
+            trash_session(str(row["uuid"]))
+    return selected_rows
+
+
+_SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)([kmgt]?)b?$", re.IGNORECASE)
+
+
+def parse_size_value(value: str) -> int:
+    match = _SIZE_RE.fullmatch(str(value or "").strip())
+    if not match:
+        raise ValueError("size must look like 500M, 2G or a byte count")
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    multiplier = {
+        "": 1,
+        "k": 1024,
+        "m": 1024 ** 2,
+        "g": 1024 ** 3,
+        "t": 1024 ** 4,
+    }[unit]
+    return int(number * multiplier)
+
+
+def parse_days_value(value: str) -> int:
+    match = re.fullmatch(r"(\d+)([dw])?", str(value or "").strip().lower())
+    if not match:
+        raise ValueError("age must look like 30d, 4w or a day count")
+    number = int(match.group(1))
+    return number * (7 if match.group(2) == "w" else 1)
+
+
+def format_size(value: int) -> str:
+    size = float(max(0, int(value)))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{int(size)} B"
+
+
+def print_trash() -> None:
+    rows = trashed_session_rows()
+    if not rows:
+        print("trash is empty")
+        return
+    print(f"trash: {len(rows)} session(s), {format_size(sum(r['size'] for r in rows))}")
+    for row in rows:
+        print(
+            f"  {row['uuid']}  {row['date']}  {format_size(row['size']):>9}  "
+            f"{row['deleted']}  {row['title']}"
+        )
+    print("usage: /session restore <uuid> | /session trash empty")
+
+
+def print_prune_candidates(rows: list[dict[str, Any]], dry_run: bool) -> None:
+    total = sum(row["size"] for row in rows)
+    if not rows:
+        print("nothing to prune")
+        return
+    print(
+        f"prune candidates: {len(rows)} session(s), {format_size(total)}"
+    )
+    for row in rows:
+        print(
+            f"  {row['uuid']}  {row['date']}  {format_size(row['size']):>9}  "
+            f"{row['title']}"
+        )
+    if dry_run:
+        print("dry-run: add --yes to move these sessions to trash")
+    else:
+        print(f"moved {len(rows)} session(s) to trash")
+
+
 def migrate_legacy_sessions() -> int:
     """Move old ~/.benben-agent/*.jsonl sessions into the sessions/ subdir."""
     try:
@@ -5310,16 +5539,9 @@ def load_session(uuid: str, messages: list[dict[str, Any]]) -> Session:
     return session
 
 
-def delete_session(uuid: str) -> None:
-    matches = _find_session_paths(uuid)
-    if not matches:
-        raise SessionError(f"session not found: {uuid}")
-    if len(matches) > 1:
-        raise SessionError(f"ambiguous session id: {uuid}")
-    try:
-        os.remove(matches[0])
-    except OSError as exc:
-        raise SessionError(str(exc)) from exc
+def delete_session(uuid: str) -> str:
+    """Move a session to trash. Permanent removal only happens via purge."""
+    return trash_session(uuid)
 
 
 def set_session_title(uuid: str, title: str) -> str:
@@ -11598,6 +11820,7 @@ def print_help() -> None:
     print("          /model [name|number|list|list all|info|config|use <conn> [model]], /context,")
     print("          /shell [name|path|list|auto],")
     print("          /session [list|new [workspace]|use <id>|export <id>|rename|delete|info],")
+    print("          /session [trash [empty]|restore <id>|prune --keep N --older-than 30d --max-size 500M],")
     print("          /workspace [list|use <n>|<path>],")
     print("          /schedule [list|history <id>|run <id>|on <id>|off <id>|delete <id>],")
     print("          /jobs [list|status|output|follow|detach|stop|clean|poll|lines],")
@@ -12071,7 +12294,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 <div id="session-menu" class="session-menu" hidden>
   <button id="session-rename" type="button">修改名称</button>
   <button id="session-export" type="button">导出会话</button>
-  <button id="session-delete" class="danger" type="button">删除会话</button>
+  <button id="session-delete" class="danger" type="button">移到回收站</button>
 </div>
 <div id="new-session-modal" class="modal" hidden>
   <div class="modal-card" style="width: 520px;">
@@ -12135,7 +12358,11 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         <tr><td>/session use 编号|uuid</td><td>切换会话并恢复其工作空间</td></tr>
         <tr><td>/session info</td><td>查看当前会话</td></tr>
         <tr><td>/session rename 新标题</td><td>修改当前会话标题</td></tr>
-        <tr><td>/session delete 编号|uuid</td><td>删除会话</td></tr>
+        <tr><td>/session delete 编号|uuid</td><td>移到回收站</td></tr>
+        <tr><td>/session trash</td><td>查看回收站</td></tr>
+        <tr><td>/session trash empty</td><td>清空回收站</td></tr>
+        <tr><td>/session restore 编号|uuid</td><td>从回收站恢复</td></tr>
+        <tr><td>/session prune --keep 100</td><td>批量移到回收站，默认 dry-run</td></tr>
       </table>
       <div class="help-note">也可以右键会话：修改名称、导出会话、删除会话。</div>
 
@@ -14218,7 +14445,7 @@ async function removeSession(uuid, title) {
       currentSession = null;
       renderHistory([]);
     }
-    statusEl.textContent = "已删除会话 " + uuid;
+    statusEl.textContent = "会话已移到回收站: " + uuid;
     loadSessions();
   } catch (err) {
     statusEl.textContent = String(err);
@@ -14416,6 +14643,30 @@ async function handleWorkspaceCommand(argument) {
   if (data) addLine("tool", "workspace: " + data.workspace);
 }
 
+function parseWorkspaceSize(value) {
+  const match = String(value || "").trim().match(/^(\d+(?:\.\d+)?)([kmgt]?)b?$/i);
+  if (!match) return null;
+  const units = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 };
+  return Math.round(Number(match[1]) * units[match[2].toLowerCase()]);
+}
+
+function parseWorkspaceDays(value) {
+  const match = String(value || "").trim().match(/^(\d+)([dw])?$/i);
+  if (!match) return null;
+  return Number(match[1]) * (match[2].toLowerCase() === "w" ? 7 : 1);
+}
+
+function formatBytes(value) {
+  let size = Number(value) || 0;
+  for (const unit of ["B", "KB", "MB", "GB", "TB"]) {
+    if (size < 1024 || unit === "TB") {
+      return unit === "B" ? Math.round(size) + " B" : size.toFixed(1) + " " + unit;
+    }
+    size /= 1024;
+  }
+  return size.toFixed(1) + " TB";
+}
+
 async function handleSessionCommand(argument) {
   const value = (argument || "").trim();
   const parts = value.split(/\s+/).filter(Boolean);
@@ -14445,6 +14696,94 @@ async function handleSessionCommand(argument) {
     if (action === "new") {
       const data = await newSession(parts.slice(1).join(" "));
       if (data) addLine("tool", "new session · " + (data.workspace || currentWorkspace));
+      return;
+    }
+    if (action === "trash") {
+      if ((parts[1] || "").toLowerCase() === "empty") {
+        if (!confirm("清空回收站？此操作不可恢复。")) return;
+        const data = await api("/api/session/trash/empty", {});
+        addLine("tool", "回收站已清空: " + data.removed + " 个会话");
+        loadSessions();
+        return;
+      }
+      const data = await api("/api/trash");
+      const rows = data.sessions || [];
+      if (!rows.length) {
+        addLine("tool", "回收站为空");
+        return;
+      }
+      const lines = ["回收站: " + rows.length + " 个会话, " + formatBytes(data.total_size)];
+      for (const row of rows) {
+        lines.push(
+          "  " + row.uuid + "  " + row.date + "  " +
+          formatBytes(row.size) + "  " + row.deleted + "  " + row.title
+        );
+      }
+      lines.push("usage: /session restore <uuid> | /session trash empty");
+      addLine("tool", lines.join("\n"));
+      return;
+    }
+    if (action === "restore") {
+      const uuid = (parts[1] || "").trim().toLowerCase();
+      if (!uuid) {
+        addLine("tool", "usage: /session restore <uuid>");
+        return;
+      }
+      const data = await api("/api/session/restore", { session: uuid });
+      addLine("tool", "已恢复会话 " + data.restored);
+      await loadSessions();
+      return;
+    }
+    if (action === "prune") {
+      let keepCount = null;
+      let keepDays = null;
+      let maxBytes = null;
+      let confirmed = false;
+      let index = 1;
+      while (index < parts.length) {
+        const flag = parts[index];
+        if (flag === "--yes") {
+          confirmed = true;
+          index += 1;
+        } else if (flag === "--keep" && parts[index + 1] !== undefined) {
+          keepCount = Number(parts[index + 1]);
+          index += 2;
+        } else if ((flag === "--older-than" || flag === "--days") && parts[index + 1] !== undefined) {
+          keepDays = parseWorkspaceDays(parts[index + 1]);
+          index += 2;
+        } else if (flag === "--max-size" && parts[index + 1] !== undefined) {
+          maxBytes = parseWorkspaceSize(parts[index + 1]);
+          index += 2;
+        } else {
+          addLine("tool", "usage: /session prune [--keep N] [--older-than 30d] [--max-size 500M] [--yes]");
+          return;
+        }
+      }
+      if (keepCount === null && keepDays === null && maxBytes === null) {
+        addLine("tool", "usage: /session prune [--keep N] [--older-than 30d] [--max-size 500M] [--yes]");
+        return;
+      }
+      const data = await api("/api/session/prune", {
+        keep_count: keepCount,
+        keep_days: keepDays,
+        max_bytes: maxBytes,
+        confirm: confirmed,
+      });
+      const rows = data.sessions || [];
+      if (!rows.length) {
+        addLine("tool", "没有需要清理的会话");
+        return;
+      }
+      const lines = [
+        (data.dry_run ? "prune dry-run: " : "已移到回收站: ") +
+        rows.length + " 个会话, " + formatBytes(data.total_size),
+      ];
+      for (const row of rows) {
+        lines.push("  " + row.uuid + "  " + row.date + "  " + formatBytes(row.size) + "  " + row.title);
+      }
+      if (data.dry_run) lines.push("确认执行请加 --yes");
+      addLine("tool", lines.join("\n"));
+      if (!data.dry_run) await loadSessions();
       return;
     }
     if (action === "use") {
@@ -14505,7 +14844,7 @@ async function handleSessionCommand(argument) {
       await removeSession(row.uuid, row.title);
       return;
     }
-    addLine("tool", "usage: /session [list|new [workspace]|use <id>|rename <title>|delete <id>|info]");
+    addLine("tool", "usage: /session [list|new [workspace]|use <id>|rename <title>|delete <id>|trash [empty]|restore <id>|prune ...|info]");
   } catch (err) {
     statusEl.textContent = String(err);
   }
@@ -15489,6 +15828,16 @@ def run_web(
             if parsed.path == "/api/sessions":
                 self._json(200, {"sessions": session_summaries()})
                 return
+            if parsed.path == "/api/trash":
+                rows = trashed_session_rows()
+                self._json(200, {
+                    "sessions": [
+                        {key: value for key, value in row.items() if key != "path"}
+                        for row in rows
+                    ],
+                    "total_size": sum(row["size"] for row in rows),
+                })
+                return
             if parsed.path == "/api/jobs":
                 self._json(200, {
                     "jobs": workspace.jobs.list_snapshots(),
@@ -15937,8 +16286,89 @@ def run_web(
                     current = state["session"]
                     self._json(200, {
                         "deleted": uuid,
+                        "trashed": True,
                         "session": current.uuid if current else None,
                     })
+                return
+
+            if parsed.path == "/api/session/restore":
+                uuid = payload.get("session")
+                if not isinstance(uuid, str) or not uuid:
+                    self._error(400, "session must be a non-empty string")
+                    return
+                try:
+                    restored = restore_session(uuid)
+                except SessionError as exc:
+                    self._error(404, str(exc))
+                    return
+                self._json(200, {
+                    "ok": True,
+                    "restored": uuid,
+                    "session": os.path.basename(restored),
+                })
+                return
+
+            if parsed.path == "/api/session/trash/empty":
+                days = payload.get("days")
+                if days is not None and (
+                    not isinstance(days, int)
+                    or isinstance(days, bool)
+                    or days < 0
+                ):
+                    self._error(400, "days must be a non-negative integer")
+                    return
+                removed = purge_trash(days)
+                self._json(200, {"ok": True, "removed": len(removed)})
+                return
+
+            if parsed.path == "/api/session/prune":
+                keep_count = payload.get("keep_count")
+                keep_days = payload.get("keep_days")
+                max_bytes = payload.get("max_bytes")
+                confirm = payload.get("confirm", False)
+                if not isinstance(confirm, bool):
+                    self._error(400, "confirm must be a boolean")
+                    return
+                for name, value in (
+                    ("keep_count", keep_count),
+                    ("keep_days", keep_days),
+                    ("max_bytes", max_bytes),
+                ):
+                    if value is not None and (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                    ):
+                        self._error(400, f"{name} must be a non-negative integer")
+                        return
+                if keep_count is None and keep_days is None and max_bytes is None:
+                    self._error(400, "provide keep_count, keep_days or max_bytes")
+                    return
+                protect = (
+                    {state["session"].uuid}
+                    if state["session"] is not None
+                    else set()
+                )
+                try:
+                    rows = prune_sessions(
+                        keep_count=keep_count,
+                        keep_days=keep_days,
+                        max_bytes=max_bytes,
+                        protect=protect,
+                        dry_run=not confirm,
+                    )
+                except (ValueError, SessionError) as exc:
+                    self._error(400, str(exc))
+                    return
+                self._json(200, {
+                    "ok": True,
+                    "dry_run": not confirm,
+                    "total_size": sum(row["size"] for row in rows),
+                    "sessions": [
+                        {key: value for key, value in row.items() if key != "path"}
+                        for row in rows
+                    ],
+                })
                 return
 
             if parsed.path == "/api/open":
@@ -16556,7 +16986,151 @@ def run_web(
     return 0
 
 
+def run_self_check(
+    args: Any,
+    workspace: "Workspace",
+    connection: Connection,
+    client: "BaseChatClient",
+    model_info: ModelInfo,
+    config_path: str,
+    *,
+    doctor: bool = False,
+) -> int:
+    """Offline checks plus an optional network/model probe."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    def ok(text: str) -> None:
+        print(f"[ok] {text}")
+
+    def warn(text: str) -> None:
+        warnings.append(text)
+        print(f"[warn] {text}")
+
+    def fail(text: str) -> None:
+        errors.append(text)
+        print(f"[error] {text}")
+
+    print("benben-agent self-check")
+    print(f"config: {config_path}")
+    if os.path.exists(config_path):
+        ok("config file exists")
+        if os.name != "nt":
+            mode = os.stat(config_path).st_mode & 0o777
+            if mode == 0o600:
+                ok("config permissions are 600")
+            else:
+                warn(f"config permissions are {oct(mode)} (expected 0o600)")
+    else:
+        warn("config file does not exist; built-in defaults are used")
+
+    active = connection.name or "custom"
+    ok(f"active connection: {active}")
+    if connection.base_url:
+        ok(f"base_url: {connection.base_url}")
+    else:
+        fail("connection base_url is empty")
+    if connection.model:
+        ok(f"model: {connection.model}")
+    else:
+        fail("connection model is empty")
+    if client.api_key:
+        ok("API key is present")
+    else:
+        warn("API key is empty; the provider may reject requests")
+
+    if os.path.isdir(workspace.root):
+        ok(f"workspace: {workspace.root}")
+        if not os.access(workspace.root, os.R_OK | os.X_OK):
+            fail("workspace is not readable/searchable")
+        elif os.access(workspace.root, os.W_OK):
+            ok("workspace is writable")
+        else:
+            warn("workspace is read-only")
+    else:
+        fail(f"workspace does not exist: {workspace.root}")
+
+    session_count = 0
+    session_bytes = 0
+    broken = 0
+    for path in _session_files():
+        try:
+            session_count += 1
+            session_bytes += os.path.getsize(path)
+            with open(path, encoding="utf-8") as handle:
+                first = json.loads(handle.readline())
+            if not isinstance(first, dict) or first.get("_type") != "meta":
+                broken += 1
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            broken += 1
+    ok(f"sessions: {session_count} file(s), {format_size(session_bytes)}")
+    if broken:
+        warn(f"sessions: {broken} file(s) have a missing or invalid meta line")
+    if session_bytes > 512 * 1024 * 1024:
+        warn("session files exceed 512 MB; consider /session prune")
+
+    trash_rows = trashed_session_rows()
+    ok(
+        f"trash: {len(trash_rows)} file(s), "
+        f"{format_size(sum(row['size'] for row in trash_rows))}"
+    )
+
+    tasks = load_schedule_tasks()
+    invalid_tasks = 0
+    for task in tasks:
+        when = str(task.get("when") or "")
+        try:
+            parse_schedule_when(when, datetime.now().replace(microsecond=0))
+        except (ValueError, TypeError):
+            invalid_tasks += 1
+    ok(f"schedules: {len(tasks)} task(s)")
+    if invalid_tasks:
+        fail(f"schedules: {invalid_tasks} task(s) have invalid when expressions")
+
+    if args.memory:
+        memory_dir = os.path.join(SESSION_DIR, "memory")
+        if os.path.isdir(memory_dir):
+            ok(f"memory: {memory_dir}")
+        else:
+            ok("memory: not created yet (enabled)")
+    else:
+        ok("memory: disabled")
+
+    if model_info.source in ("fallback", "remote"):
+        warn(
+            f"model capability source is {model_info.source}; "
+            "run /model config to save it"
+        )
+    else:
+        ok(f"model capability: {model_info.source}")
+
+    if doctor:
+        try:
+            models = client.list_models()
+        except ChatError as exc:
+            fail(f"model API probe failed: {exc}")
+        else:
+            ok(f"model API probe: {len(models)} model(s) reported")
+    else:
+        print("[ok] network probe skipped (use --doctor to test the API)")
+
+    if errors:
+        print(f"check failed: {len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1
+    print(f"check passed: {len(warnings)} warning(s)")
+    return 0
+
+
+def _handle_sigterm(signum: int, frame: Any) -> None:
+    """Exit through normal unwinding so atexit cleanup runs."""
+    raise SystemExit(128 + signum)
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except (ValueError, OSError):
+        pass
     parser = argparse.ArgumentParser(
         description="AI agent using OpenAI chat, OpenAI Responses, or Anthropic Messages APIs (standard library only).",
     )
@@ -16976,6 +17550,21 @@ def main(argv: list[str] | None = None) -> int:
         dest="list_sessions",
         action="store_true",
         help="list saved sessions and exit",
+    )
+    check_group = parser.add_mutually_exclusive_group()
+    check_group.add_argument(
+        "--check",
+        dest="check_mode",
+        action="store_const",
+        const="check",
+        help="run offline self-checks and exit",
+    )
+    check_group.add_argument(
+        "--doctor",
+        dest="check_mode",
+        action="store_const",
+        const="doctor",
+        help="run self-checks plus a model API probe and exit",
     )
     parser.add_argument("--web", action="store_true", help="serve a minimal browser UI")
     parser.add_argument(
@@ -17426,6 +18015,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"for this model ({', '.join(model_info.reasoning_providers)})",
                 file=sys.stderr,
             )
+    if args.check_mode:
+        return run_self_check(
+            args,
+            workspace,
+            connection,
+            client,
+            model_info,
+            config_path,
+            doctor=args.check_mode == "doctor",
+        )
     memory: MemoryService | None = None
     if memory_enabled:
         memory = MemoryService(
@@ -17452,6 +18051,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         workspace.scheduler = scheduler
         scheduler.start()
+        atexit.register(scheduler.stop)
         print(
             f"[schedule] enabled | tasks: {len(scheduler.list_tasks())} | "
             f"dir: {scheduler.base_dir}",
@@ -17974,6 +18574,92 @@ def main(argv: list[str] | None = None) -> int:
                         print("history cleared; the next message starts a new session")
                     continue
 
+                if action == "trash":
+                    if rest.lower() in ("empty", "purge", "clear"):
+                        try:
+                            answer = input("empty the session trash? [y/N]: ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print("\ncancelled")
+                            continue
+                        if answer not in ("y", "yes"):
+                            print("cancelled")
+                            continue
+                        removed = purge_trash()
+                        print(f"purged {len(removed)} session(s) from trash")
+                    elif rest:
+                        print("usage: /session trash [empty]")
+                    else:
+                        print_trash()
+                    continue
+
+                if action == "restore":
+                    if not rest:
+                        print("usage: /session restore <uuid>")
+                        continue
+                    try:
+                        restored = restore_session(rest.strip().lower())
+                    except SessionError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
+                    print(f"restored session: {os.path.basename(restored)}")
+                    continue
+
+                if action == "prune":
+                    tokens = rest.split()
+                    keep_count = None
+                    keep_days = None
+                    max_bytes = None
+                    confirmed = False
+                    index = 0
+                    try:
+                        while index < len(tokens):
+                            flag = tokens[index]
+                            if flag == "--yes":
+                                confirmed = True
+                                index += 1
+                                continue
+                            if flag == "--keep" and index + 1 < len(tokens):
+                                keep_count = int(tokens[index + 1])
+                                if keep_count < 0:
+                                    raise ValueError
+                                index += 2
+                                continue
+                            if flag in ("--older-than", "--days") and index + 1 < len(tokens):
+                                keep_days = parse_days_value(tokens[index + 1])
+                                index += 2
+                                continue
+                            if flag == "--max-size" and index + 1 < len(tokens):
+                                max_bytes = parse_size_value(tokens[index + 1])
+                                index += 2
+                                continue
+                            raise ValueError
+                    except ValueError:
+                        print(
+                            "usage: /session prune [--keep N] "
+                            "[--older-than 30d] [--max-size 500M] [--yes]"
+                        )
+                        continue
+                    if keep_count is None and keep_days is None and max_bytes is None:
+                        print(
+                            "usage: /session prune [--keep N] "
+                            "[--older-than 30d] [--max-size 500M] [--yes]"
+                        )
+                        continue
+                    protect = {session.uuid} if session is not None else set()
+                    try:
+                        candidates = prune_sessions(
+                            keep_count=keep_count,
+                            keep_days=keep_days,
+                            max_bytes=max_bytes,
+                            protect=protect,
+                            dry_run=not confirmed,
+                        )
+                    except (ValueError, SessionError) as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
+                    print_prune_candidates(candidates, dry_run=not confirmed)
+                    continue
+
                 if action == "use":
                     if not rest:
                         print("usage: /session use <number|uuid>")
@@ -18160,20 +18846,22 @@ def main(argv: list[str] | None = None) -> int:
                     except SessionError as exc:
                         print(f"error: {exc}", file=sys.stderr)
                         continue
-                    print(f"deleted session {row['uuid']}")
+                    print(f"deleted session {row['uuid']} (moved to trash)")
                     continue
 
                 if action == "help":
                     print(
                         "usage: /session [list [all|keyword]|new [workspace]|use <id|number>|"
                         "info [id|number]|export <id|number> [--tool] [--thinking] [file]|"
-                        "rename <title>|delete <id|number>]"
+                        "rename <title>|delete <id|number>|trash [empty]|"
+                        "restore <id>|prune [--keep N] [--older-than 30d] [--max-size 500M] [--yes]]"
                     )
                     continue
 
                 print(
                     "usage: /session [list|new [workspace]|use <id>|export <id> [--tool] [--thinking] [file]|"
-                    "rename <title>|delete <id>|info|help]"
+                    "rename <title>|delete <id>|trash [empty]|restore <id>|"
+                    "prune [--keep N] [--older-than 30d] [--max-size 500M] [--yes]|info|help]"
                 )
                 continue
             if user_input == "/workspace" or user_input.startswith("/workspace "):

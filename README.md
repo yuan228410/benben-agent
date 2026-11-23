@@ -48,7 +48,8 @@ you> /session new     # 使用当前工作空间开始新会话
 you> /session new /path/project  # 指定工作空间开始新会话
 you> /workspace /path/project     # 切换工作空间并新建
 you> /session info    # 查看当前会话
-you> /session delete 2  # 删除非当前会话
+you> /session delete 2  # 移到回收站
+you> /session trash     # 查看回收站
 ...
 you> /exit
 ```
@@ -285,6 +286,8 @@ Windows 乱码处理：
 | `--plan-guard` | `off` | 计划模式守卫：`off`（只靠提示词）/ `approve`（改状态要确认）/ `deny`（直接拒绝） |
 | `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
 | `--list` | 关 | 列出已保存的会话并退出，不联网、不需要 API key |
+| `--check` | 关 | 离线自检配置、目录、权限、会话、调度和模型能力，不联网 |
+| `--doctor` | 关 | 在 `--check` 基础上测试模型 API 连通性 |
 | `--web` | 关 | 启动浏览器界面；网页模式强制免确认 |
 | `--host` | `127.0.0.1` | 网页监听地址 |
 | `--port` | `8765` | 网页端口，`0` 表示由系统分配 |
@@ -637,7 +640,36 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 /session export <编号|uuid> [--tool] [--thinking] [文件]
                             导出 Markdown
 /session rename <新标题>    修改当前会话标题
-/session delete <编号|uuid> 删除会话（不能删除当前会话）
+/session delete <编号|uuid> 移到回收站（不能删除当前会话）
+/session trash              查看回收站
+/session trash empty        清空回收站
+/session restore <uuid>     从回收站恢复会话
+/session prune [--keep N] [--older-than 30d] [--max-size 500M] [--yes]
+                            批量移动旧会话到回收站
+```
+
+### 回收站和 prune
+
+删除会话不会立刻删除文件，而是移到：
+
+```text
+~/.benben-agent/sessions/trash/
+```
+
+- `/session trash` 列出回收站，包含大小和删除时间
+- `/session restore <uuid>` 恢复
+- `/session trash empty` 永久清空
+- `/session prune` 默认 dry-run，只列出候选
+- 加 `--yes` 才真正移动到回收站
+- 当前会话始终受保护，不会被 prune
+
+示例：
+
+```text
+/session prune --keep 100
+/session prune --older-than 90d
+/session prune --max-size 500M
+/session prune --keep 100 --yes
 ```
 
 工作空间指令：
