@@ -89,6 +89,14 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": 2, "completion_tokens": 1},
             })
             return
+        if mode == "slow_json":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(5)
+            return
         if mode == "options" and "stream_options" in payload:
             json_response(self, {"error": "unknown stream_options"}, 400)
             return
@@ -325,6 +333,24 @@ except agent.ChatCancelled:
 elapsed = time.monotonic() - started
 check("cancel fast", elapsed < 2.5, elapsed)
 check("cancel partial", bool(seen), seen)
+
+print("== non-stream cancellation ==")
+OpenAIHandler.mode = "slow_json"
+client = agent.ChatClient(base, "", "m", timeout=5, max_retries=0)
+cancel = threading.Event()
+threading.Timer(0.3, cancel.set).start()
+started = time.monotonic()
+try:
+    client.chat(
+        [{"role": "user", "content": "hi"}],
+        [],
+        cancel_event=cancel,
+    )
+    check("non-stream cancel raises", False)
+except agent.ChatCancelled:
+    check("non-stream cancel raises", True)
+elapsed = time.monotonic() - started
+check("non-stream cancel fast", elapsed < 2.5, elapsed)
 
 
 class AnthropicHandler(BaseHTTPRequestHandler):

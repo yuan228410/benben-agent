@@ -1,6 +1,6 @@
 # 零依赖 AI Agent
 
-`benben-agent.py` 是一个只用 Python 3.8+ 标准库实现的命令行 AI agent，通过 OpenAI 兼容的 `POST /chat/completions` 接口驱动。支持多轮对话、会话持久化、Agent Skills、function calling（工具调用）和图片输入，模型可以读写工作区文件、执行命令，然后给出最终回答。
+`benben-agent.py` 是一个只用 Python 3.8+ 标准库实现的命令行 AI agent，通过 OpenAI 兼容的 `POST /chat/completions` 接口驱动。支持多轮对话、会话持久化、Agent Skills、function calling（工具调用）和图片输入，模型可以读写文件、执行命令，然后给出最终回答。文件工具支持绝对路径和 `~`，工作区是默认目录和相对路径基准，不再是访问边界。
 
 ## 快速开始
 
@@ -29,8 +29,10 @@ you> /thinking on     # 显示模型的思考内容（默认关闭）
 you> /plan on         # 计划模式：先调查出计划，批准后再动手
 you> /plan guard approve   # 计划模式下改状态的操作需要确认
 you> /image shot.png  # 附带图片，随下一条消息发送
-you> /skill            # 列出已加载的 Agent Skills（启动时加 --skill）
+you> /skill            # 列出 Agent Skills（启动时加 --skill）
 you> /skill log-triage 排查 502  # 强制用指定技能回答问题
+you> /skill create     # 引导式创建或更新技能（默认全局）
+you> /skill install    # 从目录、zip 或 git URL 安装技能
 you> /save            # 把当前会话保存为工作区里的 chat-<时间戳>.md（只存对话）
 you> /save --tool --thinking notes.md  # 连同工具调用/输出和思考一起保存
 you> /compact         # 压缩历史，保留最近 2 个用户回合
@@ -248,7 +250,7 @@ Windows 乱码处理：
 | `--anthropic-auth` | `x-api-key` | Anthropic 认证方式：`x-api-key` 或 `bearer` |
 | `--max-steps` | `100` | 每轮最多调用模型多少次 |
 | `--timeout` | `120` | HTTP 超时（秒） |
-| `--cwd` | 当前目录 | 工具的根目录，也是新会话的默认工作空间；文件访问被限制在该目录内 |
+| `--cwd` | 当前目录 | 默认工作目录、相对路径基准和新会话的默认工作空间；文件工具支持绝对路径访问其他目录 |
 | `-i, --image` | 无 | 给任务附加图片，可重复，最多 4 张、单张 10 MB |
 | `--confirm` / `--no-confirm` | 关 | 是否在写文件和会修改状态的命令前询问；只读命令从不询问，`--yes` 是 `--no-confirm` 的别名 |
 | `--no-shell` | 关 | 禁用 `run_command` |
@@ -259,10 +261,14 @@ Windows 乱码处理：
 | `--max-background-jobs` / `--background-output-chars` | `8` / `20000` | 后台任务并发上限和每路输出保留字符数 |
 | `--job-follow` / `--no-job-follow` | 开 | 后台任务是否默认跟随输出 |
 | `--job-poll-seconds` / `--job-follow-lines` | `2` / `5` | 跟随轮询间隔和每次显示行数 |
+| `--job-log` / `--no-job-log` | 开 | 是否把后台任务输出写入日志文件 |
+| `--job-log-dir` / `--job-log-keep` | `~/.benben-agent/jobs` / `20` | 日志目录和保留数量 |
 | `--stream` / `--no-stream` | 交互终端开 | 流式读取模型输出；管道和脚本默认关闭，`--no-stream` 保留完整 Markdown 渲染 |
 | `--stream-idle-timeout` | `300` | 流式期间多少秒没有任何事件视为超时 |
 | `--stream-flush-ms` | `40` | CLI 流式刷新间隔；`0` 表示每块都刷新 |
 | `--debug-stream` / `--no-debug-stream` | 关 | 只向 stderr 打印 SSE 事件类型，不打印正文 |
+| `--mcp` / `--no-mcp` | 关 | 是否启用配置文件里的 MCP 服务；默认关闭，需要显式开启 |
+| `--mcp-timeout` | `60` | MCP 请求超时（秒） |
 | `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
 | `--only-own-skills` | 关 | 配合 `--skill`：只加载 `~/.benben-agent/skills/`，忽略 Claude、Codex 和跨客户端目录 |
 | `--no-skill-scripts` | 关 | 启用技能时禁用 `run_skill_script`；技能说明和资源仍可用 |
@@ -286,9 +292,10 @@ Windows 乱码处理：
 | `--plan-guard` | `off` | 计划模式守卫：`off`（只靠提示词）/ `approve`（改状态要确认）/ `deny`（直接拒绝） |
 | `-c, --continue` | 无 | 恢复会话；省略 UUID 时取最新会话，没有会话则新建 |
 | `--list` | 关 | 列出已保存的会话并退出，不联网、不需要 API key |
+| `--version` |  | 显示版本并退出 |
 | `--check` | 关 | 离线自检配置、目录、权限、会话、调度和模型能力，不联网 |
 | `--doctor` | 关 | 在 `--check` 基础上测试模型 API 连通性 |
-| `--web` | 关 | 启动浏览器界面；网页模式强制免确认 |
+| `--web` | 关 | 启动浏览器界面；默认免确认，加 `--confirm` 后启用审批弹窗 |
 | `--host` | `127.0.0.1` | 网页监听地址 |
 | `--port` | `8765` | 网页端口，`0` 表示由系统分配 |
 | `--connect` | 关 | 打开连接配置向导；没有 prompt/`--web` 时配置完退出 |
@@ -308,6 +315,7 @@ Windows 乱码处理：
   "version": 2,
   "active": "deepseek",
   "connections": {},
+  "mcpServers": {},
   "defaults": {
     "cwd": null,
     "shell": "auto",
@@ -353,10 +361,15 @@ Windows 乱码处理：
     "job_follow": true,
     "job_poll_seconds": 2,
     "job_follow_lines": 5,
+    "job_log": true,
+    "job_log_dir": null,
+    "job_log_keep": 20,
     "stream": true,
     "stream_idle_timeout": 300,
     "stream_flush_ms": 40,
     "debug_stream": false,
+    "mcp": false,
+    "mcp_timeout": 60,
     "web": {"host": "127.0.0.1", "port": 8765}
   }
 }
@@ -367,10 +380,14 @@ Windows 乱码处理：
 - 配置文件不存在时，启动会写入完整默认值，只写一次
 - 已有配置缺少字段时使用内置默认值，不会自动改写
 - 优先级：显式 CLI 参数 > `config.json` 的 `defaults` > 内置默认值
-- `--no-config` 不读取也不创建配置文件，适合临时运行
+- `--no-config` 启动时忽略保存的默认值；配置文件仍然保留给 `/connect` 和 Web 设置页，不会自动创建
 - `cwd` 默认 `null`，表示使用当前目录
 - `/config save` 会把当前有效设置写回 `defaults`，包括当前 `cwd` 和 shell
+- `/config save` 会保留 `connections` 和 `mcpServers`，不会保存 API key 之外的临时连接状态
 - `--no-thinking`、`--no-plain`、`--no-verbose-tools`、`--all-skill-dirs` 可以覆盖配置文件里的 true
+- Web 端「工具与帮助 → 默认设置」可以编辑这些默认值；保存时立即生效项会更新当前进程，其余标记为重启生效
+- 设置 API：`GET /api/settings` 读取默认值和内置值，`POST /api/settings` 保存；响应不会包含连接或 MCP 的密钥
+- 对话进行中保存设置会返回 409，先停止当前请求再保存
 
 交互模式：
 
@@ -378,6 +395,10 @@ Windows 乱码处理：
 /config          查看配置文件路径和已保存默认值
 /config path     只打印配置文件路径
 /config save     保存当前有效设置
+/config backup   创建带时间戳的配置备份
+/config backups  列出配置备份
+/config restore [file]
+                 恢复备份，默认恢复 config.json.bak
 ```
 
 例如先运行一次：
@@ -393,6 +414,8 @@ python3 benben-agent.py --memory --thinking --max-steps 50
 ```
 
 下次直接启动就会使用这些设置，不必重复加参数。注意 `cwd` 也会被保存为当前工作区的绝对路径；如果希望跟随当前目录，请保持 `cwd` 为 `null`。
+
+每次 `save_config` 覆盖前会自动保留一份 `config.json.bak`。需要多个历史版本时用 `/config backup`；恢复后需要重启 agent 才能完全生效。
 
 ## 模型能力信息
 
@@ -592,6 +615,80 @@ python3 benben-agent.py \
 - 不支持内置工具（web_search/file_search/computer_use）；
 - 内网网关也支持 `/v1/responses`，可以直接用 `--api-format openai-responses`。
 
+## MCP
+
+MCP 客户端默认关闭，需要显式开启：
+
+```bash
+python3 benben-agent.py --mcp
+```
+
+配置写在 `config.json` 顶层的 `mcpServers`：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/yzx/mycode"],
+      "env": {},
+      "cwd": "/home/yzx/mycode"
+    },
+    "remote": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": {"Authorization": "Bearer ..."}
+    }
+  },
+  "defaults": {"mcp": true, "mcp_timeout": 60}
+}
+```
+
+- 支持 stdio 和 Streamable HTTP
+- 接入 MCP `tools`、`resources` 和 `prompts`
+- 工具名使用 `mcp__server__tool`
+- 资源工具：`mcp_list_resources`、`mcp_read_resource`
+- 资源按需读取，不自动注入上下文
+- 提示词只填入输入框，不自动发送
+- 工具带 `readOnlyHint=true` 时可被只读任务使用
+- 定时任务可以使用 MCP 工具；只读任务只暴露只读工具
+- 计划模式按 `off` / `approve` / `deny` 门控
+- 服务启动失败只打印 warning，不影响主程序
+- 退出时关闭 HTTP session 和 stdio 子进程
+- `/config save` 会保留 `mcpServers`
+- MCP 全局关闭时不向模型暴露任何 MCP 工具
+- 添加/修改/删除服务立即写回配置
+- 添加服务不会自动打开全局 MCP；需要 `/mcp on` 或 Web 顶部开关
+- Web 不返回 header/env 的敏感值
+
+Web 管理：
+
+```text
+左侧栏 MCP → 管理 MCP
+```
+
+支持增删改、单个服务启停、全局开关、重启、日志和测试连接。
+
+CLI 命令：
+
+```text
+/mcp                          查看服务状态
+/mcp on|off                   全局启用/关闭
+/mcp add [服务]               引导式添加
+/mcp edit <服务>              引导式编辑
+/mcp remove <服务>            删除
+/mcp enable|disable <服务>    单个服务启停
+/mcp test <服务>              测试连接
+/mcp tools [服务]             查看工具
+/mcp resources [服务]         列出资源
+/mcp resource <服务> <uri>    读取资源
+/mcp prompts [服务]           列出提示词模板
+/mcp prompt <服务> <名称> [key=value ...]
+                              渲染提示词
+/mcp logs <服务>              查看 stderr / 通知
+/mcp restart <服务>           重启服务
+```
+
 ## 会话持久化
 
 每个会话保存为 `~/.benben-agent/sessions/` 下的 JSONL 文件，一行一条消息：
@@ -641,7 +738,12 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
                             导出 Markdown
 /session rename <新标题>    修改当前会话标题
 /session delete <编号|uuid> 移到回收站（不能删除当前会话）
-/session trash              查看回收站
+/session pin|unpin <编号|uuid>
+                            置顶或取消置顶
+/session archive|unarchive <编号|uuid>
+                            归档或取消归档
+/session trash              打开或查看回收站
+/session trash delete <uuid> 从回收站永久删除单个会话
 /session trash empty        清空回收站
 /session restore <uuid>     从回收站恢复会话
 /session prune [--keep N] [--older-than 30d] [--max-size 500M] [--yes]
@@ -658,6 +760,7 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 
 - `/session trash` 列出回收站，包含大小和删除时间
 - `/session restore <uuid>` 恢复
+- `/session trash delete <uuid>` 永久删除单个会话
 - `/session trash empty` 永久清空
 - `/session prune` 默认 dry-run，只列出候选
 - 加 `--yes` 才真正移动到回收站
@@ -671,6 +774,21 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 /session prune --max-size 500M
 /session prune --keep 100 --yes
 ```
+
+置顶、归档和列表：
+
+```text
+/session pin <uuid>       置顶
+/session unpin <uuid>     取消置顶
+/session archive <uuid>   归档
+/session unarchive <uuid> 取消归档
+```
+
+- 置顶会话排在最前
+- 归档会话默认在 Web 隐藏，勾选「显示归档」后出现
+- 列表显示标记 `P`（置顶）、`A`（归档）和会话大小
+- Web 会话区按「置顶 / 今天 / 昨天 / 日期」分组
+- 当前会话不能被归档
 
 工作空间指令：
 
@@ -853,17 +971,143 @@ description: 按时间线归纳日志。处理日志排查、异常定位时使�
 - 支持 `license`、`compatibility`、`metadata`；`allowed-tools` 会解析但暂不生效；
 - Claude 的 `!` 命令注入、`$ARGUMENTS` 等宿主特性不会执行，技能正文按普通文本加载。
 
-模型侧只看到技能清单，并按需调用：
+模型侧看到技能清单和管理工具，并按需调用：
 
 | 工具 | 作用 | 需要批准 |
 | --- | --- | --- |
 | `load_skill` | 读取完整 SKILL.md | 否 |
 | `read_skill_resource` | 读取技能目录内的参考文件 | 否 |
 | `run_skill_script` | 执行 `scripts/` 下的脚本 | 是 |
+| `create_skill` | 创建或更新技能 | 否 |
+| `install_skill` | 安装目录、zip 或 git 技能 | 中高风险需要 |
+| `remove_skill` | 请求删除技能 | 总是需要 |
 
-脚本按 shebang、扩展名（py/sh/js/rb/pl/php/ps1）或可执行文件运行；cwd 是当前工作区，并注入 `BENBEN_SKILL_DIR` 和 `BENBEN_WORKSPACE`。启用技能时脚本默认可用，`--no-skill-scripts` 关闭；`--confirm` 下每次执行都要确认；web 模式没有审批，启动会打印警告。
+### 创建和更新
 
-技能默认关闭，用 `--skill` 开启；`--no-skill` 可显式关闭。关闭时不扫描技能目录，也不向模型暴露任何技能工具。交互模式里 `/skill` 列出已加载技能，`/skill <name> <问题>` 会强制加载指定技能并用它回答。
+`create_skill` 默认写入全局技能目录：
+
+```text
+~/.benben-agent/skills/<name>/
+```
+
+需要工作区技能时显式传：
+
+```json
+{"scope": "workspace"}
+```
+
+写入 `<workspace>/.agents/skills/<name>/`。同名技能视为更新：只替换 `SKILL.md`，保留已有的 `scripts/`、`references/` 和 `assets/`，并保留 `license`、`compatibility`、`metadata`、`allowed-tools` 等其他 frontmatter 字段。
+
+### 安装
+
+`install_skill` 支持：
+
+- 本地技能目录
+- `.zip` 文件
+- git URL（`https://`、`ssh://`、`git@`、`git://`）
+- 直接下载的 `.zip` URL
+
+安装会先复制/解压/克隆到暂存目录，校验 `SKILL.md` 和 frontmatter，再做风险扫描。同名技能会替换整个技能目录，旧版本先移动到备份目录；移动失败会自动回滚。
+
+git 使用参数数组执行：
+
+```bash
+git clone --depth 1 --single-branch <url> <temp>
+```
+
+不经过 shell，不执行仓库里的安装脚本，默认超时 120 秒。zip 会拒绝绝对路径、`..` 路径穿越、符号链接、超大解压体积和过多文件。
+
+### 风险扫描与批准
+
+自动扫描内容：
+
+- 脚本、可执行文件、二进制文件
+- `curl`、`wget`、外链、网络访问
+- `rm -rf`、`sudo`、`chmod 777`、`dd`、fork bomb、`/dev/tcp`
+- `eval`、`base64 -d`、编码 PowerShell
+- 环境变量、token、password、secret
+- 提示词注入语句
+- 符号链接、路径穿越、隐藏文件、异常大小或文件数
+
+风险分级：
+
+| 等级 | 示例 | 行为 |
+| --- | --- | --- |
+| `low` | 纯 Markdown/文本 | 直接安装 |
+| `medium` | 含脚本、网络、外链、二进制 | 进入待确认 |
+| `high` | 危险命令、提示词注入、符号链接 | 进入待确认 |
+| `unknown` | 扫描失败 | 进入待确认 |
+
+模型调用 `install_skill` 遇到中高风险时，返回 `approval_required`，包含 `approval_id`、风险等级和原因。模型必须向用户说明风险并等待批准，不能自行批准。
+
+`remove_skill` 总是返回 `approval_required`，不会直接删除。批准后技能目录移动到备份目录，而不是永久删除。
+
+批准入口只属于用户：
+
+```text
+/skill pending
+/skill approve <id>
+/skill reject <id>
+```
+
+Web 端在「技能 → 管理技能 → 待确认」里批准或拒绝。
+
+### 备份与暂存
+
+```text
+~/.benben-agent/skill-backups/    # 每个技能保留最近 5 个版本
+~/.benben-agent/skill-staging/    # 安装暂存
+~/.benben-agent/skill-pending/    # 待确认记录
+```
+
+待确认记录默认 24 小时过期。批准前会重新校验暂存内容或技能目录指纹，内容变化时要求重新确认。备份目录是普通技能目录，需要恢复时手动复制回对应的技能根目录即可。
+
+### CLI
+
+```text
+/skill                        列出技能
+/skill <name>                 查看技能说明
+/skill <name> <问题>          强制加载技能来回答
+/skill create                 引导式创建或更新（默认全局）
+/skill install                从目录、zip 或 git URL 安装
+/skill remove <name> [scope]  删除技能（移动到备份）
+/skill reload                 重新扫描技能目录
+/skill pending                查看待确认操作
+/skill approve <id>           批准安装或删除
+/skill reject <id>            拒绝并清理
+```
+
+### Web
+
+左侧栏「技能 → 管理技能」支持：
+
+- 列表、搜索、按作用域过滤
+- 查看详情和文件列表
+- 创建技能
+- 编辑描述和正文
+- 安装本地目录、zip 或 git URL
+- 删除（确认后移动到备份）
+- 查看待确认并批准/拒绝
+- 刷新和重载
+
+Web API：
+
+```text
+GET  /api/skills?q=&scope=
+GET  /api/skills/detail?name=&scope=
+GET  /api/skills/pending
+POST /api/skills/create
+POST /api/skills/update
+POST /api/skills/install
+POST /api/skills/remove
+POST /api/skills/reload
+POST /api/skills/approve
+POST /api/skills/reject
+```
+
+脚本按 shebang、扩展名（py/sh/js/rb/pl/php/ps1）或可执行文件运行；cwd 是当前工作区，并注入 `BENBEN_SKILL_DIR` 和 `BENBEN_WORKSPACE`。启用技能时脚本默认可用，`--no-skill-scripts` 关闭；`--confirm` 下每次执行都要确认；web 模式没有脚本审批，启动会打印警告。
+
+技能默认关闭，用 `--skill` 开启；`--no-skill` 可显式关闭。关闭时不扫描技能目录，也不向模型暴露任何技能工具，CLI 和 Web 管理同样不可用。`--only-own-skills` 下只加载全局技能，创建/安装工作区技能会被拒绝。
 
 ## 定时任务（Scheduler）
 
@@ -910,7 +1154,7 @@ once 2026-11-12T15:00
 once 2026-11-12 15:00
 ```
 
-时间按本机本地时间计算，不支持时区后缀和 cron 表达式。权限默认是**完整权限**：定时触发时无人审批，可以读写工作区文件和执行命令。创建时传 `read_only=true` 则只暴露 `list_dir`、`read_file`、`search`、`glob`。定时任务运行在独立会话里，不插入当前聊天；任务内部不再暴露调度工具，避免递归创建任务。
+时间按本机本地时间计算，不支持时区后缀和 cron 表达式。权限默认是**完整权限**：定时触发时无人审批，可以读写文件和执行命令。创建时传 `read_only=true` 则只暴露 `list_dir`、`read_file`、`search`、`glob`。定时任务运行在独立会话里，不插入当前聊天；任务内部不再暴露调度工具，避免递归创建任务。
 
 数据位置：
 
@@ -960,7 +1204,7 @@ Web 端：输入框下方有「计划模式」开关和「守卫」下拉框，�
 计划模式**不砍工具**。读文件、搜索、跑命令、写文件全都可用，区别只在于系统提示词要求模型这一轮只做调查和规划。
 
 - 可以跑调查性命令：看文件内容、查日志、看 git 状态和差异、跑构建或测试看报错、查依赖版本
-- 不要做：写改工作区文件、删除移动文件、安装升级依赖、改变 git 状态、改系统配置、写数据库、创建定时任务
+- 不要做：写改文件、删除移动文件、安装升级依赖、改变 git 状态、改系统配置、写数据库、创建定时任务
 - 例外：确实需要产生副作用才能得到结论的命令（例如必须跑一次构建才能看到编译错误），写进计划里在批准环节一并确认
 
 约束靠提示词，不是权限封锁，所以默认档位是 `off`。
@@ -1068,7 +1312,9 @@ BENBEN_DEBUG_STREAM=1 python3 benben-agent.py --stream ...
 - 跟随期间不调用模型，不消耗模型 token
 - 任务结束后返回退出码、耗时和输出尾部
 - 成功显示最后 5 行，失败显示最后 10 行
-- 完整输出留在后台缓冲区或命令日志文件
+- 完整输出同时写入 `~/.benben-agent/jobs/<job-id>.log`
+- `/jobs clean` 删除已完成任务和对应日志
+- 日志保留数量默认 20，可用 `--job-log-keep` 调整
 
 CLI/Web 指令：
 
@@ -1161,7 +1407,13 @@ python3 benben-agent.py --memory --memory-daily --schedule --memory-daily-time 2
 /memory search <关键词>       搜索长期记忆和情景记忆
 /memory read <日期|today>     读取某天情景记忆
 /memory summarize [日期]      手动生成某天自动总结
+/memory dedupe [--yes]        去重长期记忆
+/memory prune [--keep N] [--older-than 30d] [--episodes] [--yes]
+                              清理长期记忆和/或旧情景记忆
 ```
+
+`/memory dedupe` 和 `/memory prune` 默认 dry-run；加 `--yes` 才写入。
+`--episodes` 配合 `--older-than` 删除更早的情景记忆文件。清理前会保留其他行和头部，只移除过期/重复条目。
 
 ## 网页入口
 
@@ -1171,10 +1423,13 @@ python3 benben-agent.py --web
 ```
 
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
-- 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；
-- 页面支持对话、新建/切换/删除历史会话（新建时可选择工作空间，删除有确认弹框）、上传图片；侧边栏会话区占据主要高度，连接和模型收在底部「连接与模型」折叠组里；
+- 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；`GET /healthz` 无 token 返回 `ok`，`GET /api/health` 带 token 返回版本、运行时间和状态；
+- `--version` 输出当前版本；`--check` / `--doctor` 用于部署前后自检；
+- 页面支持对话、新建/切换/移入回收站历史会话（新建时可选择工作空间）、上传图片；侧边栏会话区占据主要高度，连接和模型收在底部「连接与模型」折叠组里；
 - 侧边栏「帮助 / 指令」打开帮助弹窗，列出 Web 支持的斜杠命令和常用操作；输入 `/help` 也可以打开；
-- 会话列表支持右键菜单修改名称、导出 Markdown、删除会话；聊天框输入 `/session` 也可以管理会话；
+- 会话列表支持右键置顶、归档、修改名称、导出 Markdown、移到回收站；支持搜索标题、uuid、模型和工作空间，默认每次加载 50 个，可继续加载；按「置顶 / 今天 / 昨天 / 日期」分组；
+- 归档会话默认隐藏，勾选「显示归档」后显示；多个标签页切换会话或工作空间时会提示刷新；
+- 会话区顶部有「回收站」按钮，可查看已删除会话、恢复、永久删除单个会话或清空回收站；
 - 启用 `--schedule` 后「工具与帮助」里显示「定时任务」，可查看/运行/启停/删除任务和查看运行记录，后台每 5 秒轮询一次并提示新结果；
 - 工具调用显示为可展开块，默认折叠；展开后可查看完整参数和工具结果，历史会话也会回放；
 - 输入框下方有「流式输出」「显示思考」开关和「思考等级」选择，旁边是「压缩」按钮；思考等级按协议显示 DeepSeek/Kimi/MiniMax/OpenAI/Anthropic 选项；
@@ -1182,11 +1437,44 @@ python3 benben-agent.py --web
 - 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；
 - 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
 - 侧边栏「工具与帮助」里显示「压缩设置」，可配置自动压缩和空闲压缩的档位、阈值、目标百分比和保留回合数，改动立即生效，可勾选同时写入配置文件；聊天框输入 `/compact auto` 也会打开这个设置；
+- 侧边栏「工具与帮助 → 默认设置」可以编辑 `config.json` 的 `defaults`：常用开关、生成参数、Shell、后台任务、技能、定时、记忆、MCP、Web 和 CLI 行为；保存后立即生效项会更新当前进程，其余下次启动生效；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
 - 历史会话里的图片默认只显示「点击加载」占位，点击后才请求 `/api/image` 并打开灯箱，避免首屏传输大量 base64；刚上传的图片仍直接显示本地预览；
-- 网页模式强制免确认，`run_command` 是否可用仍由 `--no-shell` 决定；shell 开启时启动会打印提醒；
+- Web 默认免确认；加 `--confirm --web` 后，写文件、修改状态的命令和技能脚本会弹出审批框。`run_command` 是否可用仍由 `--no-shell` 决定；shell 开启时启动会打印提醒；
 - 监听非回环地址会打印警告；
 - `--web` 与位置参数 prompt 同时出现时忽略 prompt 并提示。
+
+### Web 审批
+
+默认 Web 不弹审批。加 `--confirm` 后：
+
+```bash
+python3 benben-agent.py --web --confirm
+```
+
+写文件、修改状态的命令、技能脚本会暂停，浏览器弹出「需要确认」：
+
+```text
+动作：write_file / run_command / run_skill_script
+内容：完整路径、命令或脚本
+[允许一次] [拒绝]
+```
+
+- 只允许当前这一次，不提供“永久允许”
+- 120 秒内没有响应按拒绝处理
+- 点击停止、关闭页面或连接中断也按拒绝处理
+- 计划模式守卫为 `approve` 时使用同一个弹窗，不要求额外加 `--confirm`
+- Web 聊天始终使用 SSE 事件通道，审批事件可以中途送达；「流式输出」开关只影响正文显示方式
+- 非流式 `/api/chat` 遇到需要审批的配置会返回 409，提示改用 `/api/chat/stream`
+
+审批响应接口：
+
+```text
+POST /api/approvals/respond
+{"id": "...", "allow": true}
+```
+
+接口需要 `X-Token`，且只对当前正在运行的聊天有效。
 
 ### Web 端斜杠命令
 
@@ -1205,6 +1493,7 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `/session ...` | 会话列表、切换、重命名、导出、删除 |
 | `/jobs ...` | 后台任务列表、状态、输出、跟随、停止 |
 | `/plan ...` | 计划模式开关和守卫档位 |
+| `/skill` | 打开技能管理；`/skill create`、`/skill install` 直达表单 |
 | `/stream ...` | 流式输出开关 |
 | `/compact` `/compact N` | 压缩上下文 |
 | `/compact auto` | 打开压缩设置 |
@@ -1219,7 +1508,7 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | --- | --- | --- |
 | `list_dir` | 列出目录内容 | 否 |
 | `read_file` | 按行读取文本文件（带行号，可分页） | 否 |
-| `search` | 在工作区按正则搜索文件内容（`输出=content` 返回 `文件:行号: 内容`；`输出=lines` 只返回 `文件:行号`） | 否 |
+| `search` | 按正则搜索文件内容，支持工作区外路径（`输出=content` 返回 `文件:行号: 内容`；`输出=lines` 只返回 `文件:行号`） | 否 |
 | `glob` | 按通配符查找文件，支持 `**` 递归 | 否 |
 | `write_file` | 创建或覆盖文件 | 是 |
 | `edit_file` | 替换文件中的一段文本（类似 patch） | 是 |
@@ -1234,6 +1523,9 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 否 |
 | `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 否 |
 | `run_skill_script` | 执行技能 `scripts/` 下的脚本（仅在启用脚本且存在脚本时提供） | 是 |
+| `create_skill` | 创建或更新技能，默认写入全局技能目录（仅启用技能时提供） | 否 |
+| `install_skill` | 从目录、zip 或 git URL 安装技能（仅启用技能时提供） | 中高风险需要 |
+| `remove_skill` | 请求删除技能，批准后移动到备份（仅启用技能时提供） | 总是需要 |
 | `create_schedule` | 创建定时任务（仅启用定时任务时提供） | 是 |
 | `list_schedules` | 列出定时任务（仅启用定时任务时提供） | 否 |
 | `delete_schedule` | 删除定时任务及运行记录（仅启用定时任务时提供） | 是 |
@@ -1311,7 +1603,8 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - `429`、`5xx` 和网络错误会按指数退避重试（最多 3 次），遵守 `Retry-After`。
 - 模型返回的工具调用参数如果不是合法 JSON，错误会作为工具结果回传给模型，让它自行修正。
 - 工具结果超过 20000 字符会截断；`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 1000 行。
-- `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，不跟随符号链接逃出工作区；`glob` 在遍历阶段就剪枝，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
+- `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，支持工作区外路径；`glob` 在遍历阶段就剪枝并限制 10 秒扫描预算，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
+- 文件工具不再限制在工作区内：`write_file`、`edit_file` 可以写任意可写路径。默认 `--confirm` 关闭，Web 模式没有工具审批；需要写操作确认时请加 `--confirm`，不要让不可信的网页或文件内容驱动写系统配置。
 - `write_file`、`edit_file` 和 `/save` 使用同目录临时文件 + `os.replace` 原子替换，中断时不会留下半个文件。
 - 文件路径经过 `realpath` 规范化，符号链接也无法逃逸出当前工作空间根目录。
 - 交互模式会自动开启 Linux 终端的 `IUTF8` 标志，并容错解码输入，避免中文退格留下残缺字节导致 `UnicodeDecodeError`。

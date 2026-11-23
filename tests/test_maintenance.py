@@ -54,6 +54,21 @@ try:
 except agent.SessionError:
     check("restore missing rejected", True)
 
+print("== trash permanent delete ==")
+extra = agent.create_session("m", workspace)
+agent.trash_session(extra.uuid)
+removed_path = agent.delete_trashed_session(extra.uuid)
+check("permanent delete file", not os.path.exists(removed_path), removed_path)
+check(
+    "permanent delete clears list",
+    not any(row["uuid"] == extra.uuid for row in agent.trashed_session_rows()),
+)
+try:
+    agent.delete_trashed_session(extra.uuid)
+    check("permanent delete missing rejected", False)
+except agent.SessionError:
+    check("permanent delete missing rejected", True)
+
 print("== prune ==")
 agent.trash_session(created[0].uuid)
 agent.trash_session(created[1].uuid)
@@ -87,6 +102,45 @@ check(
     "prune protects active",
     all(row["uuid"] != prune_sessions[3].uuid for row in protected),
     protected,
+)
+
+print("== config backup ==")
+config_home = tempfile.mkdtemp(prefix="maintenance-config-")
+config_path = os.path.join(config_home, "config.json")
+config = agent.empty_config()
+agent.save_config(config, config_path)
+check("config backup absent first", not os.path.exists(config_path + ".bak"))
+config["defaults"]["stream"] = False
+agent.save_config(config, config_path)
+backup_data = json.load(open(config_path + ".bak", encoding="utf-8"))
+check(
+    "config auto backup",
+    backup_data["defaults"]["stream"] is True,
+    backup_data.get("defaults"),
+)
+agent.run_config_command(config, config_path, "backup")
+manual_backups = list(Path(config_home).glob("config.json.bak-*"))
+check("config manual backup", len(manual_backups) == 1, manual_backups)
+agent.run_config_command(config, config_path, "restore")
+restored_config = json.load(open(config_path, encoding="utf-8"))
+check(
+    "config restore",
+    restored_config["defaults"]["stream"] is True,
+    restored_config.get("defaults"),
+)
+
+print("== version ==")
+version_run = subprocess.run(
+    [sys.executable, AGENT, "--version"],
+    text=True,
+    capture_output=True,
+    timeout=20,
+)
+check("version exit", version_run.returncode == 0, version_run.stderr[-500:])
+check(
+    "version output",
+    version_run.stdout.strip() == "benben-agent " + agent.AGENT_VERSION,
+    version_run.stdout,
 )
 
 print("== check command ==")

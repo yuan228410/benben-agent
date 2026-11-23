@@ -13,6 +13,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AGENT = str(Path(__file__).resolve().parents[1] / "benben-agent.py")
+MCP_SERVER = str(Path(__file__).resolve().parent / "mcp_stdio_server.py")
 failures = []
 
 
@@ -170,6 +171,14 @@ try:
         and 'id="session-rename"' in html
         and 'id="session-delete"' in html,
     )
+    check(
+        "web html trash manager",
+        'id="trash-modal"' in html
+        and 'id="trash-open"' in html
+        and "openTrashModal" in html
+        and "restoreTrashSession" in html
+        and "deleteTrashSession" in html,
+    )
     check("web html no side delete", 'class="delete"' not in html)
     check("web html export", 'id="session-export"' in html and 'id="export-modal"' in html)
     check("web html tool details", "addToolDetail" in html and "tool-detail" in html)
@@ -261,7 +270,15 @@ try:
         "web html sidebar groups",
         'id="sessions-group"' in html
         and 'id="settings-group"' in html
-        and 'id="settings-summary"' in html,
+        and 'id="settings-summary"' in html
+        and 'id="session-search"' in html,
+    )
+    check(
+        "web html session extras",
+        'id="session-archived"' in html
+        and 'id="session-pin"' in html
+        and 'id="session-archive"' in html
+        and "checkRuntimeDrift" in html,
     )
     check(
         "web html stream toggle",
@@ -280,6 +297,16 @@ try:
         'id="new-session-modal"' in html
         and 'id="new-session-workspace"' in html
         and "/workspace" in html,
+    )
+    check(
+        "web html mcp manager",
+        'id="mcp-modal"' in html
+        and 'id="mcp-open"' in html
+        and 'id="mcp-form"' in html
+        and 'id="mcp-browser-modal"' in html
+        and "saveMCPForm" in html
+        and "openMCPResources" in html
+        and "openMCPPrompts" in html,
     )
     check(
         "web html groups init order",
@@ -628,6 +655,40 @@ try:
         "web restore list",
         any(row["uuid"] == trash_uuid for row in api_json("/api/sessions")["sessions"]),
     )
+    permanent_uuid = "dd44ee55"
+    with open(
+        os.path.join(sessions_dir, f"996-20261123-{permanent_uuid}.jsonl"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps({
+            "_type": "meta",
+            "version": 1,
+            "uuid": permanent_uuid,
+            "sequence": 996,
+            "created": "2026-11-23T10:00:00",
+            "model": "m",
+            "workspace": os.path.realpath(original_workspace),
+        }) + "\n")
+        handle.write(json.dumps({"role": "user", "content": "delete forever"}) + "\n")
+    api_json("/api/delete", {"session": permanent_uuid})
+    permanent = api_json(
+        "/api/session/trash/delete", {"session": permanent_uuid}
+    )
+    check(
+        "web permanent delete",
+        permanent["deleted"] == permanent_uuid,
+        permanent,
+    )
+    trash_after = api_json("/api/trash")
+    check(
+        "web permanent delete gone",
+        not any(
+            row["uuid"] == permanent_uuid
+            for row in trash_after["sessions"]
+        ),
+        trash_after,
+    )
     api_json("/api/delete", {"session": trash_uuid})
     emptied = api_json("/api/session/trash/empty", {})
     check("web empty trash", emptied["removed"] >= 1, emptied)
@@ -661,6 +722,172 @@ try:
         expect_error=True,
     )
     check("web prune invalid", code == 400, code)
+    paged = api_json("/api/sessions?limit=2&offset=0")
+    check("web sessions paged size", len(paged["sessions"]) <= 2, paged)
+    check("web sessions paged total", paged["total"] >= len(paged["sessions"]), paged)
+    second_page = api_json("/api/sessions?limit=2&offset=2")
+    check("web sessions offset", second_page["offset"] == 2, second_page)
+    empty_search = api_json("/api/sessions?q=definitely-no-such-session")
+    check(
+        "web sessions search empty",
+        empty_search["total"] == 0 and empty_search["sessions"] == [],
+        empty_search,
+    )
+
+    flag_uuid = "dd44ee55"
+    with open(
+        os.path.join(sessions_dir, f"996-20261123-{flag_uuid}.jsonl"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps({
+            "_type": "meta",
+            "version": 1,
+            "uuid": flag_uuid,
+            "sequence": 996,
+            "created": "2026-11-23T10:00:00",
+            "model": "m",
+            "workspace": os.path.realpath(original_workspace),
+        }) + "\n")
+        handle.write(json.dumps({"role": "user", "content": "flag me"}) + "\n")
+    pinned = api_json("/api/session/flags", {"session": flag_uuid, "pinned": True})
+    check("web pin", pinned["pinned"] is True, pinned)
+    listed = api_json("/api/sessions?archived=1")
+    pinned_row = next(
+        (row for row in listed["sessions"] if row["uuid"] == flag_uuid), None
+    )
+    check("web pinned row", pinned_row and pinned_row["pinned"] is True, pinned_row)
+    check("web pinned first", listed["sessions"][0]["uuid"] == flag_uuid, listed["sessions"][:3])
+    archived = api_json("/api/session/flags", {"session": flag_uuid, "archived": True})
+    check("web archive", archived["archived"] is True, archived)
+    visible = api_json("/api/sessions")
+    check(
+        "web archived hidden",
+        all(row["uuid"] != flag_uuid for row in visible["sessions"]),
+        visible,
+    )
+    with_archived = api_json("/api/sessions?archived=1")
+    check(
+        "web archived listed",
+        any(row["uuid"] == flag_uuid for row in with_archived["sessions"]),
+        with_archived,
+    )
+    api_json("/api/session/flags", {"session": flag_uuid, "archived": False})
+    health = api_json("/api/health")
+    check(
+        "web health",
+        health["ok"] is True and bool(health.get("version")),
+        health,
+    )
+    mcp_status = api_json("/api/mcp")
+    check("web mcp disabled", mcp_status["enabled"] is False, mcp_status)
+    check("web mcp empty configs", mcp_status["configs"] == [], mcp_status)
+    added = api_json("/api/mcp/add", {
+        "name": "web-fake",
+        "config": {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [MCP_SERVER],
+            "timeout": 10,
+        },
+    })
+    check("web mcp add", added.get("ok") is True, added)
+    mcp_status = api_json("/api/mcp")
+    check(
+        "web mcp added disabled",
+        mcp_status["enabled"] is False
+        and any(item["name"] == "web-fake" for item in mcp_status["configs"]),
+        mcp_status,
+    )
+    check("web mcp add persisted", "web-fake" in json.load(open(config_path, encoding="utf-8"))["mcpServers"])
+    enabled_mcp = api_json("/api/mcp/on", {})
+    check("web mcp on", enabled_mcp["enabled"] is True, enabled_mcp)
+    mcp_status = api_json("/api/mcp")
+    check(
+        "web mcp connected",
+        any(
+            item["name"] == "web-fake" and item["status"] == "connected"
+            for item in mcp_status["servers"]
+        ),
+        mcp_status,
+    )
+    check("web mcp tools", len(mcp_status["tools"]) >= 2, mcp_status)
+    resource_data = api_json("/api/mcp/resources?server=web-fake")
+    check(
+        "web mcp resources",
+        any("readme.txt" in (item.get("uri") or "") for item in resource_data["resources"]),
+        resource_data,
+    )
+    read_data = api_json("/api/mcp/resource/read", {
+        "server": "web-fake",
+        "uri": "file:///docs/readme.txt",
+    })
+    check("web mcp read resource", "resource text" in read_data["text"], read_data)
+    prompt_data = api_json("/api/mcp/prompts?server=web-fake")
+    check(
+        "web mcp prompts",
+        any(item.get("name") == "code-review" for item in prompt_data["prompts"]),
+        prompt_data,
+    )
+    rendered = api_json("/api/mcp/prompt/get", {
+        "server": "web-fake",
+        "name": "code-review",
+        "arguments": {"language": "python", "focus": "security"},
+    })
+    check(
+        "web mcp render prompt",
+        "review python" in rendered["text"] and "security" in rendered["text"],
+        rendered,
+    )
+    tested = api_json("/api/mcp/test", {"name": "web-fake"})
+    check("web mcp test", tested.get("ok") is True and tested.get("tools"), tested)
+    updated = api_json("/api/mcp/update", {
+        "name": "web-fake",
+        "config": {"timeout": 7},
+    })
+    check("web mcp update", updated.get("ok") is True, updated)
+    disabled_server = api_json("/api/mcp/disable", {"name": "web-fake"})
+    check("web mcp disable", disabled_server["server"]["status"] == "disabled", disabled_server)
+    mcp_status = api_json("/api/mcp")
+    check("web mcp disabled tools", mcp_status["tools"] == [], mcp_status)
+    enabled_server = api_json("/api/mcp/enable", {"name": "web-fake"})
+    check("web mcp enable", enabled_server["server"]["status"] == "connected", enabled_server)
+    secret_add = api_json("/api/mcp/add", {
+        "name": "web-secret",
+        "config": {
+            "type": "http",
+            "url": "http://127.0.0.1:1/mcp",
+            "headers": {"Authorization": "Bearer very-secret"},
+            "enabled": False,
+        },
+    })
+    check("web mcp secret add", secret_add.get("ok") is True, secret_add)
+    secret_status = api_json("/api/mcp")
+    secret_row = next(
+        item for item in secret_status["configs"] if item["name"] == "web-secret"
+    )
+    check(
+        "web mcp secret hidden",
+        "Authorization" in secret_row["header_keys"]
+        and "headers" not in secret_row
+        and "very-secret" not in json.dumps(secret_status),
+        secret_row,
+    )
+    api_json("/api/mcp/remove", {"name": "web-secret"})
+    removed = api_json("/api/mcp/remove", {"name": "web-fake"})
+    check("web mcp remove", removed.get("ok") is True, removed)
+    mcp_status = api_json("/api/mcp")
+    check("web mcp removed", mcp_status["configs"] == [], mcp_status)
+    api_json("/api/mcp/off", {})
+    check("web mcp off", api_json("/api/mcp")["enabled"] is False)
+
+    runtime = api_json("/api/runtime")
+    check("web runtime session field", "session" in runtime, runtime)
+    check(
+        "web runtime model field",
+        isinstance(runtime.get("model"), str) and bool(runtime.get("model")),
+        runtime,
+    )
 
     # Shell listing and switching.
     shells = api_json("/api/shells")

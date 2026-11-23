@@ -261,7 +261,7 @@ check("prompt has plan section", "当前处于计划模式" in plan_prompt)
 check("prompt mentions submit_plan", "submit_plan" in plan_prompt)
 check("prompt has mode contract", "工作模式：" in plan_prompt)
 check("prompt allows investigation commands", "跑构建或测试看报错" in plan_prompt)
-check("prompt forbids writing", "不要写或改工作区里的文件" in plan_prompt)
+check("prompt forbids writing", "不要写或改文件" in plan_prompt)
 check("prompt allows exceptions", "例外：" in plan_prompt)
 
 off_prompt = agent.build_system_prompt(ws_root, {}, None, "interactive", plan_mode=False)

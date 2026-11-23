@@ -82,6 +82,41 @@ try:
 except agent.ToolError as exc:
     check("edit asks approval in non-tty", "permission denied" in str(exc), str(exc))
 
+# ---------- approval handler ----------
+approval_ws = agent.Workspace(base, confirm=True)
+approval_ws.interactive = False
+approval_calls = []
+approval_ws.approval_handler = (
+    lambda action, detail: approval_calls.append((action, detail)) or True
+)
+out = approval_ws.write_file("approval/handler.txt", "ok\n")
+check("approval handler allows write", "wrote" in out, out)
+check(
+    "approval handler action",
+    bool(approval_calls) and approval_calls[0][0] == "write_file",
+    approval_calls,
+)
+approval_ws.approval_handler = lambda action, detail: False
+try:
+    approval_ws.write_file("approval/denied.txt", "x")
+    check("approval handler denies write", False)
+except agent.ToolError as exc:
+    check(
+        "approval handler denies write",
+        "permission denied" in str(exc),
+        str(exc),
+    )
+approval_ws.approval_handler = lambda action, detail: True
+out = approval_ws.run_command(
+    "echo approved > approval/command.txt", timeout_seconds=10
+)
+check("approval handler run_command", "exit code: 0" in out, out)
+approval_ws.plan_mode = True
+approval_ws.plan_guard = "approve"
+approval_ws.prompt_mode = "web"
+out = approval_ws.write_file("approval/plan.txt", "ok\n")
+check("plan guard uses approval handler", "wrote" in out, out)
+
 # ---------- search ----------
 write("src/app.py", "import os\nprint('needle')\n")
 write("src/lib.py", "NEEDLE = 1\n")
@@ -110,7 +145,7 @@ os.symlink(os.path.join(outside, "secret.txt"), os.path.join(base, "src", "link.
 with open(os.path.join(outside, "secret.txt"), "w") as f:
     f.write("needle secret\n")
 out = ws.search("needle", include="link.py")
-check("search skips outside symlink", "secret" not in out, out)
+check("search reads outside symlink", "secret" in out, out)
 
 # ---------- glob ----------
 write("deep/a/b/c.py", "")
@@ -122,11 +157,15 @@ out = ws.glob("**/*.txt", path="deep")
 check("glob scoped", "deep/a/b/d.txt" in out and "src/notes.txt" not in out, out)
 check("glob no match", ws.glob("**/*.nope") == "(no matches)")
 os.symlink(outside, os.path.join(base, "outdir"))
+out = ws.glob("**/*.txt", path="outdir")
+check("glob reads outside symlink", "secret" in out, out)
+old_glob_seconds = agent.MAX_GLOB_SECONDS
+agent.MAX_GLOB_SECONDS = -1
 try:
-    out = ws.glob("**/*.txt", path="outdir")
-    check("glob outside symlink blocked", "secret" not in out and "outdir" not in out, out)
-except agent.ToolError as exc:
-    check("glob outside symlink blocked", "outside" in str(exc), str(exc))
+    out = ws.glob("**/*.txt")
+    check("glob time budget", "stopped after scan budget" in out, out)
+finally:
+    agent.MAX_GLOB_SECONDS = old_glob_seconds
 
 # ---------- pruning / binary skip / scan budget ----------
 write("node_modules/pkg/hidden.py", "needle\n")
@@ -183,12 +222,57 @@ check("run_command stdin=DEVNULL", "exit code: 0" in res and "stdout:" not in re
 
 # ---------- existing behaviours still work ----------
 check("pagination", "3 | line3" in (write("ten.txt", "".join(f"line{i}\n" for i in range(1, 11))) or ws.read_file("ten.txt", offset=3, limit=3)))
-check("symlink escape blocked", (lambda: (ws.read_file("link.txt") if False else True))())
+content = ws.read_file("src/link.py")
+check("read outside symlink allowed", "needle secret" in content, content)
+
+# ---------- outside workspace ----------
+outside_note = os.path.join(outside, "note.txt")
+with open(outside_note, "w", encoding="utf-8") as handle:
+    handle.write("hello outside\nline2\n")
+check(
+    "read outside file",
+    "hello outside" in ws.read_file(outside_note),
+)
+check(
+    "list outside dir",
+    "note.txt" in ws.list_dir(outside),
+)
+check(
+    "search outside dir",
+    "note.txt" in ws.search("hello", path=outside),
+)
+check(
+    "glob outside dir",
+    "note.txt" in ws.glob("*.txt", path=outside),
+)
+outside_write = os.path.join(outside, "written.txt")
+message = ws.write_file(outside_write, "written outside\n")
+check(
+    "write outside file",
+    open(outside_write, encoding="utf-8").read() == "written outside\n",
+)
+check("write outside message absolute", outside_write in message, message)
+ws.edit_file(outside_write, "written", "edited")
+check(
+    "edit outside file",
+    "edited outside" in open(outside_write, encoding="utf-8").read(),
+)
+old_home = os.environ.get("HOME")
+os.environ["HOME"] = outside
 try:
-    ws.read_file("src/link.py")
-    check("read outside symlink blocked", False)
-except agent.ToolError:
-    check("read outside symlink blocked", True)
+    check(
+        "tilde expands",
+        "hello outside" in ws.read_file("~/note.txt"),
+    )
+    check(
+        "glob tilde expands",
+        "note.txt" in ws.glob("~/note.txt"),
+    )
+finally:
+    if old_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = old_home
 
 # ---------- HTTP round trip with tool call ----------
 class Handler(BaseHTTPRequestHandler):

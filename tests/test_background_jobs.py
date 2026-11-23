@@ -157,6 +157,40 @@ with contextlib.redirect_stdout(auto_buffer):
     agent.print_job_notifications(auto_ws)
 check("auto-promoted notification shown", "[job]" in auto_buffer.getvalue(), auto_buffer.getvalue())
 
+# ---------- job log files ----------
+log_dir = tempfile.mkdtemp(prefix="job-logs-")
+log_ws = agent.Workspace(
+    tempfile.mkdtemp(prefix="job-log-work-"),
+    background_after_seconds=0,
+    job_log=True,
+    job_log_dir=log_dir,
+    job_log_keep=5,
+)
+log_out = log_ws.run_command(
+    "printf 'log-line\\n'; sleep 1",
+    timeout_seconds=5,
+    background=True,
+)
+log_match = re.search(r"job-[0-9a-f]+", log_out)
+check("job log starts", bool(log_match), log_out)
+if log_match:
+    log_id = log_match.group(0)
+    log_ws.jobs.wait(log_id, 5)
+    log_path = os.path.join(log_dir, f"{log_id}.log")
+    check("job log exists", os.path.exists(log_path), log_path)
+    check(
+        "job log content",
+        os.path.exists(log_path) and "log-line" in open(log_path, encoding="utf-8").read(),
+        log_path,
+    )
+    check(
+        "job log snapshot",
+        log_ws.jobs.snapshot(log_id).get("log_path") == log_path,
+        log_ws.jobs.snapshot(log_id),
+    )
+    log_ws.jobs.clean_finished()
+    check("job clean removes log", not os.path.exists(log_path), log_path)
+
 # ---------- list/clean ----------
 check("list jobs", "background jobs:" in ws.jobs.list_text(), ws.jobs.list_text())
 check("clean jobs", "cleaned" in ws.jobs.clean_finished())
@@ -166,6 +200,8 @@ defaults = agent.default_settings()
 check("default job follow", defaults["job_follow"] is True)
 check("default job poll", defaults["job_poll_seconds"] == 2)
 check("default job lines", defaults["job_follow_lines"] == 5)
+check("default job log", defaults["job_log"] is True)
+check("default job log keep", defaults["job_log_keep"] == 20)
 check("default command timeout", defaults["command_timeout"] == 60)
 check("default max command timeout", defaults["max_command_timeout"] == 600)
 

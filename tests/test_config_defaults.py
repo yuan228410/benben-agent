@@ -139,6 +139,141 @@ check("cli cwd wins", override.cwd == "/cli-cwd")
 check("cli memory wins", override.memory is False)
 check("cli max steps wins", override.max_steps == 3)
 
+# ---------- every default is picked when no CLI flag is given ----------
+full_config = agent.empty_config()
+full_config["defaults"].update({
+    "cwd": "/tmp/config-all-cwd",
+    "shell": "bash",
+    "shell_enabled": False,
+    "shell_fallback": False,
+    "confirm": True,
+    "thinking": True,
+    "reasoning": "deepseek:low",
+    "plan_mode": True,
+    "plan_guard": "deny",
+    "max_steps": 42,
+    "timeout": 33.0,
+    "temperature": 0.2,
+    "max_tokens": 1234,
+    "plain": True,
+    "verbose_tools": True,
+    "skills": True,
+    "only_own_skills": True,
+    "skill_scripts": False,
+    "schedule": True,
+    "memory": True,
+    "memory_daily": True,
+    "memory_daily_time": "22:30",
+    "auto_compact": {
+        "enabled": True,
+        "level": "aggressive",
+        "threshold": 70,
+        "target_ratio": 40,
+        "keep": 3,
+    },
+    "idle_compact": {
+        "enabled": True,
+        "minutes": 15,
+        "level": "normal",
+        "min_context_percent": 30,
+        "min_messages": 8,
+    },
+    "command_timeout": 15,
+    "max_command_timeout": 120,
+    "background_after_seconds": 5,
+    "max_background_jobs": 4,
+    "background_output_chars": 3000,
+    "job_follow": False,
+    "job_poll_seconds": 7,
+    "job_follow_lines": 9,
+    "job_log": False,
+    "job_log_dir": "/tmp/jobs",
+    "job_log_keep": 11,
+    "stream": False,
+    "stream_idle_timeout": 123,
+    "stream_flush_ms": 9,
+    "debug_stream": True,
+    "mcp": True,
+    "mcp_timeout": 33,
+    "web": {"host": "0.0.0.0", "port": 9999},
+})
+full = Args()
+agent.resolve_settings(full, full_config)
+check("all cwd", full.cwd == "/tmp/config-all-cwd", full.cwd)
+check("all shell", full.shell == "bash", full.shell)
+check("all shell enabled", full.shell_enabled is False, full.shell_enabled)
+check("all shell fallback", full.shell_fallback is False, full.shell_fallback)
+check("all confirm", full.confirm is True, full.confirm)
+check("all thinking", full.thinking is True, full.thinking)
+check("all reasoning", full.reasoning == "deepseek:low", full.reasoning)
+check("all plan", full.plan_mode is True, full.plan_mode)
+check("all guard", full.plan_guard == "deny", full.plan_guard)
+check("all steps", full.max_steps == 42, full.max_steps)
+check("all timeout", full.timeout == 33.0, full.timeout)
+check("all temperature", full.temperature == 0.2, full.temperature)
+check("all tokens", full.max_tokens == 1234, full.max_tokens)
+check("all plain", full.plain is True, full.plain)
+check("all verbose", full.verbose_tools is True, full.verbose_tools)
+check("all skills", full.skills is True, full.skills)
+check("all only own", full.only_own_skills is True, full.only_own_skills)
+check("all scripts", full.skill_scripts is False, full.skill_scripts)
+check("all schedule", full.schedule is True, full.schedule)
+check("all memory", full.memory is True, full.memory)
+check("all daily", full.memory_daily is True, full.memory_daily)
+check("all daily time", full.memory_daily_time == "22:30", full.memory_daily_time)
+check("all auto compact", full.auto_compact_enabled is True, full.auto_compact_enabled)
+check("all auto level", full.auto_compact_level == "aggressive", full.auto_compact_level)
+check("all auto threshold", full.auto_compact_threshold == 70, full.auto_compact_threshold)
+check("all auto target", full.auto_compact_target == 40, full.auto_compact_target)
+check("all auto keep", full.auto_compact_keep == 3, full.auto_compact_keep)
+check("all idle compact", full.idle_compact_enabled is True, full.idle_compact_enabled)
+check("all idle minutes", full.idle_compact_minutes == 15, full.idle_compact_minutes)
+check("all idle level", full.idle_compact_level == "normal", full.idle_compact_level)
+check("all idle percent", full.idle_compact_min_percent == 30, full.idle_compact_min_percent)
+check("all idle messages", full.idle_compact_min_messages == 8, full.idle_compact_min_messages)
+check("all command timeout", full.command_timeout == 15, full.command_timeout)
+check("all max command", full.max_command_timeout == 120, full.max_command_timeout)
+check("all background", full.background_after_seconds == 5, full.background_after_seconds)
+check("all max jobs", full.max_background_jobs == 4, full.max_background_jobs)
+check("all output chars", full.background_output_chars == 3000, full.background_output_chars)
+check("all follow", full.job_follow is False, full.job_follow)
+check("all poll", full.job_poll_seconds == 7, full.job_poll_seconds)
+check("all lines", full.job_follow_lines == 9, full.job_follow_lines)
+check("all job log", full.job_log is False, full.job_log)
+check("all job dir", full.job_log_dir == "/tmp/jobs", full.job_log_dir)
+check("all keep", full.job_log_keep == 11, full.job_log_keep)
+check("all stream", full.stream is False, full.stream)
+check("all idle timeout", full.stream_idle_timeout == 123, full.stream_idle_timeout)
+check("all flush", full.stream_flush_ms == 9, full.stream_flush_ms)
+check("all debug", full.debug_stream is True, full.debug_stream)
+check("all mcp", full.mcp is True, full.mcp)
+check("all mcp timeout", full.mcp_timeout == 33, full.mcp_timeout)
+check("all host", full.host == "0.0.0.0", full.host)
+check("all port", full.port == 9999, full.port)
+
+full_override = Args()
+full_override.confirm = False
+full_override.skills = False
+full_override.max_steps = 2
+full_override.stream = True
+agent.resolve_settings(full_override, full_config)
+check("all cli confirm", full_override.confirm is False, full_override.confirm)
+check("all cli skills", full_override.skills is False, full_override.skills)
+check("all cli steps", full_override.max_steps == 2, full_override.max_steps)
+check("all cli stream", full_override.stream is True, full_override.stream)
+
+strict_errors = []
+agent._normalize_defaults(
+    {
+        "max_steps": 0,
+        "timeout": -1,
+        "shell": "",
+        "reasoning": "bad",
+    },
+    strict_errors,
+)
+check("strict defaults collect errors", len(strict_errors) >= 4, strict_errors)
+
 # ---------- CLI creates defaults ----------
 agent_path = str(Path(__file__).resolve().parents[1] / "benben-agent.py")
 
