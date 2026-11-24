@@ -120,7 +120,7 @@ scheduled_workspace = service._make_workspace(task)
 scheduled_names = [item["function"]["name"] for item in agent.tool_schemas(scheduled_workspace)]
 check(
     "read-only scheduled tools",
-    scheduled_names == ["list_dir", "read_file", "search", "glob"],
+    scheduled_names == ["list_dir", "read_file", "read_file_outline", "search", "glob"],
     scheduled_names,
 )
 check("no schedule tools inside scheduled run", "create_schedule" not in scheduled_names)

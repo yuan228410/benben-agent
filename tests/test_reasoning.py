@@ -171,7 +171,7 @@ shutil.rmtree(home, ignore_errors=True)
 
 print("== web ==")
 home = tempfile.mkdtemp(prefix="reasoning-web-")
-env = dict(os.environ, HOME=home)
+env = dict(os.environ, HOME=home, PYTHONUNBUFFERED="1")
 Handler.requests.clear()
 log_path = os.path.join(home, "web.log")
 log_handle = open(log_path, "w+", encoding="utf-8")
@@ -194,7 +194,7 @@ for _ in range(100):
     time.sleep(0.1)
 check("web started", url is not None, open(log_path, encoding="utf-8").read()[-300:])
 if url:
-    base = url.split("?", 1)[0]
+    base = url.split("?", 1)[0].rstrip("/")
     token = url.rsplit("token=", 1)[1]
     req = urllib.request.Request(
         base + "/api/chat", data=json.dumps({"message": "hi", "images": []}).encode(),

@@ -136,7 +136,7 @@ def start_web(home, extra_args, extra_env=None):
 
 def make_api(url):
     token = url.rsplit("token=", 1)[1]
-    base = url.split("?", 1)[0]
+    base = url.split("?", 1)[0].rstrip("/")
 
     def request(path, body=None, expect_error=False):
         data = json.dumps(body).encode() if body is not None else None

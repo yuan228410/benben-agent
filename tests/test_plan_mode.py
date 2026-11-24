@@ -420,7 +420,7 @@ check("web started", url is not None, open(web_log_path, encoding="utf-8").read(
 
 def web_api(path, body=None):
     token = url.rsplit("token=", 1)[1]
-    base = url.split("?", 1)[0]
+    base = url.split("?", 1)[0].rstrip("/")
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(
         base + path,

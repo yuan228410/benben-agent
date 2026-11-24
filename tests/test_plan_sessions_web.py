@@ -113,7 +113,7 @@ for _ in range(150):
 check("plan sessions web started", url is not None, open(log_path, encoding="utf-8").read()[-800:])
 
 token = url.rsplit("token=", 1)[1]
-base = url.split("?", 1)[0]
+base = url.split("?", 1)[0].rstrip("/")
 
 
 def api(path, body=None, expect_error=False):

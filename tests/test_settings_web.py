@@ -118,7 +118,7 @@ check("settings web started", url is not None, open(log_path, encoding="utf-8").
 
 def make_api(url):
     token = url.rsplit("token=", 1)[1]
-    base = url.split("?", 1)[0]
+    base = url.split("?", 1)[0].rstrip("/")
 
     def request(path, body=None, expect_error=False):
         data = json.dumps(body).encode() if body is not None else None
@@ -248,7 +248,7 @@ try:
 
     ModelHandler.delay = 2.0
     token = url.rsplit("token=", 1)[1]
-    base = url.split("?", 1)[0]
+    base = url.split("?", 1)[0].rstrip("/")
     chat_error = []
 
     def run_chat():

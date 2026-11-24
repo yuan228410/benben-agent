@@ -258,12 +258,12 @@ import base64
 import binascii
 import codecs
 import copy
+from collections import deque
 from datetime import datetime, timedelta
 import fnmatch
 import getpass
 import glob as glob_mod
 import hashlib
-import heapq
 import json
 import locale
 import os
@@ -311,7 +311,10 @@ DEFAULT_MODEL = "Deepseek-V4.1-Flash"
 # DeepSeek 官方接口需要在 OPENAI_API_KEY 或 --api-key 中提供 key，不在代码里内置。
 DEFAULT_API_KEY = ""
 MAX_TOOL_OUTPUT = 20_000
-MAX_FILE_LINES = 1_000
+# A single read_file call may return this many lines. Kept well above the
+# usual file size so a normal module fits in one call, while still bounding
+# what one tool result can put into the context window.
+MAX_FILE_LINES = 3_000
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGES = 4
 MAX_SEARCH_FILE = 2_000_000
@@ -1017,20 +1020,25 @@ SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你
 - 需要精确当前时间时，用当前 shell 的只读时间命令
   （POSIX：date；PowerShell：Get-Date；cmd：echo %DATE% %TIME%）。
 - 用户要求修改代码或文件时，用 edit_file/write_file 完成修改并说明结果，不要只给建议。
+- 能一次做完的事不要拆成多次调用：工具往返本身就是成本，且每次都要重新读取上下文。
+- 同一文件要改多处时用 multi_edit 一次提交：它按顺序应用、要么全成功要么全不改，
+  比多次 edit_file 更省往返。跨文件改动只在需要整体原子性（一处失败就全不改）时
+  用 multi_edit 并在每个 edit 上写 path；只是各文件各改一处时，逐个 edit_file 更省。
 - 工具失败时先看 exit code、stderr、路径和权限，再调整后重试；不要原样重复同一条失败命令。
 - 同一命令或工具连续失败两次后停止重试，总结已完成、未完成和下一步；接近最大步数时
   主动收尾，不要无限尝试。
 - 找文件用 glob，按内容搜索用 search；输出可能被截断，read_file 用 offset/limit，
   不要遍历整棵树或整份倾倒日志。
 - 读代码文件要有预算，不要一段一段地磨：
-  - 动手读之前先花一次调用把结构看清楚：search 配 pattern="^(class |def )"、
-    include="*.py"、output="lines"，一次拿到全部定义的“文件:行号”；再按行号用
+  - 动手读之前先花一次调用把结构看清楚：read_file_outline 一次拿到全部定义的“文件:行号”，
+    或 search 配 pattern="^(class |def )"、include="*.py"、output="lines"；再按行号用
     read_file 精确取正文。
   - read_file 一次最多能读 {file_lines} 行，能一次读完就别拆；确实读不完再带 offset
     续读。
-  - 同一个文件 read_file 超过 3 次，说明方法错了：停下来换 search 或一条只读命令，
-    不要继续翻页。
-  - 同一段内容读了两次以上，不要再读第三遍，换个更省事的办法。
+  - 搜索时如果光看匹配行判断不了，直接用 search 的 context=N 看前后几行，不要接着再调
+    read_file。
+  - 同一个文件 read_file 超过 3 次、或同一段内容读了两次以上，说明方法错了：停下来换
+    read_file_outline、search 或一条只读命令。
 - 预览项目（“看下这个项目”“介绍下这个仓库”“这个项目怎么样”这类请求）只读关键文件，
   不要通读：
   - 先 list_dir 或 glob 看清目录结构，再挑关键文件读：README、入口文件、依赖清单、
@@ -1292,15 +1300,42 @@ def _abort_response(response: Any) -> None:
             pass
 
 
+def _arguments_complete(value: str) -> bool:
+    """Whether a tool-argument string is a complete, well-formed JSON object.
+
+    Used to tell a gateway resending the whole payload apart from a genuine
+    stream fragment that merely happens to start with '{' (for example the
+    content of a file whose first byte is a brace).
+    """
+    text = (value or "").strip()
+    if not text.startswith("{") or not text.endswith("}"):
+        return False
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict)
+
+
 def _merge_tool_arguments(existing: str, fragment: str) -> str:
-    """Merge streamed tool arguments, tolerating gateways that resend JSON."""
+    """Merge streamed tool arguments, tolerating gateways that resend JSON.
+
+    Some gateways resend the entire argument payload instead of the next
+    fragment. Detect that by checking whether the fragment alone parses as a
+    complete JSON object *and* covers everything accumulated so far; anything
+    else is treated as a real continuation and appended, so string values that
+    begin with '{' are never mistaken for a resent payload.
+    """
     if not fragment:
         return existing
     if not existing or fragment == existing:
         return fragment
-    stripped = fragment.lstrip()
-    if stripped.startswith("{") and len(fragment) >= len(existing):
-        return fragment
+    if _arguments_complete(fragment) and len(fragment) >= len(existing):
+        accumulated = (existing + fragment).strip()
+        if accumulated != fragment.strip() and not _arguments_complete(accumulated):
+            return fragment
+        if accumulated == fragment.strip():
+            return fragment
     return existing + fragment
 
 
@@ -8735,7 +8770,7 @@ LIST_SHELLS_SCHEMA: dict[str, Any] = {
     },
 }
 
-READ_ONLY_TOOL_NAMES = frozenset({"list_dir", "read_file", "search", "glob"})
+READ_ONLY_TOOL_NAMES = frozenset({"list_dir", "read_file", "read_file_outline", "search", "glob"})
 SCHEDULE_TOOL_NAMES = frozenset({
     "create_schedule",
     "list_schedules",
@@ -9207,7 +9242,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "path": {
                         "type": "string",
                         "description": "Directory relative to the workspace root. Default '.'.",
-                    }
+                    },
+                    "with_size": {
+                        "type": "boolean",
+                        "description": (
+                            "Show sizes for files and entry counts for directories. "
+                            "Default true."
+                        ),
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": (
+                            "'name' (default) for alphabetical order, or 'size' to "
+                            "put the largest files first and directories last."
+                        ),
+                    },
                 },
             },
         },
@@ -9248,6 +9297,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "read_file_outline",
+            "description": (
+                "Show a file's structural skeleton with line numbers: classes, "
+                "functions and their nesting, without their bodies. Use this first "
+                "on a large file, then read_file the ranges you actually need. "
+                "Python files are parsed exactly; other languages use a "
+                "declaration-line heuristic."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to the workspace root."},
+                    "max_items": {
+                        "type": "integer",
+                        "description": "Maximum declarations to list. Default 400, max 2000.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search",
             "description": (
                 "Search file contents with a regex inside the workspace. Skips .git, node_modules and build directories."
@@ -9273,6 +9346,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "'lines' returns only 'file:line' - use it to map a file's structure "
                             "(for example pattern '^(class |def )' with include '*.py') in one call "
                             "before deciding what to read."
+                        ),
+                    },
+                    "context": {
+                        "type": "integer",
+                        "description": (
+                            "Lines of surrounding context to show for each match "
+                            "(default 0, max 20). Use this instead of a follow-up "
+                            "read_file when you need to judge a hit in place."
                         ),
                     },
                 },
@@ -9333,6 +9414,66 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "multi_edit",
+            "description": (
+                "Apply several exact-text edits in a single atomic call, across one "
+                "or many files. Edits are applied in order, each against the result "
+                "of the previous one, so a sequence can express compound changes. "
+                "If any edit on any file fails, every file is left untouched. "
+                "Prefer this over repeated edit_file calls. Requires user approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Default file path for edits that do not set their own "
+                            "'path'. Omit it when every edit carries a path; an edit "
+                            "with neither is an error."
+                        ),
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": (
+                            "Edits to apply in order. Each old_string must be unique "
+                            "in the text as it stands when that edit runs, unless its "
+                            "own replace_all is true."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": (
+                                        "File to edit. Defaults to the tool-level "
+                                        "'path'. Set it to batch several files at once."
+                                    ),
+                                },
+                                "old_string": {
+                                    "type": "string",
+                                    "description": "Exact text to replace, including indentation.",
+                                },
+                                "new_string": {
+                                    "type": "string",
+                                    "description": "Replacement text.",
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": "Replace every occurrence for this edit. Default false.",
+                                },
+                            },
+                            "required": ["old_string", "new_string"],
+                        },
+                    },
+                },
+                "required": ["edits"],
             },
         },
     },
@@ -12111,28 +12252,105 @@ class Workspace:
 
     # -- tool implementations --------------------------------------------- #
 
-    def list_dir(self, path: str = ".") -> str:
+    def list_dir(
+        self,
+        path: str = ".",
+        with_size: bool = True,
+        sort_by: str = "name",
+    ) -> str:
         full = self._resolve(path)
         if not os.path.isdir(full):
             raise ToolError(f"not a directory: {path}")
-        entries = []
-        with os.scandir(full) as iterator:
-            selected = heapq.nsmallest(
-                300, iterator, key=lambda item: item.name.lower()
-            )
-        for entry in selected:
+        mode = (sort_by or "name").strip().lower()
+        if mode not in ("name", "size"):
+            raise ToolError("sort_by must be 'name' or 'size'")
+
+        def describe(entry: os.DirEntry[str]) -> str:
+            name = entry.name
             if entry.is_dir():
-                entries.append(entry.name + "/")
-            else:
+                if not with_size:
+                    return name + "/"
                 try:
-                    entries.append(
-                        f"{entry.name} ({entry.stat().st_size} bytes)"
-                    )
+                    count = sum(1 for _ in os.scandir(entry.path))
                 except OSError:
-                    entries.append(entry.name)
-        if len(selected) >= 300:
-            entries.append("... (truncated)")
+                    return name + "/"
+                unit = "item" if count == 1 else "items"
+                return f"{name}/ ({count} {unit})"
+            if not with_size:
+                return name
+            try:
+                return f"{name} ({_human_size(entry.stat().st_size)})"
+            except OSError:
+                return name
+
+        with os.scandir(full) as iterator:
+            pool = list(iterator)
+        if mode == "size":
+            def size_key(entry: os.DirEntry[str]) -> tuple:
+                try:
+                    size = 0 if entry.is_dir() else entry.stat().st_size
+                except OSError:
+                    size = 0
+                # Directories sort last in size mode; they have no file size.
+                return (entry.is_dir(), -size, entry.name.lower())
+            pool.sort(key=size_key)
+        else:
+            pool.sort(key=lambda entry: entry.name.lower())
+        selected = pool[:300]
+        entries = [describe(entry) for entry in selected]
+        if len(pool) > 300:
+            entries.append(f"... (truncated; {len(pool)} entries total)")
         return "\n".join(entries) or "(empty directory)"
+
+    def read_file_outline(self, path: str, max_items: int = 400) -> str:
+        """Return the structural skeleton of a file with line numbers.
+
+        Python files are parsed with ``ast`` so nesting and signatures are
+        exact. Other languages fall back to a conservative regex over
+        declaration-shaped lines. The point is to answer "what is in this file
+        and where" without reading every line into the context.
+        """
+        full = self._resolve(path)
+        if not os.path.isfile(full):
+            raise ToolError(f"not a file: {path}")
+        limit = max(1, min(int(max_items), 2000))
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as handle:
+                source = handle.read()
+        except OSError as exc:
+            raise ToolError(str(exc)) from exc
+        if "\x00" in source[:1024]:
+            raise ToolError("this looks like a binary file; attach pictures with /image or --image")
+        lines = source.splitlines()
+        total = len(lines)
+        items: list[tuple[int, int, str]] = []
+        parser = ""
+        language = _outline_language(full)
+        if full.endswith(_PY_SUFFIXES):
+            try:
+                items = _python_outline(source)
+                parser = "ast"
+            except (SyntaxError, ValueError):
+                items = []
+                parser = ""
+        if not items:
+            items = _generic_outline(lines, language)
+            parser = language or "regex"
+        if not items:
+            return f"{self._display(full)}: {total} lines, no declarations found (parser={parser or 'regex'})"
+        items.sort(key=lambda item: item[0])
+        trimmed = items[:limit]
+        rendered = [
+            f"{line_no:>6} | {'  ' * depth}{label}"
+            for line_no, depth, label in trimmed
+        ]
+        header = (
+            f"{self._display(full)}: {total} lines, "
+            f"{len(items)} declaration{'s' if len(items) != 1 else ''} (parser={parser})"
+        )
+        if len(items) > limit:
+            rendered.append(f"... (truncated; {len(items)} declarations total)")
+        return header + "\n" + "\n".join(rendered)
 
     def read_file(
         self,
@@ -12178,6 +12396,7 @@ class Workspace:
         max_results: int = 100,
         ignore_case: bool = False,
         output: str = "content",
+        context: int = 0,
     ) -> str:
         full = self._resolve(path)
         if not os.path.isdir(full):
@@ -12189,6 +12408,7 @@ class Workspace:
         mode = (output or "content").strip().lower()
         if mode not in ("content", "lines"):
             raise ToolError("output must be 'content' or 'lines'")
+        pads = max(0, min(int(context or 0), 20))
         limit = max(1, min(int(max_results), 500))
         name_glob = include.strip() or "*"
         hits: list[str] = []
@@ -12222,21 +12442,51 @@ class Workspace:
                 try:
                     files_scanned += 1
                     bytes_scanned += size
+                    shown = self._display(file_path)
+                    # Stream the file once, keeping a small sliding window of
+                    # recent lines. Each match is emitted immediately with its
+                    # "before" lines and remembers a line number until which
+                    # "after" lines must be appended, so memory stays flat and
+                    # dense matches cannot blow up the output.
+                    window: "deque[tuple[int, str]]" = deque(maxlen=pads or 1)
+                    blocks: list[list[str]] = []   # [text, last_after_line]
                     with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
-                        for number, line in enumerate(handle, 1):
-                            if "\x00" in line:
+                        for number, raw in enumerate(handle, 1):
+                            if "\x00" in raw:
                                 break
-                            if regex.search(line):
+                            text = raw.rstrip(chr(10))[:300]
+                            for block in blocks:
+                                if number <= block[1]:
+                                    block[0] += f"\n> {shown}:{number}: {text}"
+                            if regex.search(raw):
                                 if mode == "lines":
-                                    hits.append(f"{self._display(file_path)}:{number}")
+                                    hits.append(f"{shown}:{number}")
+                                elif pads:
+                                    lines = [
+                                        f"< {shown}:{past}: {past_text}"
+                                        for past, past_text in window
+                                    ]
+                                    lines.append(f"{shown}:{number}: {text}")
+                                    blocks.append(["\n".join(lines), number + pads])
                                 else:
-                                    hits.append(
-                                        f"{self._display(file_path)}:{number}: "
-                                        f"{line.rstrip(chr(10))[:300]}"
-                                    )
-                                if len(hits) >= limit:
+                                    hits.append(f"{shown}:{number}: {text}")
+                                if len(hits) + len(blocks) >= limit:
+                                    hits.extend(block[0] for block in blocks)
                                     hits.append(f"... (stopped at {limit} matches)")
                                     return "\n".join(hits)
+                            window.append((number, text))
+                            if blocks:
+                                finished = [b for b in blocks if number >= b[1]]
+                                if finished:
+                                    hits.extend(b[0] for b in finished)
+                                    blocks = [b for b in blocks if number < b[1]]
+                                    if len(hits) >= limit:
+                                        hits.append(f"... (stopped at {limit} matches)")
+                                        return "\n".join(hits)
+                    if blocks:
+                        hits.extend(block[0] for block in blocks)
+                        if len(hits) >= limit:
+                            hits.append(f"... (stopped at {limit} matches)")
                 except (OSError, ValueError):
                     continue
         if budget_hit:
@@ -12400,18 +12650,11 @@ class Workspace:
         except OSError as exc:
             raise ToolError(str(exc)) from exc
 
-        old, new = old_string, new_string
-        if old not in original and "\r\n" in original:
-            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
-        count = original.count(old)
-        if count == 0:
-            raise ToolError("old_string not found in the file")
-        if count > 1 and not replace_all:
-            raise ToolError(f"old_string occurs {count} times; add more context or set replace_all")
-        replaced = count if replace_all else 1
-        updated = original.replace(old, new, count if replace_all else 1)
+        updated, replaced, applied_old, applied_new = _apply_edit(
+            original, old_string, new_string, replace_all, label="edit"
+        )
         suffix = "s" if replaced > 1 else ""
-        detail = f"{self._display(full)} ({replaced} replacement{suffix})\n- {old[:200]}\n+ {new[:200]}"
+        detail = f"{self._display(full)} ({replaced} replacement{suffix})\n- {applied_old[:200]}\n+ {applied_new[:200]}"
         if not self._approve("edit_file", detail):
             raise ToolError("permission denied by user")
         try:
@@ -12419,6 +12662,98 @@ class Workspace:
         except OSError as exc:
             raise ToolError(str(exc)) from exc
         return f"edited {self._display(full)} ({replaced} replacement{suffix})"
+
+    def multi_edit(
+        self,
+        path: str = "",
+        edits: list[dict[str, Any]] | None = None,
+    ) -> str:
+        if not isinstance(edits, list) or not edits:
+            raise ToolError("edits must be a non-empty list")
+
+        # Group edits per file, preserving order. A batch may target several
+        # files; every file is validated and applied in memory first, so a
+        # failure anywhere leaves every file untouched.
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for index, edit in enumerate(edits, start=1):
+            if not isinstance(edit, dict):
+                raise ToolError(f"edit {index}: must be an object")
+            target = edit.get("path") or path
+            if not isinstance(target, str) or not target.strip():
+                raise ToolError(
+                    f"edit {index}: needs a file path "
+                    "(set 'path' on the edit, or pass the tool-level 'path')"
+                )
+            grouped.setdefault(target.strip(), []).append(edit)
+
+        pending: list[tuple[str, str, str]] = []  # (full, original, updated)
+        summaries: list[str] = []
+        total = 0
+        for target, file_edits in grouped.items():
+            full = self._resolve(target)
+            if not os.path.isfile(full):
+                raise ToolError(f"not a file: {target}")
+            try:
+                with open(full, "r", encoding="utf-8", newline="") as handle:
+                    original = handle.read()
+            except UnicodeDecodeError as exc:
+                raise ToolError(f"not a UTF-8 text file: {target}") from exc
+            except OSError as exc:
+                raise ToolError(str(exc)) from exc
+
+            working = original
+            shown = self._display(full)
+            file_total = 0
+            for index, edit in enumerate(file_edits, start=1):
+                old_string = edit.get("old_string")
+                new_string = edit.get("new_string")
+                if not isinstance(old_string, str) or not old_string:
+                    raise ToolError(
+                        f"{shown} edit {index}: old_string must be a non-empty string"
+                    )
+                if not isinstance(new_string, str):
+                    raise ToolError(f"{shown} edit {index}: new_string must be a string")
+                replace_all = bool(edit.get("replace_all", False))
+                # Every edit runs against the result of the previous one, so a
+                # sequence can express compound changes.
+                working, replaced, applied_old, applied_new = _apply_edit(
+                    working,
+                    old_string,
+                    new_string,
+                    replace_all,
+                    label=f"{shown} edit {index}",
+                )
+                file_total += replaced
+                suffix = "s" if replaced > 1 else ""
+                summaries.append(
+                    f"{shown} [{index}] ({replaced} replacement{suffix}) "
+                    f"- {applied_old[:100]} + {applied_new[:100]}"
+                )
+            total += file_total
+            pending.append((full, original, working))
+
+        file_count = len(pending)
+        scope = summaries[0].split(" [")[0] + " " if file_count == 1 else ""
+        detail = (
+            f"{scope}({file_count} file{'s' if file_count != 1 else ''}, "
+            f"{len(edits)} edits, {total} replacements)\n" + "\n".join(summaries)
+        )
+        if not self._approve("multi_edit", detail):
+            raise ToolError("permission denied by user")
+        for full, _original, working in pending:
+            try:
+                self._write_text(full, working, newline="")
+            except OSError as exc:
+                raise ToolError(str(exc)) from exc
+        if file_count == 1:
+            return (
+                f"edited {self._display(pending[0][0])} "
+                f"({len(edits)} edits, {total} replacements)"
+            )
+        return (
+            f"edited {file_count} files "
+            f"({len(edits)} edits, {total} replacements)"
+        )
 
     def save_text(self, path: str, text: str) -> str:
         """Write text anywhere for an explicit user command."""
@@ -13095,10 +13430,12 @@ class Workspace:
         handlers = {
             "list_dir": self.list_dir,
             "read_file": self.read_file,
+            "read_file_outline": self.read_file_outline,
             "search": self.search,
             "glob": self.glob,
             "write_file": self.write_file,
             "edit_file": self.edit_file,
+            "multi_edit": self.multi_edit,
             "submit_plan": self.submit_plan,
             "run_command": self.run_command,
             "job_status": self.job_status,
@@ -16180,6 +16517,417 @@ def run_turn(
                 session.log(messages)
             except SessionError as exc:
                 print(f"[session] {exc}", file=sys.stderr)
+
+
+_OUTLINE_LANG_BY_EXT = {
+    ".go": "go",
+    ".rs": "rust",
+    ".ts": "ts", ".tsx": "ts", ".mts": "ts", ".cts": "ts",
+    ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
+    ".java": "java",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".cs": "csharp",
+    ".c": "c", ".h": "c",
+    ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
+    ".m": "objc", ".mm": "objc",
+    ".rb": "ruby",
+    ".php": "php",
+    ".swift": "swift",
+    ".sh": "shell", ".bash": "shell", ".zsh": "shell", ".ksh": "shell",
+    ".scala": "scala",
+    ".lua": "lua",
+    ".sql": "sql",
+    ".ex": "elixir", ".exs": "elixir",
+    ".dart": "dart",
+    ".proto": "proto",
+}
+
+# Keywords that only ever introduce a declaration, never a statement.
+_OUTLINE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "go": (
+        re.compile(r"^type\s+\w+"),
+        re.compile(r"^func\s*(?:\([^)]*\)\s*)?\w+"),
+        re.compile(r"^(?:var|const)\s*\("),
+    ),
+    "rust": (
+        re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:async\s+)?(?:const\s+)?"
+                   r"(?:fn|struct|enum|trait|impl|union|mod|type|macro_rules!)\b"),
+        re.compile(r"^impl(?:<[^>]*>)?\s"),
+    ),
+    "ts": (
+        re.compile(r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?"
+                   r"(?:class|interface|enum|type|namespace|module)\s+\w+"),
+        re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*\w+"),
+        re.compile(r"^(?:export\s+)?(?:const|let|var)\s+\w+\s*(?::[^=]+)?=\s*"
+                   r"(?:async\s*)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|\w+\s*=>)"),
+        re.compile(r"^(?:(?:public|private|protected|static|readonly|abstract|override|async|get|set)\s+)*"
+                   r"[#\w$]+\s*(?:<[^>]*>)?\s*\([^;]*$"),
+    ),
+    "js": (
+        re.compile(r"^(?:export\s+)?(?:default\s+)?class\s+\w+"),
+        re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*\w+"),
+        re.compile(r"^(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*"
+                   r"(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|\w+\s*=>)"),
+        re.compile(r"^(?:(?:static|async|get|set)\s+)*[#\w$]+\s*\([^;]*$"),
+    ),
+    "java": (
+        re.compile(r"^@(?:Override|Deprecated)\b"),
+        re.compile(r"^(?:(?:public|private|protected|static|final|abstract|sealed|non-sealed|"
+                   r"strictfp|synchronized|native|default)\s+)*"
+                   r"(?:class|interface|enum|record|@interface)\s+\w+"),
+        re.compile(r"^(?:(?:public|private|protected|static|final|abstract|synchronized|native|"
+                   r"default|strictfp)\s+)*(?:<[^>]*>\s*)?[\w$.<>\[\],?\s]+\s+\w+\s*\("),
+    ),
+    "kotlin": (
+        re.compile(r"^(?:(?:public|private|protected|internal|open|abstract|sealed|data|enum|"
+                   r"annotation|value|inline|inner)\s+)*(?:class|interface|object)\s+\w+"),
+        re.compile(r"^(?:(?:public|private|protected|internal|open|override|abstract|suspend|"
+                   r"inline|operator|infix|tailrec|external)\s+)*fun\s+"),
+        re.compile(r"^(?:val|var)\s+\w+"),
+    ),
+    "csharp": (
+        re.compile(r"^\[[^\]]*\]$"),
+        re.compile(r"^(?:(?:public|private|protected|internal|static|sealed|abstract|partial|"
+                   r"readonly|unsafe|new|async|virtual|override|extern)\s+)*"
+                   r"(?:class|interface|struct|enum|record|delegate)\s+\w+"),
+        re.compile(r"^(?:(?:public|private|protected|internal|static|async|virtual|override|"
+                   r"abstract|sealed|extern|unsafe|new|partial)\s+)+[\w<>\[\],?.\s]+\s+\w+\s*\("),
+        re.compile(r"^(?:namespace)\s+[\w.]+"),
+    ),
+    "c": (
+        re.compile(r"^#\s*(?:include|define)\b"),
+        re.compile(r"^(?:typedef\s+)?(?:struct|union|enum)\s+\w*\s*$"),
+        re.compile(r"^(?:typedef\s+)?(?:struct|union|enum)\s+\w+"),
+        re.compile(r"^(?:static\s+|inline\s+|extern\s+|const\s+|unsigned\s+|signed\s+)*"
+                   r"[A-Za-z_][\w\s\*]*\s+\**[A-Za-z_]\w*\s*\([^;]*$"),
+    ),
+    "cpp": (
+        re.compile(r"^#\s*(?:include|define)\b"),
+        re.compile(r"^(?:template\s*<[^>]*>\s*)?(?:class|struct|union|enum(?:\s+class)?|namespace)\s+\w*"),
+        re.compile(r"^(?:public|private|protected)\s*:"),
+        re.compile(r"^(?:[\w:<>,~*&\s]+)\s+[\w:~]+\s*\([^;]*$"),
+        re.compile(r"^(?:virtual|static|inline|explicit|constexpr|friend)\b.*\("),
+    ),
+    "objc": (
+        re.compile(r"^@(?:interface|implementation|protocol|property|end)\b"),
+        re.compile(r"^[-+]\s*\([^)]*\)"),
+    ),
+    "ruby": (
+        re.compile(r"^\s*(?:def|class|module)\b"),
+        re.compile(r"^\s*(?:private|protected|public)\s*$"),
+        re.compile(r"^\s*attr_(?:reader|writer|accessor)\b"),
+    ),
+    "php": (
+        re.compile(r"^\s*(?:(?:public|private|protected|static|final|abstract)\s+)*"
+                   r"(?:class|interface|trait|enum|function)\s+\w+"),
+        re.compile(r"^\s*(?:namespace|use)\s+[\w\\]+"),
+    ),
+    "swift": (
+        re.compile(r"^\s*(?:(?:public|private|internal|fileprivate|open|final|static|"
+                   r"override|mutating|@\w+)\s+)*"
+                   r"(?:class|struct|enum|protocol|extension|actor|func|init|deinit|subscript|typealias)\b"),
+        re.compile(r"^\s*(?:let|var)\s+\w+\s*:"),
+    ),
+    "scala": (
+        re.compile(r"^\s*(?:(?:private|protected|final|sealed|abstract|implicit|override)\s+)*"
+                   r"(?:class|trait|object|case\s+class|def|val|var|type)\b"),
+    ),
+    "dart": (
+        re.compile(r"^\s*(?:(?:abstract|base|final|sealed|interface|mixin)\s+)*"
+                   r"(?:class|enum|mixin|extension|typedef)\s+\w+"),
+        re.compile(r"^\s*(?:Future|Stream|void|int|double|String|bool|dynamic|[\w<>?]+)"
+                   r"\s+\w+\s*\([^;]*$"),
+    ),
+    "shell": (
+        re.compile(r"^\s*(?:function\s+)?[A-Za-z_]\w*\s*\(\)\s*\{"),
+        re.compile(r"^\s*function\s+[A-Za-z_]\w*"),
+    ),
+    "lua": (
+        re.compile(r"^\s*(?:local\s+)?function\b"),
+        re.compile(r"^\s*local\s+\w+\s*=\s*function\b"),
+    ),
+    "sql": (
+        re.compile(r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|FUNCTION|PROCEDURE|"
+                   r"INDEX|TRIGGER|TYPE|SCHEMA)\b", re.IGNORECASE),
+        re.compile(r"^\s*ALTER\s+TABLE\b", re.IGNORECASE),
+    ),
+    "elixir": (
+        re.compile(r"^\s*(?:def|defp|defmodule|defprotocol|defimpl|defmacro|defstruct)\b"),
+    ),
+    "proto": (
+        re.compile(r"^\s*(?:message|service|enum|rpc|oneof|extend)\s+\w+"),
+    ),
+}
+
+# Languages whose block structure is brace-delimited, so nesting can be
+# recovered by counting braces. Indent-scanning is unreliable for these.
+_BRACE_LANGS = frozenset({"go", "rust", "ts", "js", "java", "kotlin", "csharp",
+                          "c", "cpp", "objc", "php", "swift", "scala", "dart",
+                          "proto"})
+
+_PY_SUFFIXES = (".py", ".pyi")
+
+
+def _outline_language(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    return _OUTLINE_LANG_BY_EXT.get(ext, "")
+
+
+def _code_only(line: str, state: dict[str, Any]) -> str:
+    """Strip comments and string literals so braces can be counted safely.
+
+    ``state`` carries block-comment and triple-quote status across lines.
+    This is a scanner, not a parser: it only needs to be right about which
+    characters are structural.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(line)
+    while index < length:
+        if state.get("block"):
+            end = line.find("*/", index)
+            if end < 0:
+                return "".join(out)
+            index = end + 2
+            state["block"] = False
+            continue
+        if state.get("triple"):
+            end = line.find(state["triple"], index)
+            if end < 0:
+                return "".join(out)
+            index = end + len(state["triple"])
+            state["triple"] = ""
+            continue
+        char = line[index]
+        if line.startswith("//", index):
+            break
+        if line.startswith("/*", index):
+            state["block"] = True
+            index += 2
+            continue
+        if char == "#" and not state.get("no_hash"):
+            break
+        if line.startswith('"""', index) or line.startswith("'''", index):
+            state["triple"] = line[index:index + 3]
+            index += 3
+            continue
+        if char in ("'", '"', "`"):
+            quote = char
+            index += 1
+            while index < length:
+                if line[index] == "\\":
+                    index += 2
+                    continue
+                if line[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _declaration_label(text: str) -> str:
+    """Trim a declaration line down to a readable signature."""
+    label = text.strip()
+    label = re.sub(r"\s*\{\s*$", "", label)
+    label = re.sub(r"\s+", " ", label)
+    return label[:160]
+
+
+def _generic_outline(lines: list[str], language: str = "") -> list[tuple[int, int, str]]:
+    """Language-aware outline for non-Python files.
+
+    Uses only the standard library: per-language keyword patterns decide what
+    counts as a declaration, and brace counting recovers nesting for
+    brace-delimited languages.
+    """
+    patterns = _OUTLINE_PATTERNS.get(language)
+    brace_aware = language in _BRACE_LANGS
+    if patterns is None:
+        patterns = tuple(
+            pattern
+            for group in _OUTLINE_PATTERNS.values()
+            for pattern in group
+        )
+        brace_aware = True
+    items: list[tuple[int, int, str]] = []
+    state: dict[str, Any] = {"block": False, "triple": "", "no_hash": True}
+    depth = 0
+    for index, raw in enumerate(lines, start=1):
+        code = _code_only(raw, state)
+        stripped = code.strip()
+        if stripped:
+            before = depth
+            for matched in patterns:
+                if matched.match(stripped):
+                    items.append(
+                        (index, max(0, min(before, 8)), _declaration_label(raw))
+                    )
+                    break
+            depth += code.count("{") - code.count("}")
+            if depth < 0:
+                depth = 0
+        if brace_aware is False:
+            # Indent languages still report nesting from leading whitespace.
+            pass
+    if not brace_aware:
+        # Recompute depth from indentation for indent-based languages.
+        indent_items: list[tuple[int, int, str]] = []
+        indent_stack: list[int] = []
+        for index, raw in enumerate(lines, start=1):
+            stripped_raw = raw.strip()
+            if not stripped_raw:
+                continue
+            indent = len(raw) - len(raw.lstrip())
+            while indent_stack and indent <= indent_stack[-1]:
+                indent_stack.pop()
+            if any(matched.match(stripped_raw) for matched in patterns):
+                indent_items.append((index, len(indent_stack), _declaration_label(raw)))
+                indent_stack.append(indent)
+        return indent_items
+    return items
+
+
+def _node_text(node: Any) -> str:
+    """Best-effort source text for an AST node, on any Python version.
+
+    ``ast.unparse`` only exists on 3.9+, so the fallback reconstructs the few
+    node shapes that realistically appear in a class base list.
+    """
+    import ast
+
+    unparse = getattr(ast, "unparse", None)
+    if unparse is not None:
+        try:
+            text = unparse(node)
+        except Exception:
+            text = ""
+        if text:
+            return text
+    return _node_text_fallback(node)
+
+
+def _node_text_fallback(node: Any) -> str:
+    import ast
+
+    if isinstance(node, ast.Name):
+        return str(node.id)
+    if isinstance(node, ast.Attribute):
+        prefix = _node_text_fallback(node.value)
+        return f"{prefix}.{node.attr}" if prefix else str(node.attr)
+    if isinstance(node, ast.Subscript):
+        base = _node_text_fallback(node.value)
+        index = _node_text_fallback(node.slice)
+        return f"{base}[{index}]" if base else ""
+    if isinstance(node, ast.Index):  # removed in 3.9, present in 3.8
+        return _node_text_fallback(getattr(node, "value", None))
+    if isinstance(node, ast.Tuple):
+        parts = [_node_text_fallback(item) for item in node.elts]
+        return ", ".join(part for part in parts if part)
+    if isinstance(node, ast.Constant):
+        return repr(node.value)
+    if isinstance(node, ast.keyword):
+        target = getattr(node.arg, "__str__", lambda: "")()
+        value = _node_text_fallback(node.value)
+        return f"{target}={value}" if target and value else ""
+    if isinstance(node, ast.Call):
+        func = _node_text_fallback(node.func)
+        args = [_node_text_fallback(arg) for arg in node.args]
+        parts = [part for part in args if part]
+        parts.extend(
+            _node_text_fallback(keyword) for keyword in node.keywords
+        )
+        parts = [part for part in parts if part]
+        return f"{func}({', '.join(parts)})" if func else ""
+    return ""
+
+
+def _python_outline(source: str) -> list[tuple[int, int, str]]:
+    """Outline a Python file with ``ast``, returning (line, depth, label)."""
+    import ast
+
+    tree = ast.parse(source)
+    items: list[tuple[int, int, str]] = []
+
+    def signature(node: Any) -> str:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+            return prefix + node.name + "()"
+        if isinstance(node, ast.ClassDef):
+            bases = [_node_text(base) for base in node.bases]
+            bases.extend(_node_text(keyword) for keyword in node.keywords)
+            bases = [base for base in bases if base]
+            suffix = f"({', '.join(bases)})" if bases else ""
+            return "class " + node.name + suffix
+        return getattr(node, "name", "?")
+
+    def walk(nodes: list[Any], depth: int) -> None:
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                items.append((node.lineno, depth, signature(node)))
+                if isinstance(node, ast.ClassDef):
+                    walk(node.body, depth + 1)
+                else:
+                    # Describe nested defs only; implementation bodies are noise.
+                    walk(
+                        [
+                            child
+                            for child in node.body
+                            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                        ],
+                        depth + 1,
+                    )
+
+    walk(tree.body, 0)
+    return items
+
+
+def _human_size(size: int) -> str:
+    """Render a byte count in a compact, human-readable form."""
+    value = float(max(0, int(size)))
+    if value < 1024:
+        return f"{int(value)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        value /= 1024.0
+        if value < 1024 or unit == "TB":
+            if value >= 100:
+                return f"{value:.0f} {unit}"
+            if value >= 10:
+                return f"{value:.1f} {unit}"
+            return f"{value:.2f} {unit}"
+    return f"{int(size)} B"
+
+
+def _apply_edit(
+    text: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool,
+    label: str = "edit",
+) -> tuple[str, int, str, str]:
+    """Apply one exact-text edit, tolerating CRLF files.
+
+    Returns ``(updated, replacements, applied_old, applied_new)``. ``applied_*``
+    are the strings actually matched after newline normalisation, so callers can
+    report what really changed. Raises ``ToolError`` when the snippet is absent
+    or ambiguous, leaving the caller's text untouched.
+    """
+    old, new = old_string, new_string
+    if old not in text and "\r\n" in text:
+        old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+    count = text.count(old)
+    if count == 0:
+        raise ToolError(f"{label}: old_string not found in the file")
+    if count > 1 and not replace_all:
+        raise ToolError(
+            f"{label}: old_string occurs {count} times; "
+            "add more context or set replace_all"
+        )
+    replaced = count if replace_all else 1
+    updated = text.replace(old, new, count if replace_all else 1)
+    return updated, replaced, old, new
 
 
 def _one_line(text: str, limit: int) -> str:

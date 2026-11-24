@@ -90,7 +90,7 @@ def start_web(home, args):
 
 def make_api(url):
     token = url.rsplit("token=", 1)[1]
-    base = url.split("?", 1)[0]
+    base = url.split("?", 1)[0].rstrip("/")
 
     def api(path, body=None, expect_error=False):
         data = json.dumps(body).encode() if body is not None else None

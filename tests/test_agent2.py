@@ -315,8 +315,9 @@ check("run_turn with edit_file", ok and "GAMMA" in open(os.path.join(base, "edit
 check(
     "all tools sent",
     messages[-1]["content"] == (
-        "done:list_dir,read_file,search,glob,write_file,edit_file,run_command,"
-        "list_shells,switch_shell,job_status,job_output,job_cancel,list_jobs"
+        "done:list_dir,read_file,read_file_outline,search,glob,write_file,edit_file,"
+        "multi_edit,run_command,list_shells,switch_shell,job_status,job_output,"
+        "job_cancel,list_jobs"
     ),
     messages[-1],
 )
