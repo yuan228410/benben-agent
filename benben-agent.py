@@ -263,6 +263,7 @@ import fnmatch
 import getpass
 import glob as glob_mod
 import hashlib
+import heapq
 import json
 import locale
 import os
@@ -451,6 +452,7 @@ SKILL_BACKUP_DIR = os.path.join(SESSION_DIR, "skill-backups")
 SKILL_STAGING_DIR = os.path.join(SESSION_DIR, "skill-staging")
 SKILL_PENDING_DIR = os.path.join(SESSION_DIR, "skill-pending")
 SKILL_BACKUP_KEEP = 5
+SKILL_INVENTORY_TTL = 2.0
 SKILL_PENDING_TTL = 24 * 60 * 60
 SKILL_MAX_FILES = 2000
 SKILL_MAX_TOTAL_BYTES = 20 * 1024 * 1024
@@ -6893,24 +6895,6 @@ def skill_roots(workspace_root: str, only_own: bool = False) -> list[str]:
     ]
 
 
-def _dir_has_files(path: str) -> bool:
-    if not os.path.isdir(path):
-        return False
-    for _root, _dirs, files in os.walk(path):
-        if files:
-            return True
-    return False
-
-
-def _has_extra_files(skill_dir: str) -> bool:
-    for root, _dirs, files in os.walk(skill_dir):
-        for name in files:
-            if root == skill_dir and name == "SKILL.md":
-                continue
-            return True
-    return False
-
-
 def discover_skills(workspace_root: str, only_own: bool = False) -> dict[str, dict[str, Any]]:
     """Load only skill metadata; bodies and resources stay on disk until requested."""
     skills: dict[str, dict[str, Any]] = {}
@@ -6942,6 +6926,7 @@ def discover_skills(workspace_root: str, only_own: bool = False) -> dict[str, di
                 continue
             if name in skills:
                 continue
+            _, _, has_scripts, has_resources = _skill_stats(directory)
             skills[name] = {
                 "name": name,
                 "description": meta["description"],
@@ -6951,8 +6936,8 @@ def discover_skills(workspace_root: str, only_own: bool = False) -> dict[str, di
                 "compatibility": meta.get("compatibility") or "",
                 "metadata": meta.get("metadata") or {},
                 "allowed_tools": meta.get("allowed-tools") or "",
-                "has_scripts": _dir_has_files(os.path.join(directory, "scripts")),
-                "has_resources": _has_extra_files(directory),
+                "has_scripts": has_scripts,
+                "has_resources": has_resources,
             }
     return skills
 
@@ -7106,10 +7091,14 @@ def _skill_scope_root(workspace_root: str, scope: str) -> str:
     raise ToolError("scope must be 'user' or 'workspace'")
 
 
-def _dir_size_and_count(path: str) -> tuple[int, int]:
+def _skill_stats(directory: str) -> tuple[int, int, bool, bool]:
+    """Return size, file count, has_scripts and has_resources in one walk."""
     total = 0
     count = 0
-    for root, dirs, files in os.walk(path):
+    has_scripts = False
+    has_resources = False
+    scripts_prefix = "scripts" + os.sep
+    for root, dirs, files in os.walk(directory):
         dirs[:] = [
             name
             for name in dirs
@@ -7117,12 +7106,17 @@ def _dir_size_and_count(path: str) -> tuple[int, int]:
         ]
         for name in files:
             full = os.path.join(root, name)
+            relative = os.path.relpath(full, directory)
+            if relative != "SKILL.md":
+                has_resources = True
+                if relative.startswith(scripts_prefix):
+                    has_scripts = True
             try:
                 total += os.lstat(full).st_size
             except OSError:
                 pass
             count += 1
-    return total, count
+    return total, count, has_scripts, has_resources
 
 
 def _dir_fingerprint(path: str) -> str:
@@ -7282,6 +7276,9 @@ class SkillManager:
 
     def __init__(self, workspace: "Workspace") -> None:
         self.workspace = workspace
+        self._inventory_cache: list[dict[str, Any]] | None = None
+        self._inventory_cached_at = 0.0
+        self._inventory_roots: tuple[tuple[str, int], ...] = ()
         self.cleanup()
 
     @property
@@ -7345,7 +7342,26 @@ class SkillManager:
 
     # -- inventory -------------------------------------------------------- #
 
+    def _root_signature(self) -> tuple[tuple[str, int], ...]:
+        signature: list[tuple[str, int]] = []
+        for _scope, root, _label, _editable in self._root_specs():
+            real_root = os.path.realpath(root)
+            try:
+                mtime = os.stat(real_root).st_mtime_ns
+            except OSError:
+                mtime = 0
+            signature.append((real_root, mtime))
+        return tuple(signature)
+
     def inventory(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        roots = self._root_signature()
+        if (
+            self._inventory_cache is not None
+            and roots == self._inventory_roots
+            and now - self._inventory_cached_at < SKILL_INVENTORY_TTL
+        ):
+            return [dict(row) for row in self._inventory_cache]
         rows: list[dict[str, Any]] = []
         seen_roots: set[str] = set()
         for scope, root, label, editable in self._root_specs():
@@ -7397,7 +7413,9 @@ class SkillManager:
                     if meta is not None
                     else (None, "invalid or missing frontmatter")
                 )
-                size, file_count = _dir_size_and_count(directory)
+                size, file_count, has_scripts, has_resources = _skill_stats(
+                    directory
+                )
                 invalid = bool(problem)
                 rows.append({
                     "name": name or entry,
@@ -7412,10 +7430,8 @@ class SkillManager:
                         if meta is not None
                         else ""
                     ),
-                    "has_scripts": _dir_has_files(
-                        os.path.join(directory, "scripts")
-                    ),
-                    "has_resources": _has_extra_files(directory),
+                    "has_scripts": has_scripts,
+                    "has_resources": has_resources,
                     "file_count": file_count,
                     "size": size,
                     "editable": editable,
@@ -7428,7 +7444,10 @@ class SkillManager:
             item["name"],
             item["scope_label"],
         ))
-        return rows
+        self._inventory_cache = rows
+        self._inventory_cached_at = time.monotonic()
+        self._inventory_roots = roots
+        return [dict(row) for row in rows]
 
     def _find_row(
         self,
@@ -8281,6 +8300,9 @@ class SkillManager:
     # -- reload / detail -------------------------------------------------- #
 
     def reload(self) -> int:
+        self._inventory_cache = None
+        self._inventory_cached_at = 0.0
+        self._inventory_roots = ()
         self.workspace.skills = discover_skills(
             self.root, only_own=self.workspace.only_own_skills
         )
@@ -12023,17 +12045,21 @@ class Workspace:
             raise ToolError(f"not a directory: {path}")
         entries = []
         with os.scandir(full) as iterator:
-            for entry in sorted(iterator, key=lambda item: item.name.lower()):
-                if entry.is_dir():
-                    entries.append(entry.name + "/")
-                else:
-                    try:
-                        entries.append(f"{entry.name} ({entry.stat().st_size} bytes)")
-                    except OSError:
-                        entries.append(entry.name)
-                if len(entries) >= 300:
-                    entries.append("... (truncated)")
-                    break
+            selected = heapq.nsmallest(
+                300, iterator, key=lambda item: item.name.lower()
+            )
+        for entry in selected:
+            if entry.is_dir():
+                entries.append(entry.name + "/")
+            else:
+                try:
+                    entries.append(
+                        f"{entry.name} ({entry.stat().st_size} bytes)"
+                    )
+                except OSError:
+                    entries.append(entry.name)
+        if len(selected) >= 300:
+            entries.append("... (truncated)")
         return "\n".join(entries) or "(empty directory)"
 
     def read_file(
