@@ -11935,6 +11935,7 @@ class Workspace:
         self.plan_mode = False
         self.plan_guard = "off"
         self.plan_result: dict[str, Any] | None = None
+        self.plan_sessions: dict[str, dict[str, Any]] = {}
         self.scheduler: "SchedulerService | None" = None
         self.memory: "MemoryService | None" = None
         self.mcp: "McpManager | None" = None
@@ -12256,6 +12257,30 @@ class Workspace:
             "approved": False,
         }
         return "plan submitted; waiting for the user's approval"
+
+    def save_plan_state(self, session_uuid: str | None) -> None:
+        if not session_uuid:
+            return
+        self.plan_sessions[session_uuid] = {
+            "plan_mode": self.plan_mode,
+            "plan_guard": self.plan_guard,
+            "plan_result": copy.deepcopy(self.plan_result),
+        }
+
+    def restore_plan_state(
+        self,
+        session_uuid: str | None,
+        default_mode: bool,
+        default_guard: str,
+    ) -> None:
+        saved = self.plan_sessions.get(session_uuid or "") or {}
+        self.plan_mode = bool(saved.get("plan_mode", default_mode))
+        self.plan_guard = str(saved.get("plan_guard", default_guard))
+        self.plan_result = copy.deepcopy(saved.get("plan_result"))
+
+    def drop_plan_state(self, session_uuid: str | None) -> None:
+        if session_uuid:
+            self.plan_sessions.pop(session_uuid, None)
 
     def edit_file(
         self,
@@ -22129,12 +22154,31 @@ def run_web(
             if state["messages"]:
                 state["messages"][0] = system_message
 
+    plan_defaults = {
+        "mode": bool(workspace.plan_mode),
+        "guard": str(workspace.plan_guard),
+    }
+
     def apply_plan_mode(enabled: bool, guard: str | None = None) -> None:
         """Switch plan mode and refresh the system prompt and the tool list."""
         workspace.plan_mode = enabled
         workspace.plan_result = None
         if guard is not None:
             workspace.plan_guard = guard
+        refresh_web_system_message()
+
+    def save_current_plan_state() -> None:
+        with lock:
+            current = state["session"]
+            uuid = current.uuid if current is not None else None
+        workspace.save_plan_state(uuid)
+
+    def restore_session_plan(uuid: str | None) -> None:
+        workspace.restore_plan_state(
+            uuid,
+            plan_defaults["mode"],
+            plan_defaults["guard"],
+        )
         refresh_web_system_message()
 
     def settings_snapshot() -> dict[str, Any]:
@@ -22177,6 +22221,12 @@ def run_web(
             with lock:
                 state["stream_enabled"] = bool(values["stream"])
             applied.append("stream")
+        if "plan_mode" in values:
+            plan_defaults["mode"] = bool(values["plan_mode"])
+            applied.append("plan_mode")
+        if "plan_guard" in values:
+            plan_defaults["guard"] = str(values["plan_guard"])
+            applied.append("plan_guard")
         if "plan_mode" in values or "plan_guard" in values:
             apply_plan_mode(
                 bool(values.get("plan_mode", workspace.plan_mode)),
@@ -22186,10 +22236,6 @@ def run_web(
                     else None
                 ),
             )
-            if "plan_mode" in values:
-                applied.append("plan_mode")
-            if "plan_guard" in values:
-                applied.append("plan_guard")
         if "job_follow" in values:
             workspace.job_follow = bool(values["job_follow"])
             applied.append("job_follow")
@@ -22984,6 +23030,7 @@ def run_web(
                         "shell": workspace.shell_state.to_dict(),
                         "busy": bool(chat_state["active"]),
                         "confirm": bool(workspace.confirm),
+                        "plan_pending": workspace.plan_result is not None,
                         "show_thinking": bool(
                             state.get("show_thinking", show_thinking)
                         ),
@@ -23046,6 +23093,7 @@ def run_web(
                     "context": context_state,
                     "plan_mode": bool(workspace.plan_mode),
                     "plan_guard": str(workspace.plan_guard),
+                    "plan_pending": workspace.plan_result is not None,
                     "confirm": bool(workspace.confirm),
                 })
                 return
@@ -23190,10 +23238,12 @@ def run_web(
                     if error:
                         self._error(400, error)
                         return
+                save_current_plan_state()
                 with lock:
                     state["messages"] = [system_message]
                     state["session"] = None
                     state["last_activity"] = time.monotonic()
+                restore_session_plan(None)
                 self._json(200, {
                     "session": None,
                     "messages": [],
@@ -23736,6 +23786,7 @@ def run_web(
                 if not isinstance(uuid, str):
                     self._error(400, "session must be a string")
                     return
+                was_current = False
                 with lock:
                     try:
                         delete_session(uuid)
@@ -23745,12 +23796,17 @@ def run_web(
                     if state["session"] is not None and state["session"].uuid == uuid:
                         state["messages"] = [system_message]
                         state["session"] = None
+                        was_current = True
                     current = state["session"]
-                    self._json(200, {
+                    response = {
                         "deleted": uuid,
                         "trashed": True,
                         "session": current.uuid if current else None,
-                    })
+                    }
+                workspace.drop_plan_state(uuid)
+                if was_current:
+                    restore_session_plan(None)
+                self._json(200, response)
                 return
 
             if parsed.path == "/api/session/restore":
@@ -23780,6 +23836,7 @@ def run_web(
                 except SessionError as exc:
                     self._error(404, str(exc))
                     return
+                workspace.drop_plan_state(uuid)
                 self._json(200, {
                     "ok": True,
                     "deleted": uuid,
@@ -23868,6 +23925,7 @@ def run_web(
                             changed, error = switch_web_workspace(target_root)
                             if error:
                                 workspace_warning = error
+                save_current_plan_state()
                 with lock:
                     messages = [system_message]
                     try:
@@ -23878,13 +23936,15 @@ def run_web(
                     state["messages"] = messages
                     state["session"] = session
                     state["last_activity"] = time.monotonic()
-                    self._json(200, {
+                    response = {
                         "session": session.uuid,
                         "messages": history_view(messages, lazy_images=True, include_tools=True),
                         "workspace": workspace.root,
                         "workspace_changed": changed,
                         "workspace_warning": workspace_warning,
-                    })
+                    }
+                restore_session_plan(session.uuid)
+                self._json(200, response)
                 return
 
             if parsed.path == "/api/model/info":
@@ -25779,6 +25839,22 @@ def main(argv: list[str] | None = None) -> int:
         workspace.plan_result = None
         refresh_system_prompt()
 
+    plan_defaults = {
+        "mode": bool(workspace.plan_mode),
+        "guard": str(workspace.plan_guard),
+    }
+
+    def save_current_plan_state() -> None:
+        workspace.save_plan_state(session.uuid if session else None)
+
+    def restore_session_plan(uuid: str | None = None) -> None:
+        workspace.restore_plan_state(
+            uuid,
+            plan_defaults["mode"],
+            plan_defaults["guard"],
+        )
+        refresh_system_prompt()
+
     def run_current_turn() -> None:
         run_turn(
             client, workspace, messages, args.max_steps, render_output,
@@ -26190,11 +26266,11 @@ def main(argv: list[str] | None = None) -> int:
                     if session is None and len(messages) <= 1 and not switched:
                         print("already in a new session")
                     else:
+                        save_current_plan_state()
                         messages = messages[:1]
                         pending_images = []
                         session = None
-                        if switched:
-                            refresh_system_prompt()
+                        restore_session_plan(None)
                         print("history cleared; the next message starts a new session")
                     continue
 
@@ -26240,6 +26316,7 @@ def main(argv: list[str] | None = None) -> int:
                         except SessionError as exc:
                             print(f"error: {exc}", file=sys.stderr)
                             continue
+                        workspace.drop_plan_state(uuid)
                         print(f"permanently deleted session: {uuid}")
                     elif rest:
                         print(
@@ -26364,6 +26441,7 @@ def main(argv: list[str] | None = None) -> int:
                     if session is not None and row["uuid"] == session.uuid:
                         print(f"already current: {session.uuid}")
                         continue
+                    save_current_plan_state()
                     new_messages = [messages[0]]
                     try:
                         loaded = load_session(row["uuid"], new_messages)
@@ -26400,6 +26478,7 @@ def main(argv: list[str] | None = None) -> int:
                                     workspace, target_root, args
                                 )
                                 refresh_system_prompt()
+                    restore_session_plan(row["uuid"])
                     continue
 
                 if action == "info":
@@ -26537,6 +26616,7 @@ def main(argv: list[str] | None = None) -> int:
                     except SessionError as exc:
                         print(f"error: {exc}", file=sys.stderr)
                         continue
+                    workspace.drop_plan_state(row["uuid"])
                     print(f"deleted session {row['uuid']} (moved to trash)")
                     continue
 
@@ -26576,6 +26656,7 @@ def main(argv: list[str] | None = None) -> int:
                     target = rows[index - 1]
                 else:
                     target = argument
+                save_current_plan_state()
                 try:
                     changed = apply_workspace_switch(workspace, target, args)
                 except WorkspaceError as exc:
@@ -26585,13 +26666,15 @@ def main(argv: list[str] | None = None) -> int:
                     messages = messages[:1]
                     pending_images = []
                     session = None
-                    refresh_system_prompt()
+                    restore_session_plan(None)
                     print("history cleared; the next message starts a new session")
                 continue
             if user_input == "/reset":
+                save_current_plan_state()
                 messages = messages[:1]
                 pending_images = []
                 session = None
+                restore_session_plan(None)
                 print("history cleared; the next message starts a new session")
                 continue
             if user_input == "/compact" or user_input.startswith("/compact "):

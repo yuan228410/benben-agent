@@ -47,6 +47,7 @@ python3 tests/test_skills_web.py
 python3 tests/test_web_js.py
 python3 tests/test_web_approval.py
 python3 tests/test_settings_web.py
+python3 tests/test_plan_sessions_web.py
 ```
 
 测试会：
@@ -68,6 +69,7 @@ python3 tests/test_settings_web.py
 | `test_web_js.py` | 用 Node 假 DOM 执行内嵌页面脚本，捕获初始化顺序和运行时错误（`web_js_harness.js`） |
 | `test_web_approval.py` | Web 审批：允许/拒绝/停止/超时、计划模式守卫弹窗、非流式 409、前端弹窗 HTML |
 | `test_settings_web.py` | Web 默认设置：读取/保存、立即生效、重启项、校验、密钥隐藏、对话中 409 |
+| `test_plan_sessions_web.py` | 计划状态按会话隔离、切换后不串计划、删除后计划清理、恢复会话不还原已删计划 |
 | `test_compact.py` | 会话压缩、compact 标记、恢复 |
 | `test_reasoning.py` | `--reasoning` 映射和请求字段 |
 | `test_anthropic.py` | Anthropic 协议转换、工具循环、Web |
@@ -80,7 +82,7 @@ python3 tests/test_settings_web.py
 | `test_web_connections.py` | Web 连接设置、会话标题/导出、工具详情、思考/停止控件、会话回收站恢复/永久删除/清空 |
 | `test_shell.py` | shell 检测顺序、`$SHELL` 优先、Windows 编码、工具切换、自动回退、系统提示 |
 | `test_shell_choice.py` | `run_command` 的 `shell` 参数：按指定 shell 执行、不改默认、不回退、只读判定、工具描述 |
-| `test_plan_mode.py` | 计划模式：工具不削减、`submit_plan`、守卫三档、提示词、CLI、Web API、配置持久化 |
+| `test_plan_mode.py` | 计划模式：工具不削减、`submit_plan`、守卫三档、提示词、CLI、Web API、配置持久化、会话级计划状态 |
 | `test_scheduler.py` | 时间表达式、任务存储、只读/完整权限、运行记录、补跑一次、CLI `/schedule` |
 | `test_schedule_web.py` | Web 定时任务 API、轮询通知、启停/运行/记录/删除、禁用模式 |
 | `test_memory.py` | 长期记忆、情景记忆、自动日总结、内置定时任务、只读权限、CLI `/memory` |

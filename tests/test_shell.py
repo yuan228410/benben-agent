@@ -207,7 +207,14 @@ check(
 
 # ---------- read-only and prompt ----------
 check("posix read only", agent.is_read_only_command("ls -la"))
-check("powershell never read only", not agent.is_read_only_command("Get-ChildItem", "powershell"))
+check(
+    "powershell safe cmdlet read only",
+    agent.is_read_only_command("Get-ChildItem", "powershell"),
+)
+check(
+    "powershell destructive cmdlet blocked",
+    not agent.is_read_only_command("Remove-Item x", "powershell"),
+)
 check("cmd never read only", not agent.is_read_only_command("dir", "cmd"))
 check("posix multi", agent.is_read_only_command("ls | grep x"))
 check("shell mismatch posix", agent._shell_mismatch("posix", 127, "", "foo: command not found"))

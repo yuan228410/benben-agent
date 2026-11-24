@@ -167,8 +167,12 @@ check(
 # ---------- read-only judgement follows the selected shell ----------
 check("posix cat is read only", agent.is_read_only_command("cat file", "posix") is True)
 check(
-    "powershell cat is not read only",
-    agent.is_read_only_command("cat file", "powershell") is False,
+    "powershell cat is read only",
+    agent.is_read_only_command("cat file", "powershell") is True,
+)
+check(
+    "powershell remove is not read only",
+    agent.is_read_only_command("Remove-Item x", "powershell") is False,
 )
 check("cmd dir is not read only", agent.is_read_only_command("dir", "cmd") is False)
 

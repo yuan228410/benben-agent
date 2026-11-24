@@ -484,6 +484,34 @@ finally:
     web_log.close()
     model.shutdown()
 
+# ---------- per-session plan state ----------
+plan_state_ws = agent.Workspace(ws_root)
+plan_state_ws.plan_mode = True
+plan_state_ws.plan_guard = "approve"
+plan_state_ws.plan_result = {
+    "plan": "session A plan",
+    "questions": "",
+    "approved": False,
+}
+plan_state_ws.save_plan_state("aaaaaaaa")
+plan_state_ws.restore_plan_state("bbbbbbbb", False, "off")
+check("other session plan mode default", plan_state_ws.plan_mode is False, plan_state_ws.plan_mode)
+check("other session plan guard default", plan_state_ws.plan_guard == "off", plan_state_ws.plan_guard)
+check("other session plan result empty", plan_state_ws.plan_result is None, plan_state_ws.plan_result)
+plan_state_ws.restore_plan_state("aaaaaaaa", False, "off")
+check("saved session plan restored", plan_state_ws.plan_mode is True, plan_state_ws.plan_mode)
+check("saved session guard restored", plan_state_ws.plan_guard == "approve", plan_state_ws.plan_guard)
+check(
+    "saved session plan text",
+    plan_state_ws.plan_result is not None
+    and plan_state_ws.plan_result.get("plan") == "session A plan",
+    plan_state_ws.plan_result,
+)
+plan_state_ws.drop_plan_state("aaaaaaaa")
+plan_state_ws.restore_plan_state("aaaaaaaa", False, "off")
+check("dropped session plan cleared", plan_state_ws.plan_result is None, plan_state_ws.plan_result)
+check("dropped session mode cleared", plan_state_ws.plan_mode is False, plan_state_ws.plan_mode)
+
 shutil.rmtree(root, ignore_errors=True)
 shutil.rmtree(cli_home, ignore_errors=True)
 shutil.rmtree(web_home, ignore_errors=True)
