@@ -289,6 +289,8 @@ Windows 乱码处理：
 | `--idle-compact-minutes` | `10` | 空闲分钟数 |
 | `--idle-compact-level` | 跟随 auto | 空闲压缩档位 |
 | `--idle-compact-min-percent` / `--idle-compact-min-messages` | `20` / `6` | 空闲压缩的最低上下文和消息门槛 |
+| `--compress` / `--no-compress` | 开 | 工具输出超过字符上限时按内容压缩而不是从头截断；`--no-compress` 恢复旧行为 |
+| `--compress-limit` | `20000` | 工具输出的字符上限（>= 600） |
 | `--plain` / `--no-plain` | 关 | 非流式时是否渲染 Markdown；`--no-plain` 可覆盖配置文件 |
 | `--verbose-tools` / `--no-verbose-tools` | 关 | 显示完整工具参数和工具结果（最多 20000 字符） |
 | `--thinking` / `--no-thinking` | 关 | 在回答前用暗色打印模型的 `reasoning_content`；交互模式可用 `/thinking on\|off` 切换 |
@@ -358,6 +360,10 @@ Windows 乱码处理：
       "level": null,
       "min_context_percent": 20,
       "min_messages": 6
+    },
+    "compress": {
+      "enabled": true,
+      "limit": null
     },
     "command_timeout": 60,
     "max_command_timeout": 600,
@@ -854,7 +860,7 @@ Web 端点击「+ 新建」会打开工作空间对话框，默认填当前全�
 - 摘要固定包含目标、已完成、关键决策、文件路径、执行过的命令、未完成事项和注意事项；
 - 待压缩内容过长时会分块滚动总结；
 - 图片只以 `[图片]` 占位进入摘要，base64 不会发进摘要请求；
-- 网页输入框下方的「压缩」按钮等价于 `/compact`，压缩后刷新页面仍会显示摘要提示。
+- 网页输入框下方的「压缩」按钮等价于 `/compact`。摘要显示在对话末尾（作为「以上内容已压缩」的边界提示），压缩完成后自动展开最新一条；刷新页面或重新打开历史会话时恢复折叠，避免旧摘要铺满屏幕。
 
 ### 自动压缩
 
@@ -892,9 +898,12 @@ Web 端可以不重启直接改：侧边栏「压缩设置」，或 `POST /api/c
 {
   "auto": {"enabled": true, "level": "aggressive", "threshold": null, "target_ratio": null, "keep": null},
   "idle": {"enabled": false, "minutes": 10, "level": null, "min_context_percent": 20, "min_messages": 6},
+  "compress": {"enabled": true, "limit": 20000},
   "persist": false
 }
 ```
+
+同一接口也管工具输出压缩（`compress` 段，见「工具输出压缩」）；不传该段时保持当前设置不变，`limit` 传 `null` 表示回到默认上限。
 
 - `null` 表示跟随档位预设；`level` 必须是上表 8 档之一
 - 阈值、目标、保留回合取值 1-100；空闲分钟数 1-1440
@@ -936,9 +945,36 @@ python3 benben-agent.py --idle-compact --idle-compact-minutes 10
 /compact idle messages 6         设置最少消息数
 ```
 
-`/config save` 会保存自动压缩和空闲压缩配置。
+`/config save` 会保存自动压缩、空闲压缩和工具输出压缩（`/compress`）的配置。
 
 注意：压缩只减少发送给模型的 token，不会删除或缩短磁盘上的会话 JSONL。
+
+### 工具输出压缩
+
+上面三节压缩的是**对话历史**，这一节压缩的是**工具输出**：命令结果、文件内容、搜索命中在写进上下文之前的长度。两者互不影响。
+
+工具输出超过字符上限（默认 20000）时，默认不再从头截断，而是按内容压缩：
+
+- 先判断内容类型（JSON、日志、代码、普通文本），再决定怎么花预算；
+- 报错、警告和 `def`/`class`/`import` 这类声明行优先保留，最多占 55% 预算，只要放得下就不会被丢掉；
+- 剩下的预算用于覆盖开头（到 80%）和结尾（到 95%），因为触发原因在前、结果或崩溃点在后；
+- 被跳过的中间部分折叠成 `… (N 行省略) …`，连续重复的行合并成一行并标注重复次数；
+- JSON 会先解析再削减：键名保留，超长字符串截断并标注原长度，大数组保留首尾元素，压缩结果仍是合法 JSON；
+- 单行超长（比如一整个压缩过的 JSON）会行内截断，不会整行丢弃。
+
+效果举例：3000 行编译日志压到 1%，报错行保留；400 帧堆栈压到 5%，末尾的异常类型保留；pytest 输出压到 19%，`FAILED` 行保留。
+
+```text
+/compress                         查看状态和当前字符上限
+/compress on|off                  开关（会话内有效）
+/compress limit 8000              设置字符上限
+/compress limit default           恢复默认上限
+/compress test <文本>             预览一段文本的压缩效果
+```
+
+命令行等价写法：`--compress` / `--no-compress` / `--compress-limit N`；配置文件里是 `compress: { enabled, limit }`。Web 端的入口在侧边栏「压缩设置」弹窗底部的「工具输出压缩」，改完立即生效，勾选「同时写入配置文件」才会持久化。
+
+`--no-compress` 恢复成旧行为：保留开头、丢掉结尾的硬截断。压缩是有损的，只作用于送进上下文的内容，不改磁盘上的文件、日志和会话。需要完整输出时应该直接读文件或把输出重定向到文件，不要依赖压缩。
 
 ## 技能（Agent Skills）
 
@@ -1456,7 +1492,8 @@ python3 benben-agent.py --web
 - 输入框下方还有「计划模式」开关和「守卫」下拉框；计划模式下模型提交的计划会渲染成带「批准执行」「继续规划」按钮的计划块，聊天框输入 `/plan` 也能切换；
 - 生成过程中显示「停止」按钮，点击后立即中断浏览器端等待，并请求服务端停止后续模型调用和工具执行；
 - 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
-- 侧边栏「工具与帮助」里显示「压缩设置」，可配置自动压缩和空闲压缩的档位、阈值、目标百分比和保留回合数，改动立即生效，可勾选同时写入配置文件；聊天框输入 `/compact auto` 也会打开这个设置；
+- 压缩摘要渲染为对话末尾的虚线可展开块，标题显示保留回合数（如「上下文已压缩 · 保留最近 2 轮」）；点完「压缩」会自动展开并滚到可视区域，加载历史时默认折叠；
+- 侧边栏「工具与帮助」里显示「压缩设置」，上两块配置自动压缩和空闲压缩的档位、阈值、目标百分比和保留回合数，底部「工具输出压缩」配置工具输出是否按内容压缩和字符上限；改动全部立即生效，可勾选同时写入配置文件；聊天框输入 `/compact auto` 也会打开这个设置；
 - 侧边栏「工具与帮助 → 默认设置」可以编辑 `config.json` 的 `defaults`：常用开关、生成参数、Shell、后台任务、技能、定时、记忆、MCP、Web 和 CLI 行为；保存后立即生效项会更新当前进程，其余下次启动生效；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
 - 历史会话里的图片默认只显示「点击加载」占位，点击后才请求 `/api/image` 并打开灯箱，避免首屏传输大量 base64；刚上传的图片仍直接显示本地预览；
@@ -1519,6 +1556,7 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `/stream ...` | 流式输出开关 |
 | `/compact` `/compact N` | 压缩上下文 |
 | `/compact auto` | 打开压缩设置 |
+| `/compress ...` | 工具输出压缩：查看状态、开关、字符上限、效果预览 |
 
 `/model info`、`/model config`、`/memory`、`/schedule`、`/config`、`/confirm`、`/thinking`、`/reasoning`、`/save`、`/image`、`/exit` 是 CLI 专属，Web 用对应按钮或设置项代替。
 
@@ -1633,7 +1671,7 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - HTTP 使用 `urllib.request`，JSON 使用 `json`，命令使用 `subprocess`，没有任何第三方依赖。
 - `429`、`5xx` 和网络错误会按指数退避重试（最多 3 次），遵守 `Retry-After`。
 - 模型返回的工具调用参数如果不是合法 JSON，错误会作为工具结果回传给模型，让它自行修正。
-- 工具结果超过 20000 字符会截断；`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 1000 行。
+- 工具结果超过字符上限（默认 20000）时按内容压缩：先保住报错、警告和声明行，再用剩余预算覆盖首尾，跳过的部分标出省略行数；JSON 会解析后保留结构，压缩结果仍是合法 JSON。`--no-compress` 恢复成从头截断。`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 1000 行。
 - `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，支持工作区外路径；`glob` 在遍历阶段就剪枝并限制 10 秒扫描预算，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
 - 文件工具不再限制在工作区内：`write_file`、`edit_file` 可以写任意可写路径。默认 `--confirm` 关闭，Web 模式默认也不审批；需要写操作确认时请加 `--confirm`（Web 用 `--confirm --web`），不要让不可信的网页或文件内容驱动写系统配置。
 - `write_file`、`edit_file` 和 `/save` 使用同目录临时文件 + `os.replace` 原子替换，中断时不会留下半个文件。

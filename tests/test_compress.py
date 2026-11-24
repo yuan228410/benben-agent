@@ -164,6 +164,24 @@ check("/compress limit default", agent.compression_limit() == agent.MAX_TOOL_OUT
 agent.run_compress_command(args, ["/compress", "bogus"])
 check("/compress survives bad action", agent.compression_limit() == agent.MAX_TOOL_OUTPUT)
 
+# --- Settings persist through /config save --------------------------------- #
+
+# settings_from_runtime feeds /config save; if it forgets compress, a
+# /compress limit set in the session is silently dropped on save.
+import inspect
+
+runtime_src = inspect.getsource(agent.settings_from_runtime)
+check("settings_from_runtime covers compress", '"compress"' in runtime_src)
+
+round_trip = agent._normalize_defaults({"compress": {"enabled": False, "limit": 8000}})
+check("round-trips enabled", round_trip["compress"]["enabled"] is False)
+check("round-trips limit", round_trip["compress"]["limit"] == 8000)
+
+defaults_block = agent.default_settings()
+check("defaults include compress", "compress" in defaults_block, list(defaults_block)[:5])
+check("defaults enable compression", defaults_block["compress"]["enabled"] is True)
+check("defaults limit is auto", defaults_block["compress"]["limit"] is None)
+
 print()
 if failures:
     print("FAILURES:", ", ".join(failures))

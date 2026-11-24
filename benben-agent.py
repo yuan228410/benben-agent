@@ -4515,6 +4515,10 @@ def settings_from_runtime(
             "min_context_percent": int(args.idle_compact_min_percent),
             "min_messages": int(args.idle_compact_min_messages),
         },
+        "compress": {
+            "enabled": bool(getattr(args, "compress_enabled", True)),
+            "limit": getattr(args, "compress_limit", None),
+        },
         "command_timeout": int(args.command_timeout),
         "max_command_timeout": int(args.max_command_timeout),
         "background_after_seconds": int(args.background_after_seconds),
@@ -6950,6 +6954,43 @@ def print_idle_compact_status(args: Any) -> None:
         f"min context: {idle['min_context_percent']}% | "
         f"min messages: {idle['min_messages']}"
     )
+
+
+def apply_compression_overrides(
+    section: Any,
+    current: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate a web/CLI compression patch and merge it over ``current``.
+
+    Returns ``None`` when the payload carries no compression section, so the
+    caller can leave the runtime switch untouched.
+    """
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError("compress must be an object")
+    merged = {
+        "enabled": bool(current.get("enabled", True)),
+        "limit": current.get("limit"),
+    }
+    if "enabled" in section:
+        if not isinstance(section["enabled"], bool):
+            raise ValueError("compress.enabled must be a boolean")
+        merged["enabled"] = section["enabled"]
+    if "limit" in section:
+        raw = section["limit"]
+        if raw is None or raw == "":
+            merged["limit"] = None
+        else:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                raise ValueError("compress.limit must be an integer or null")
+            if not COMPRESS_MIN_LIMIT <= raw <= COMPRESS_MAX_LIMIT:
+                raise ValueError(
+                    f"compress.limit must be between {COMPRESS_MIN_LIMIT} "
+                    f"and {COMPRESS_MAX_LIMIT}"
+                )
+            merged["limit"] = raw
+    return merged
 
 
 def print_compress_status() -> None:
@@ -18089,16 +18130,16 @@ aside { width: 250px; flex: none; background: #fff; border-right: 1px solid #e3e
 .session .meta { display: block; color: #8a919c; font-size: 12px; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #log { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; }
-.msg { max-width: 820px; margin-bottom: 12px; padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; }
+.msg { max-width: 92%; margin-bottom: 12px; padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; }
 .msg.user { align-self: flex-end; background: #dcebff; }
 .msg.assistant { align-self: flex-start; background: #fff; border: 1px solid #e3e6ea; white-space: normal; }
-.tool { align-self: flex-start; color: #8a919c; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
-.tool-detail { align-self: flex-start; width: 100%; max-width: 820px; margin: -6px 0 10px; color: #667085; font-size: 12px; }
+.tool { align-self: flex-start; max-width: 92%; color: #8a919c; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
+.tool-detail { align-self: flex-start; width: 100%; max-width: 92%; margin: -6px 0 10px; color: #667085; font-size: 12px; }
 .tool-detail summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tool-detail pre { white-space: pre-wrap; word-break: break-word; background: #f9fafb; border: 1px solid #e3e6ea; border-radius: 6px; padding: 8px; margin: 6px 0 0; max-height: 320px; overflow: auto; font-size: 12px; }
 .tool-detail pre.tool-result { background: #fff; }
-.warning { align-self: flex-start; color: #d92d20; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
-.compact { align-self: stretch; margin: -2px 0 12px; padding: 8px 12px; border: 1px dashed #c9ced6; border-radius: 8px; background: #fafbfc; color: #667085; font-size: 12px; white-space: normal; }
+.warning { align-self: flex-start; max-width: 92%; color: #d92d20; font-size: 12px; white-space: pre-wrap; margin: -6px 0 10px; }
+.compact { align-self: stretch; max-width: 92%; margin: -2px 0 12px; padding: 8px 12px; border: 1px dashed #c9ced6; border-radius: 8px; background: #fafbfc; color: #667085; font-size: 12px; white-space: normal; }
 .compact summary { cursor: pointer; }
 .compact-body { margin-top: 8px; color: #344054; font-size: 13px; }
 .compact-body p { margin: 6px 0; }
@@ -18192,7 +18233,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .help-table td { border-bottom: 1px solid #eef0f3; padding: 5px 6px; vertical-align: top; }
 .help-table td:first-child { width: 42%; color: #344054; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 .help-note { margin: 8px 0; padding: 7px 9px; border-radius: 6px; background: #f9fafb; color: #667085; font-size: 12px; }
-.job-block { align-self: stretch; max-width: 820px; margin: 0 0 12px; padding: 9px 11px; border: 1px solid #d9e2ef; border-radius: 8px; background: #f8fbff; font-size: 12px; }
+.job-block { align-self: stretch; max-width: 92%; margin: 0 0 12px; padding: 9px 11px; border: 1px solid #d9e2ef; border-radius: 8px; background: #f8fbff; font-size: 12px; }
 .job-block .job-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .job-block .job-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; }
 .job-block .job-state { color: #667085; }
@@ -19219,6 +19260,14 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
       <label for="cc-idle-min-messages">最少消息数</label>
       <input id="cc-idle-min-messages" type="number" min="0" max="10000">
     </div>
+    <h3 style="margin:14px 0 6px;">工具输出压缩</h3>
+    <div class="form-row">
+      <label class="check"><input id="cc-compress-enabled" type="checkbox"> 超长工具输出按内容压缩（保留报错和结尾）</label>
+    </div>
+    <div class="form-row">
+      <label for="cc-compress-limit">字符上限</label>
+      <input id="cc-compress-limit" type="number" min="600" placeholder="留空用默认 20000">
+    </div>
     <div class="form-row">
       <label class="check"><input id="cc-persist" type="checkbox"> 同时写入配置文件</label>
     </div>
@@ -19476,6 +19525,8 @@ const ccIdleMinutesEl = document.getElementById("cc-idle-minutes");
 const ccIdleLevelEl = document.getElementById("cc-idle-level");
 const ccIdleMinPercentEl = document.getElementById("cc-idle-min-percent");
 const ccIdleMinMessagesEl = document.getElementById("cc-idle-min-messages");
+const ccCompressEnabledEl = document.getElementById("cc-compress-enabled");
+const ccCompressLimitEl = document.getElementById("cc-compress-limit");
 const ccPersistEl = document.getElementById("cc-persist");
 const modelInfoModalEl = document.getElementById("model-info-modal");
 const modelInfoTitleEl = document.getElementById("model-info-title");
@@ -20051,18 +20102,13 @@ function renderHistory(messages) {
   streamText = "";
   streamThinkingEl = null;
   autoScroll = true;
+  // 摘要消息在 messages 里排在保留对话之前（发给模型时顺序不能变，
+  // 否则模型会把旧摘要当成最新上下文），但给人看时它是"以上内容已压缩"
+  // 的边界提示，堆在列表末尾更直观，也不会把视口顶到顶部。
+  const notices = [];
   for (const message of messages) {
     if (message.role === "notice") {
-      const details = document.createElement("details");
-      details.className = "compact";
-      const summary = document.createElement("summary");
-      summary.textContent = message.text || "上下文已压缩";
-      const body = document.createElement("div");
-      body.className = "compact-body";
-      body.innerHTML = renderMarkdown(message.summary || "");
-      details.appendChild(summary);
-      details.appendChild(body);
-      logEl.appendChild(details);
+      notices.push(message);
     } else if (message.role === "tool_call") {
       addToolDetail(formatToolCall(message), message.call_id);
     } else if (message.role === "tool_result") {
@@ -20078,6 +20124,18 @@ function renderHistory(messages) {
       });
       addUserMessage(message.text, images, true);
     }
+  }
+  for (const message of notices) {
+    const details = document.createElement("details");
+    details.className = "compact";
+    const summary = document.createElement("summary");
+    summary.textContent = message.text || "上下文已压缩";
+    const body = document.createElement("div");
+    body.className = "compact-body";
+    body.innerHTML = renderMarkdown(message.summary || "");
+    details.appendChild(summary);
+    details.appendChild(body);
+    logEl.appendChild(details);
   }
 }
 
@@ -20670,6 +20728,10 @@ async function openCompactConfigModal() {
       || rawIdle.min_context_percent === null ? 20 : rawIdle.min_context_percent;
     ccIdleMinMessagesEl.value = rawIdle.min_messages === undefined
       || rawIdle.min_messages === null ? 6 : rawIdle.min_messages;
+    const compress = data.compress || {};
+    ccCompressEnabledEl.checked = compress.enabled !== false;
+    ccCompressLimitEl.value = compress.limit === undefined
+      || compress.limit === null ? "" : compress.limit;
     compactConfigModalEl.hidden = false;
   } catch (err) {
     statusEl.textContent = "压缩设置读取失败: " + String(err);
@@ -20688,6 +20750,15 @@ async function saveCompactConfig() {
     compactConfigStatusEl.textContent = "空闲分钟数、最低上下文 % 和最少消息数必须是整数";
     return;
   }
+  const compressLimit = compactNumber(ccCompressLimitEl.value);
+  if (ccCompressLimitEl.value.trim() !== "" && compressLimit === null) {
+    compactConfigStatusEl.textContent = "字符上限必须是整数，留空表示用默认值";
+    return;
+  }
+  if (compressLimit !== null && (compressLimit < 600 || compressLimit > 1000000)) {
+    compactConfigStatusEl.textContent = "字符上限必须在 600 到 1000000 之间";
+    return;
+  }
   const payload = {
     auto: {
       enabled: ccAutoEnabledEl.checked,
@@ -20702,6 +20773,10 @@ async function saveCompactConfig() {
       level: ccIdleLevelEl.value || null,
       min_context_percent: minPercent,
       min_messages: minMessages,
+    },
+    compress: {
+      enabled: ccCompressEnabledEl.checked,
+      limit: compressLimit,
     },
     persist: ccPersistEl.checked,
   };
@@ -20731,6 +20806,7 @@ async function resetCompactConfig() {
         enabled: false, minutes: 10, level: null,
         min_context_percent: 20, min_messages: 6,
       },
+      compress: { enabled: true, limit: null },
     });
     closeCompactConfigModal();
     statusEl.textContent = "压缩设置已恢复默认";
@@ -21820,8 +21896,18 @@ async function compactContext(keep) {
     const data = await api("/api/compact", { keep: value });
     currentSession = data.session;
     renderHistory(data.messages);
+    // 摘要默认折叠在 <details> 里，压缩完直接展开，否则点完按钮只看得到
+    // 状态栏那行统计，看不到压缩出来的摘要本身。
+    const blocks = logEl.querySelectorAll("details.compact");
+    if (blocks.length) {
+      const latest = blocks[blocks.length - 1];
+      latest.open = true;
+      latest.scrollIntoView({ block: "nearest" });
+    }
+    const summaryChars = typeof data.summary === "string" ? data.summary.length : 0;
     statusEl.textContent = "已压缩：" + data.before_total + " 条 → " + data.after_messages
-      + " 条，约 " + data.before_tokens + " → " + data.after_tokens + " tokens";
+      + " 条，约 " + data.before_tokens + " → " + data.after_tokens + " tokens"
+      + (summaryChars ? "，摘要 " + summaryChars + " 字符" : "");
     loadSessions();
   } catch (err) {
     statusEl.textContent = String(err);
@@ -23948,6 +24034,10 @@ def run_web(
     class Handler(BaseHTTPRequestHandler):
         server_version = "benben-agent"
 
+        # Set once a write fails because the browser hung up; _sse checks it so
+        # the rest of the turn does not keep trying to write to a dead socket.
+        _client_gone = False
+
         def log_message(self, *args: Any) -> None:
             pass
 
@@ -23962,8 +24052,11 @@ def run_web(
                 self.send_header("X-Frame-Options", "DENY")
                 self.end_headers()
                 self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except ConnectionError:
+                # The client hung up. Windows reports ConnectionAbortedError
+                # (WinError 10053) where POSIX raises BrokenPipeError or
+                # ConnectionResetError; the ConnectionError base covers all.
+                self._client_gone = True
 
         def _json(self, code: int, payload: Any) -> None:
             self._send(code, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
@@ -23980,8 +24073,8 @@ def run_web(
                 self.send_header("X-Frame-Options", "DENY")
                 self.end_headers()
                 self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except ConnectionError:
+                self._client_gone = True
 
         def _error(self, code: int, message: str) -> None:
             self._json(code, {"error": message})
@@ -23998,16 +24091,22 @@ def run_web(
                 self.end_headers()
                 self.close_connection = True
                 return True
-            except (BrokenPipeError, ConnectionResetError):
+            except ConnectionError:
+                self._client_gone = True
                 return False
 
         def _sse(self, payload: dict[str, Any]) -> None:
+            # Once the browser has gone, stop writing. The turn keeps running
+            # and the transcript is still saved, but every further emit would
+            # otherwise raise and print a traceback for each remaining step.
+            if self._client_gone:
+                return
             data = "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
             try:
                 self.wfile.write(data.encode("utf-8"))
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except ConnectionError:
+                self._client_gone = True
 
         def _authorized(self, value: str | None) -> bool:
             if not value:
@@ -24686,6 +24785,13 @@ def run_web(
                     "presets": AUTO_COMPACT_PRESETS,
                     "auto_compact": resolved["auto"],
                     "idle_compact": resolved["idle"],
+                    "compress": {
+                        "enabled": compression_enabled(),
+                        "limit": COMPRESS_SETTINGS.get("limit"),
+                        "resolved_limit": compression_limit(),
+                        "min_limit": COMPRESS_MIN_LIMIT,
+                        "max_limit": COMPRESS_MAX_LIMIT,
+                    },
                     "compact_raw": {
                         "auto": dict(compact_raw["auto"]),
                         "idle": dict(compact_raw["idle"]),
@@ -26012,8 +26118,23 @@ def run_web(
                 except ValueError as exc:
                     self._error(400, str(exc))
                     return
+                try:
+                    new_compress = apply_compression_overrides(
+                        payload.get("compress"),
+                        {
+                            "enabled": compression_enabled(),
+                            "limit": COMPRESS_SETTINGS.get("limit"),
+                        },
+                    )
+                except ValueError as exc:
+                    self._error(400, str(exc))
+                    return
                 compact_raw["auto"] = new_auto
                 compact_raw["idle"] = new_idle
+                if new_compress is not None:
+                    configure_compression(
+                        new_compress["enabled"], new_compress["limit"]
+                    )
                 persist = bool(payload.get("persist"))
                 if persist:
                     with config_lock:
@@ -26035,6 +26156,11 @@ def run_web(
                             ),
                             "min_messages": int(new_idle.get("min_messages", 6)),
                         }
+                        if new_compress is not None:
+                            defaults["compress"] = {
+                                "enabled": bool(new_compress["enabled"]),
+                                "limit": new_compress["limit"],
+                            }
                         try:
                             save_config(draft, config_path)
                         except ConfigError as exc:
@@ -26045,6 +26171,11 @@ def run_web(
                 self._json(200, {
                     "auto_compact": resolved["auto"],
                     "idle_compact": resolved["idle"],
+                    "compress": {
+                        "enabled": compression_enabled(),
+                        "limit": COMPRESS_SETTINGS.get("limit"),
+                        "resolved_limit": compression_limit(),
+                    },
                     "compact_raw": {
                         "auto": dict(compact_raw["auto"]),
                         "idle": dict(compact_raw["idle"]),
