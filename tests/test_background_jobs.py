@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -23,6 +24,43 @@ def check(name, cond, detail=""):
     else:
         failures.append(name)
         print(f"FAIL {name} {detail}")
+
+
+def _python_command(code: str) -> str:
+    """Run a tiny Python snippet portably.
+
+    The snippet is written to a temp file instead of being inlined, because
+    nested quoting differs between POSIX shells and PowerShell.
+    """
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", delete=False, encoding="utf-8"
+    )
+    try:
+        handle.write(code)
+        handle.close()
+        return f'"{sys.executable}" "{handle.name}"'
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+
+
+def _multi_line_command() -> str:
+    """Print six lines then exit; works on every supported shell."""
+    if os.name == "nt":
+        return _python_command(
+            "for ch in 'abcdef':\n    print(ch)\n"
+        )
+    return "printf 'a\\nb\\nc\\nd\\ne\\nf\\n'"
+
+
+def _log_line_command() -> str:
+    """Print a single marker line; works on every supported shell."""
+    if os.name == "nt":
+        return _python_command("print('log-line')\n")
+    return "printf 'log-line\\n'"
 
 
 ws = agent.Workspace(
@@ -99,7 +137,7 @@ ws.job_follow = True
 events = []
 ws.job_event = lambda kind, text: events.append((kind, json.loads(text)))
 follow_out = ws.run_command(
-    "printf 'a\\nb\\nc\\nd\\ne\\nf\\n'; sleep 1",
+    _multi_line_command(),
     timeout_seconds=10,
     background=True,
 )
@@ -167,7 +205,7 @@ log_ws = agent.Workspace(
     job_log_keep=5,
 )
 log_out = log_ws.run_command(
-    "printf 'log-line\\n'; sleep 1",
+    _log_line_command(),
     timeout_seconds=5,
     background=True,
 )
@@ -185,7 +223,8 @@ if log_match:
     )
     check(
         "job log snapshot",
-        log_ws.jobs.snapshot(log_id).get("log_path") == log_path,
+        os.path.realpath(log_ws.jobs.snapshot(log_id).get("log_path") or "")
+        == os.path.realpath(log_path),
         log_ws.jobs.snapshot(log_id),
     )
     log_ws.jobs.clean_finished()

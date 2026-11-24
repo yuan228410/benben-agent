@@ -36,6 +36,8 @@ result = subprocess.run(
     [node, str(HARNESS), js_path],
     capture_output=True,
     text=True,
+    encoding="utf-8",
+    errors="replace",
     timeout=60,
 )
 output = result.stdout + result.stderr
@@ -58,6 +60,8 @@ broken = subprocess.run(
     [node, str(HARNESS), broken_path],
     capture_output=True,
     text=True,
+    encoding="utf-8",
+    errors="replace",
     timeout=60,
 )
 broken_output = broken.stdout + broken.stderr

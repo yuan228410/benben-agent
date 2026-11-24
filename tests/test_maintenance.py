@@ -133,6 +133,8 @@ print("== version ==")
 version_run = subprocess.run(
     [sys.executable, AGENT, "--version"],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     timeout=20,
 )
@@ -167,6 +169,8 @@ check_run = subprocess.run(
         workspace,
     ],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=40,
@@ -208,6 +212,8 @@ doctor_run = subprocess.run(
         workspace,
     ],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=40,
@@ -247,7 +253,10 @@ except subprocess.TimeoutExpired:
     process.communicate()
     check("sigterm exits", False, "timeout")
 else:
-    check("sigterm exits", process.returncode == 128 + signal.SIGTERM, process.returncode)
+    # POSIX reports 128+signal for a terminated child; Windows uses
+    # TerminateProcess, which surfaces as a plain non-zero exit code.
+    expected = 1 if os.name == "nt" else 128 + signal.SIGTERM
+    check("sigterm exits", process.returncode == expected, process.returncode)
 
 if failures:
     print("\nFAILURES:", ", ".join(failures))

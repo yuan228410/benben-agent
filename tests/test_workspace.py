@@ -122,6 +122,8 @@ run = subprocess.run(
         "/exit\n"
     ),
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=60,
@@ -165,6 +167,8 @@ resume = subprocess.run(
     base_args + ["-c", uuid_a],
     input="/status\n/exit\n",
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=60,
@@ -186,6 +190,8 @@ run = subprocess.run(
         "/exit\n"
     ),
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=60,

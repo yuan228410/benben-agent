@@ -40,7 +40,10 @@ def make_png(width, height, rgb):
 
 
 # ---------- python 3.8 syntax gate ----------
-ast.parse(open(str(Path(__file__).resolve().parents[1] / "benben-agent.py")).read(), feature_version=(3, 8))
+ast.parse(
+    Path(__file__).resolve().parents[1].joinpath("benben-agent.py").read_text(encoding="utf-8"),
+    feature_version=(3, 8),
+)
 check("python 3.8 syntax", True)
 
 # ---------- mime sniffing ----------

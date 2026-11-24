@@ -153,7 +153,7 @@ state = agent.detect_shell_state(
     "auto",
     platform_name="linux",
     which=which_from(posix_map),
-    environ={"SHELL": "/bin/sh"},
+    environ={"SHELL": sh},
 )
 check("shell env sh", state.current.name == "sh", state.describe())
 
@@ -262,41 +262,94 @@ check("prompt cmd commands", "findstr" in cmd_prompt)
 
 # ---------- Workspace and tools ----------
 ws_root = tempfile.mkdtemp(prefix="shell-ws-")
-real_sh = agent.ShellInfo("/bin/sh", "sh", "posix")
+if os.name == "nt":
+    real_sh = agent.ShellInfo(
+        shutil.which("pwsh") or shutil.which("powershell") or "pwsh",
+        "pwsh",
+        "powershell",
+    )
+    real_sh_name = "pwsh"
+else:
+    real_sh = agent.ShellInfo("/bin/sh", "sh", "posix")
+    real_sh_name = "sh"
 ws = agent.Workspace(ws_root, shell_state=agent.ShellState(real_sh, [real_sh]))
 out = ws.run_command("echo shell-ok")
 check("workspace run_command", "exit code: 0" in out and "shell-ok" in out, out)
-check("workspace shell result", "shell: sh (" in out, out)
-check("workspace list_shells", ws.list_shells().startswith("current: sh"))
-switched = ws.switch_shell("sh")
-check("workspace switch", "switched shell to: sh" in switched, switched)
+check("workspace shell result", f"shell: {real_sh_name} (" in out, out)
+check("workspace list_shells", ws.list_shells().startswith(f"current: {real_sh_name}"))
+switched = ws.switch_shell(real_sh_name)
+check("workspace switch", f"switched shell to: {real_sh_name}" in switched, switched)
 tool_names = {tool["function"]["name"] for tool in agent.tool_schemas(ws)}
 check("shell tools advertised", {"list_shells", "switch_shell"} <= tool_names, tool_names)
-check("dispatch list_shells", ws.dispatch("list_shells", {}).startswith("current: sh"))
-check("dispatch switch_shell", "switched shell" in ws.dispatch("switch_shell", {"name": "sh"}))
+check("dispatch list_shells", ws.dispatch("list_shells", {}).startswith(f"current: {real_sh_name}"))
+check("dispatch switch_shell", "switched shell" in ws.dispatch("switch_shell", {"name": real_sh_name}))
 
 # ---------- automatic fallback ----------
 fallback_root = os.path.join(root, "fallback")
-fail1 = make_script(
-    os.path.join(fallback_root, "fail1"),
-    '#!/bin/sh\nif [ "$1" = "-c" ]; then echo "fail1: command not found" >&2; exit 127; fi\n',
+
+
+def fake_shell_script(path, kind, body):
+    """Write a script that mimics a shell refusing the command."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if kind == "posix":
+        script = "#!/bin/sh\n" + body + "\n"
+    elif kind == "cmd":
+        script = "@echo off\r\n" + body + "\r\n"
+    else:
+        script = body + "\n"
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(script)
+    os.chmod(path, 0o755)
+    return path
+
+
+if os.name == "nt":
+    shell_kind = "cmd"
+    refuse_body = 'echo fail1: command not found 1>&2 & exit /b 9009'
+    refuse2_body = 'echo fail2: command not found 1>&2 & exit /b 9009'
+    syntax_body = 'echo syntax error 1>&2 & exit /b 2'
+    ok_body = "echo fallback-ok"
+    missing_path = os.path.join(fallback_root, "missing.cmd")
+else:
+    shell_kind = "posix"
+    refuse_body = (
+        'if [ "$1" = "-c" ]; then echo "fail1: command not found" >&2; '
+        "exit 127; fi"
+    )
+    refuse2_body = (
+        'if [ "$1" = "-c" ]; then echo "fail2: command not found" >&2; '
+        "exit 127; fi"
+    )
+    syntax_body = (
+        'if [ "$1" = "-c" ]; then echo "syntax error" >&2; exit 2; fi'
+    )
+    ok_body = "echo fallback-ok"
+    missing_path = "/definitely/not/a/shell"
+
+fail1 = fake_shell_script(
+    os.path.join(fallback_root, "fail1." + shell_kind),
+    shell_kind,
+    refuse_body,
 )
-fail2 = make_script(
-    os.path.join(fallback_root, "fail2"),
-    '#!/bin/sh\nif [ "$1" = "-c" ]; then echo "fail2: command not found" >&2; exit 127; fi\n',
+fail2 = fake_shell_script(
+    os.path.join(fallback_root, "fail2." + shell_kind),
+    shell_kind,
+    refuse2_body,
 )
-good = make_script(
-    os.path.join(fallback_root, "good"),
-    '#!/bin/sh\necho fallback-ok\n',
+good = fake_shell_script(
+    os.path.join(fallback_root, "good." + shell_kind),
+    shell_kind,
+    ok_body,
 )
-bad = make_script(
-    os.path.join(fallback_root, "bad"),
-    '#!/bin/sh\nif [ "$1" = "-c" ]; then echo "syntax error" >&2; exit 2; fi\n',
+bad = fake_shell_script(
+    os.path.join(fallback_root, "bad." + shell_kind),
+    shell_kind,
+    syntax_body,
 )
-shell_fail1 = agent.ShellInfo(fail1, "fail1", "posix")
-shell_fail2 = agent.ShellInfo(fail2, "fail2", "posix")
-shell_good = agent.ShellInfo(good, "good", "posix")
-shell_bad = agent.ShellInfo(bad, "bad", "posix")
+shell_fail1 = agent.ShellInfo(fail1, "fail1", shell_kind)
+shell_fail2 = agent.ShellInfo(fail2, "fail2", shell_kind)
+shell_good = agent.ShellInfo(good, "good", shell_kind)
+shell_bad = agent.ShellInfo(bad, "bad", shell_kind)
 
 fallback_ws = agent.Workspace(
     tempfile.mkdtemp(prefix="fallback-ws-"),
@@ -329,7 +382,7 @@ no_fallback_ws = agent.Workspace(
 out = no_fallback_ws.run_command("definitely-missing")
 check("fallback disabled", "fallback-ok" not in out and "reason:" in out, out)
 
-missing_shell = agent.ShellInfo("/definitely/not/a/shell", "missing", "posix")
+missing_shell = agent.ShellInfo(missing_path, "missing", shell_kind)
 launch_ws = agent.Workspace(
     tempfile.mkdtemp(prefix="fallback-ws-"),
     shell_state=agent.ShellState(missing_shell, [missing_shell, shell_good]),
@@ -341,7 +394,7 @@ all_launch_ws = agent.Workspace(
     tempfile.mkdtemp(prefix="fallback-ws-"),
     shell_state=agent.ShellState(
         missing_shell,
-        [missing_shell, agent.ShellInfo("/also/missing", "missing2", "posix")],
+        [missing_shell, agent.ShellInfo(missing_path + "2", "missing2", shell_kind)],
     ),
 )
 out = all_launch_ws.run_command("anything")
@@ -362,10 +415,10 @@ class FakeClient:
 fake = FakeClient()
 static_prompt = "old"
 messages = [{"role": "system", "content": static_prompt}, {"role": "user", "content": "hi"}]
-ws.switch_shell("sh")
+ws.switch_shell(real_sh_name)
 check("run_turn ok", agent.run_turn(fake, ws, messages, 2))
 check("system prompt stable", messages[0]["content"] == static_prompt, messages[0])
-check("live shell after switch", "current: sh" in ws.list_shells())
+check("live shell after switch", f"current: {real_sh_name}" in ws.list_shells())
 
 # ---------- CLI ----------
 home = tempfile.mkdtemp(prefix="shell-cli-")
@@ -373,6 +426,8 @@ env = dict(os.environ, HOME=home, BENBEN_CONFIG=os.path.join(home, "config.json"
 result = subprocess.run(
     [sys.executable, AGENT, "--shell", "/definitely/not/a/shell", "hi"],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=30,
@@ -381,19 +436,23 @@ check("cli bad shell exit", result.returncode == 2, result.returncode)
 check("cli bad shell message", "shell not found" in result.stderr, result.stderr[-200:])
 
 result = subprocess.run(
-    [sys.executable, AGENT, "--shell", "sh"],
+    [sys.executable, AGENT, "--shell", real_sh_name],
     input="/exit\n",
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=30,
 )
-check("cli shell banner", "shell: sh (" in result.stdout, result.stdout[-500:])
+check("cli shell banner", f"shell: {real_sh_name} (" in result.stdout, result.stdout[-500:])
 
 result = subprocess.run(
-    [sys.executable, AGENT, "--shell", "sh"],
+    [sys.executable, AGENT, "--shell", real_sh_name],
     input="/status\n/exit\n",
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=30,

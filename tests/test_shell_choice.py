@@ -232,6 +232,8 @@ env = dict(os.environ, HOME=home, BENBEN_CONFIG=os.path.join(home, "config.json"
 result = subprocess.run(
     [sys.executable, AGENT, "--help"],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=30,

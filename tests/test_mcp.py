@@ -482,6 +482,8 @@ e2e = subprocess.run(
         "go",
     ],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=e2e_env,
     timeout=60,

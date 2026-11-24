@@ -301,6 +301,8 @@ def run_agent(home, workspace, args, user_input, config_path=None):
         ],
         input=user_input,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         env=env,
         cwd=workspace,
@@ -336,7 +338,7 @@ with open(config_path2, "w", encoding="utf-8") as handle:
 result = run_agent(home2, workspace2, [], "/status\n/exit\n")
 check("config memory applied", "memory: on" in result.stdout, result.stdout[-1000:])
 check("config thinking applied", "thinking: on" in result.stdout, result.stdout[-1000:])
-check("config cwd applied", f"workspace: {workspace2}" in result.stdout, result.stdout[-1000:])
+check("config cwd applied", f"workspace: {os.path.realpath(workspace2)}" in result.stdout, result.stdout[-1000:])
 
 result = run_agent(home2, workspace2, ["--no-memory", "--no-thinking"], "/status\n/exit\n")
 check("cli memory override", "memory: off" in result.stdout, result.stdout[-1000:])
@@ -357,7 +359,7 @@ saved = json.load(open(config_path3, encoding="utf-8"))["defaults"]
 check("config save memory", saved["memory"] is True, saved)
 check("config save thinking", saved["thinking"] is True, saved)
 check("config save max steps", saved["max_steps"] == 7, saved)
-check("config save cwd", saved["cwd"] == workspace3, saved)
+check("config save cwd", saved["cwd"] == os.path.realpath(workspace3), saved)
 check("config save skill scripts", saved["skill_scripts"] is True, saved)
 
 # ---------- --no-config does not create ----------

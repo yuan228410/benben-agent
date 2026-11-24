@@ -68,12 +68,14 @@ check("scheduled prompt note", "本次运行由定时任务触发" in run_prompt
 tasks = [{"id": "abcd1234", "name": "demo", "prompt": "x", "when": "every 1h"}]
 path = agent.save_schedule_tasks(tasks, schedule_dir)
 check("tasks saved", os.path.exists(path), path)
-check("tasks private", oct(os.stat(path).st_mode & 0o777) == "0o600", oct(os.stat(path).st_mode & 0o777))
-check("dir private", oct(os.stat(schedule_dir).st_mode & 0o777) == "0o700")
+if os.name != "nt":
+    check("tasks private", oct(os.stat(path).st_mode & 0o777) == "0o600", oct(os.stat(path).st_mode & 0o777))
+    check("dir private", oct(os.stat(schedule_dir).st_mode & 0o777) == "0o700")
 check("tasks loaded", agent.load_schedule_tasks(schedule_dir)[0]["id"] == "abcd1234")
 record = {"id": "abcd1234", "status": "ok", "output": "done"}
 run_path = agent.append_schedule_run("abcd1234", record, schedule_dir)
-check("run log private", oct(os.stat(run_path).st_mode & 0o777) == "0o600")
+if os.name != "nt":
+    check("run log private", oct(os.stat(run_path).st_mode & 0o777) == "0o600")
 check("runs loaded", agent.read_schedule_runs("abcd1234", 5, schedule_dir)[0]["output"] == "done")
 agent.append_schedule_run("abcd1234", {"id": "abcd1234", "status": "error"}, schedule_dir)
 check("runs limited", len(agent.read_schedule_runs("abcd1234", 1, schedule_dir)) == 1)
@@ -273,6 +275,8 @@ result = subprocess.run(
     ],
     input="/schedule\n/schedule off bbbb2222\n/schedule on bbbb2222\n/schedule history bbbb2222\n/schedule delete bbbb2222\n/exit\n",
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=40,
@@ -303,6 +307,8 @@ result = subprocess.run(
     ],
     input="/schedule\n/exit\n",
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=dict(os.environ, HOME=tempfile.mkdtemp(prefix="schedule-cli-off-")),
     timeout=40,

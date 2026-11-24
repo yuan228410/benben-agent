@@ -295,6 +295,8 @@ def run_cli(args, stdin=""):
         [sys.executable, AGENT, *args],
         input=stdin,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         env=cli_env,
         timeout=60,

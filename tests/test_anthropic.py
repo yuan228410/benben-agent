@@ -219,7 +219,7 @@ Handler.headers.clear()
 result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "anthropic-messages", "--base-url", BASE,
      "--api-key", "t", "-m", "claude-test", "--max-tokens", "123", "只回复 ok"],
-    capture_output=True, text=True, timeout=60, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env,
 )
 check("cli exit", result.returncode == 0, result.stderr[-300:])
 check("cli output", "done" in result.stdout, result.stdout[-300:])
@@ -231,7 +231,7 @@ check("cli auth", Handler.headers[-1].get("x-api-key") == "t", Handler.headers[-
 result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "anthropic-messages", "--base-url", BASE,
      "--api-key", "t", "-m", "claude-test", "--reasoning", "anthropic:high", "hi"],
-    capture_output=True, text=True, timeout=60, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env,
 )
 check("anthropic reasoning exit", result.returncode == 0, result.stderr[-300:])
 sent = Handler.requests[-1]
@@ -246,7 +246,7 @@ check(
 
 result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "anthropic-messages", "--reasoning", "deepseek:low", "hi"],
-    capture_output=True, text=True, timeout=30, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, env=env,
 )
 check("reasoning rejected", result.returncode == 2, result.returncode)
 check("reasoning message", "not supported with --api-format anthropic-messages" in result.stderr, result.stderr[-200:])
@@ -254,7 +254,7 @@ check("reasoning message", "not supported with --api-format anthropic-messages" 
 result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "anthropic-messages", "--base-url", BASE,
      "--api-key", "t", "-m", "claude-test", "--anthropic-auth", "bearer", "hi"],
-    capture_output=True, text=True, timeout=60, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env,
 )
 check("cli bearer exit", result.returncode == 0, result.stderr[-300:])
 check("cli bearer header", Handler.headers[-1].get("authorization") == "Bearer t", Handler.headers[-1])

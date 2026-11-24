@@ -217,7 +217,7 @@ Handler.headers.clear()
 result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "openai-responses", "--base-url", BASE,
      "--api-key", "t", "-m", "resp-test", "--max-tokens", "123", "hi"],
-    capture_output=True, text=True, timeout=60, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env,
 )
 check("cli exit", result.returncode == 0, result.stderr[-300:])
 check("cli output", "done" in result.stdout, result.stdout[-300:])
@@ -230,7 +230,7 @@ check("cli auth", Handler.headers[-1].get("authorization") == "Bearer t", Handle
 result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "openai-responses", "--base-url", BASE,
      "--api-key", "t", "-m", "resp-test", "--reasoning", "openai:high", "hi"],
-    capture_output=True, text=True, timeout=60, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env,
 )
 check("responses reasoning exit", result.returncode == 0, result.stderr[-300:])
 sent = Handler.requests[-1]
@@ -238,7 +238,7 @@ check("responses reasoning effort", sent.get("reasoning") == {"effort": "high"},
 
 result = subprocess.run(
     [sys.executable, AGENT, "--api-format", "openai-responses", "--reasoning", "deepseek:low", "hi"],
-    capture_output=True, text=True, timeout=30, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, env=env,
 )
 check("reasoning rejected", result.returncode == 2, result.returncode)
 check("reasoning message", "not supported with --api-format openai-responses" in result.stderr, result.stderr[-200:])

@@ -145,13 +145,13 @@ home = tempfile.mkdtemp(prefix="reasoning-home-")
 env = dict(os.environ, HOME=home)
 result = subprocess.run(
     [sys.executable, AGENT, "--reasoning", "minimax:off", "hi"],
-    capture_output=True, text=True, timeout=30, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, env=env,
 )
 check("minimax off exit", result.returncode == 2, result.returncode)
 check("minimax off message", "cannot disable thinking" in result.stderr, result.stderr[-200:])
 result = subprocess.run(
     [sys.executable, AGENT, "--reasoning", "qwen:low", "hi"],
-    capture_output=True, text=True, timeout=30, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, env=env,
 )
 check("qwen exit", result.returncode == 2)
 check("qwen message", "unsupported reasoning provider" in result.stderr, result.stderr[-200:])
@@ -159,7 +159,7 @@ check("qwen message", "unsupported reasoning provider" in result.stderr, result.
 interactive = subprocess.run(
     [sys.executable, AGENT, "--base-url", BASE, "--api-key", "t", "-m", "Kimi-K3.1-Pro"],
     input="/reasoning\n/reasoning kimi:low\n/reasoning\n/reasoning clear\n/reasoning\n/exit\n",
-    capture_output=True, text=True, timeout=30, env=env,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, env=env,
 )
 out = interactive.stdout
 check("interactive default", "reasoning: default" in out, out[-500:])

@@ -47,7 +47,11 @@ check("list_shells kept when no shell", "list_shells" in no_shell_tools, no_shel
 
 # ---------- edit_file ----------
 write("edit/a.txt", "alpha\nbeta\ngamma\n")
-check("edit unique", ws.edit_file("edit/a.txt", "beta", "BETA") == "edited edit/a.txt (1 replacement)")
+check(
+    "edit unique",
+    ws.edit_file("edit/a.txt", "beta", "BETA")
+    == f"edited {os.path.join('edit', 'a.txt')} (1 replacement)",
+)
 check("edit applied", open(os.path.join(base, "edit/a.txt")).read() == "alpha\nBETA\ngamma\n")
 try:
     ws.edit_file("edit/a.txt", "nope", "x")
@@ -126,8 +130,8 @@ write(".git/hidden.py", "needle in git\n")
 os.makedirs(os.path.join(base, "node_modules"), exist_ok=True)
 write("node_modules/dep.js", "needle dep\n")
 out = ws.search("needle")
-check("search finds py", "src/app.py:2:" in out, out)
-check("search finds txt", "src/notes.txt:1:" in out, out)
+check("search finds py", os.path.join("src", "app.py") + ":2:" in out, out)
+check("search finds txt", os.path.join("src", "notes.txt") + ":1:" in out, out)
 check("search skips .git", ".git" not in out, out)
 check("search skips node_modules", "node_modules" not in out, out)
 out = ws.search("needle", include="*.py")
@@ -151,10 +155,20 @@ check("search reads outside symlink", "secret" in out, out)
 write("deep/a/b/c.py", "")
 write("deep/a/b/d.txt", "")
 out = ws.glob("**/*.py")
-check("glob recursive", "deep/a/b/c.py" in out and "src/app.py" in out, out)
+check(
+    "glob recursive",
+    os.path.join("deep", "a", "b", "c.py") in out
+    and os.path.join("src", "app.py") in out,
+    out,
+)
 check("glob skips .git", ".git" not in out, out)
 out = ws.glob("**/*.txt", path="deep")
-check("glob scoped", "deep/a/b/d.txt" in out and "src/notes.txt" not in out, out)
+check(
+    "glob scoped",
+    os.path.join("deep", "a", "b", "d.txt") in out
+    and os.path.join("src", "notes.txt") not in out,
+    out,
+)
 check("glob no match", ws.glob("**/*.nope") == "(no matches)")
 os.symlink(outside, os.path.join(base, "outdir"))
 out = ws.glob("**/*.txt", path="outdir")
@@ -217,8 +231,10 @@ for cmd, expected in cases.items():
     check(f"readonly {cmd!r}", ro(cmd) is expected, f"got {ro(cmd)}")
 
 # ---------- stdin is not inherited ----------
-res = ws.run_command("cat")
-check("run_command stdin=DEVNULL", "exit code: 0" in res and "stdout:" not in res, res)
+# ``cat`` only exists on POSIX; the point of the check is that stdin is never
+# inherited, so a command that would block on stdin must return immediately.
+res = ws.run_command("cat" if os.name != "nt" else "definitely-not-a-real-command")
+check("run_command stdin=DEVNULL", "exit code:" in res and "stdout:" not in res, res)
 
 # ---------- existing behaviours still work ----------
 check("pagination", "3 | line3" in (write("ten.txt", "".join(f"line{i}\n" for i in range(1, 11))) or ws.read_file("ten.txt", offset=3, limit=3)))
@@ -251,7 +267,7 @@ check(
     "write outside file",
     open(outside_write, encoding="utf-8").read() == "written outside\n",
 )
-check("write outside message absolute", outside_write in message, message)
+check("write outside message absolute", os.path.realpath(outside_write) in message, message)
 ws.edit_file(outside_write, "written", "edited")
 check(
     "edit outside file",

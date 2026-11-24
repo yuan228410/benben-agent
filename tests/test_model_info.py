@@ -67,7 +67,8 @@ payload = {
     },
 }
 agent.save_models_config(payload, models_path)
-check("models file private", oct(os.stat(models_path).st_mode & 0o777) == "0o600")
+if os.name != "nt":
+    check("models file private", oct(os.stat(models_path).st_mode & 0o777) == "0o600")
 loaded = agent.load_models_config(models_path)
 check("loaded fallback", loaded["fallback"].context_window == 128000, loaded["fallback"])
 check("loaded model count", len(loaded["models"]) == 2, loaded["models"])
@@ -227,6 +228,8 @@ def run_cli(home, workspace, user_input, extra=None):
         ],
         input=user_input,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         env=env,
         cwd=workspace,

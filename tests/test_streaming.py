@@ -555,6 +555,8 @@ base_args = [
 stream_run = subprocess.run(
     base_args + ["--stream", "hello"],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=40,
@@ -571,6 +573,8 @@ OpenAIHandler.requests.clear()
 plain_run = subprocess.run(
     base_args + ["--no-stream", "hello"],
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=40,
@@ -594,6 +598,8 @@ interactive_run = subprocess.run(
         "/exit\n"
     ),
     text=True,
+    encoding="utf-8",
+    errors="replace",
     capture_output=True,
     env=env,
     timeout=60,

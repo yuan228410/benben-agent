@@ -45,7 +45,7 @@ memory = agent.MemoryService(
 
 # ---------- storage and long-term memory ----------
 status = memory.status_text()
-check("status dir", memory_dir in status, status)
+check("status dir", os.path.realpath(memory_dir) in status, status)
 check("status empty", "long-term: 0 entries" in status, status)
 check("remember", "remembered in MEMORY.md" in memory.remember("用户偏好简洁中文回答。", "偏好"))
 check("remember dedup", "already remembered" in memory.remember("用户偏好简洁中文回答。", "偏好"))
@@ -54,8 +54,9 @@ try:
     check("remember secret rejected", False)
 except agent.ToolError as exc:
     check("remember secret rejected", "secret" in str(exc), str(exc))
-check("memory file private", oct(os.stat(memory.memory_path).st_mode & 0o777) == "0o600")
-check("memory dir private", oct(os.stat(memory_dir).st_mode & 0o777) == "0o700")
+if os.name != "nt":
+    check("memory file private", oct(os.stat(memory.memory_path).st_mode & 0o777) == "0o600")
+    check("memory dir private", oct(os.stat(memory_dir).st_mode & 0o777) == "0o700")
 check("remember tags", "[偏好]" in open(memory.memory_path, encoding="utf-8").read())
 
 # ---------- episodic memory ----------
@@ -64,7 +65,8 @@ check("save episode", "saved episode 2026-11-12" in memory.save_episode(
 ))
 episode_path = os.path.join(memory.episodes_dir, "2026-11-12.md")
 check("episode exists", os.path.isfile(episode_path))
-check("episode private", oct(os.stat(episode_path).st_mode & 0o777) == "0o600")
+if os.name != "nt":
+    check("episode private", oct(os.stat(episode_path).st_mode & 0o777) == "0o600")
 listed = memory.list_episodes()
 check("list episode", "2026-11-12" in listed and "1 entries" in listed, listed)
 read = memory.read_episode("2026-11-12")

@@ -264,6 +264,7 @@ import fnmatch
 import getpass
 import glob as glob_mod
 import hashlib
+import http.client
 import json
 import locale
 import os
@@ -273,6 +274,7 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import signal
 import socket
 import subprocess
@@ -300,6 +302,65 @@ try:
 except ImportError:
     readline = None  # type: ignore[assignment]
 
+
+def _force_utf8_stdio() -> None:
+    """Make stdout/stderr UTF-8 on Windows consoles and redirected pipes.
+
+    Windows still defaults to a legacy code page (GBK/CP936), which mangles
+    Chinese output and makes redirected logs unreadable as UTF-8. Reconfiguring
+    the streams keeps CLI output and captured logs consistent everywhere.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def _force_utf8_stdin() -> None:
+    """Decode piped stdin as UTF-8.
+
+    Only redirected input is reconfigured: an interactive console on Windows
+    already uses the console code page, and forcing UTF-8 there would break
+    typing non-ASCII characters.
+    """
+    stream = sys.stdin
+    if stream is None or stream.isatty():
+        return
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, OSError):
+        pass
+
+
+_force_utf8_stdio()
+
+
+def _expand_user(path: str) -> str:
+    """Expand ``~`` honouring HOME on every platform.
+
+    ``_expand_user`` only consults ``HOME`` on POSIX; on Windows it
+    reads ``USERPROFILE`` and ignores ``HOME`` entirely. Honouring an
+    explicit ``HOME`` keeps the agent relocatable and lets callers (and
+    the test-suite) point the home directory at a sandbox.
+    """
+    if not path.startswith("~"):
+        return os.path.expanduser(path)
+    home = os.environ.get("HOME")
+    if home and os.path.isabs(home):
+        rest = path[1:]
+        if os.sep in rest or (os.altsep and os.altsep in rest):
+            rest = rest.lstrip("/\\")
+            return os.path.join(home, rest.replace("/", os.sep))
+        return os.path.join(home, rest)
+    return os.path.expanduser(path)
+
 API_FORMATS = (
     "openai-chat-completions",
     "openai-responses",
@@ -320,7 +381,7 @@ MAX_IMAGES = 4
 MAX_SEARCH_FILE = 2_000_000
 MAX_GLOB_RESULTS = 500
 MAX_GLOB_SECONDS = 10.0
-SESSION_DIR = os.path.expanduser("~/.benben-agent")
+SESSION_DIR = _expand_user("~/.benben-agent")
 SESSIONS_DIR = os.path.join(SESSION_DIR, "sessions")
 TRASH_DIR = os.path.join(SESSIONS_DIR, "trash")
 JOB_LOG_DIR = os.path.join(SESSION_DIR, "jobs")
@@ -442,9 +503,9 @@ def default_config_path() -> str:
 
 
 HOME_SKILLS_DIR = os.path.join(SESSION_DIR, "skills")
-CROSS_SKILLS_DIR = os.path.expanduser("~/.agents/skills")
-CLAUDE_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
-CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+CROSS_SKILLS_DIR = _expand_user("~/.agents/skills")
+CLAUDE_SKILLS_DIR = _expand_user("~/.claude/skills")
+CODEX_HOME = os.environ.get("CODEX_HOME") or _expand_user("~/.codex")
 CODEX_SKILLS_DIR = os.path.join(CODEX_HOME, "skills")
 CODEX_ADMIN_SKILLS_DIR = "/etc/codex/skills"
 SKILL_FRONTMATTER_BYTES = 8192
@@ -586,13 +647,28 @@ class ShellInfo:
                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
                 "$OutputEncoding=[Text.Encoding]::UTF8;"
             )
+            # PowerShell treats a -Command argument that starts with a quote as
+            # a string literal: it strips the outer quotes and re-parses the
+            # result, so `"C:\tool.exe" "arg"` loses the call operator and
+            # fails with a ParserError. Prefixing the call operator keeps the
+            # command executable.
+            body = command.strip()
+            if body.startswith(('"', "'")):
+                body = "& " + body
+            # The call operator must lead the whole script, so it has to be
+            # applied after the encoding prefix is prepended as well.
+            script = prefix + body
+            if not script.lstrip().startswith("& "):
+                stripped = body.lstrip()
+                if stripped.startswith(('"', "'")):
+                    script = prefix + "& " + stripped
             return [
                 self.path,
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                prefix + command,
+                script,
             ]
         if self.kind == "cmd":
             return [self.path, "/d", "/s", "/c", "chcp 65001>nul & " + command]
@@ -815,7 +891,7 @@ def select_shell(
 
     looks_like_path = os.path.isabs(preference) or "/" in preference or "\\" in preference
     if looks_like_path:
-        path = os.path.abspath(os.path.expanduser(preference))
+        path = os.path.abspath(_expand_user(preference))
         if not _is_executable_file(path):
             raise ShellError(f"shell not found or not executable: {preference}")
         name, kind = _infer_shell(path, platform_name)
@@ -1281,21 +1357,112 @@ def reasoning_model_warning(config: ReasoningConfig | None, model: str) -> str |
 _SSE_DONE = object()
 
 
-def _abort_response(response: Any) -> None:
-    """Shut down the socket so a blocked read in another thread returns."""
-    shutdown = False
-    try:
-        fp = getattr(response, "fp", None)
-        raw = getattr(fp, "raw", None)
-        sock = getattr(raw, "_sock", None)
-        if sock is not None:
-            sock.shutdown(socket.SHUT_RDWR)
-            shutdown = True
-    except Exception:
-        pass
-    if not shutdown:
+class _ConnectionRecorder:
+    """Keeps track of the live HTTP connections so they can be aborted."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._connections: list[Any] = []
+
+    def add(self, connection: Any) -> None:
+        with self._lock:
+            self._connections.append(connection)
+
+    def discard(self, connection: Any) -> None:
+        with self._lock:
+            try:
+                self._connections.remove(connection)
+            except ValueError:
+                pass
+
+    def abort(self) -> None:
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for connection in connections:
+            try:
+                sock = getattr(connection, "sock", None)
+                if sock is not None:
+                    sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
+class _RecordingHTTPHandler(urllib.request.HTTPHandler):
+    """HTTP handler that registers connections with a recorder."""
+
+    recorder: _ConnectionRecorder | None = None
+
+    def http_open(self, req: Any) -> Any:
+        connection = self.do_open(http.client.HTTPConnection, req)
+        if self.recorder is not None:
+            self.recorder.add(connection)
+        return connection
+
+
+class _RecordingHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS handler that registers connections with a recorder."""
+
+    recorder: _ConnectionRecorder | None = None
+
+    def https_open(self, req: Any) -> Any:
+        connection = self.do_open(http.client.HTTPSConnection, req)
+        if self.recorder is not None:
+            self.recorder.add(connection)
+        return connection
+
+
+def _response_socket(response: Any) -> Any:
+    """Find the live socket behind an ``http.client`` response.
+
+    The socket is reached through several layers of ``http.client`` internals
+    that differ between Python versions and platforms, so every known handle
+    is tried before giving up.
+    """
+    for getter in (
+        lambda: getattr(getattr(response, "fp", None), "raw", None),
+        lambda: getattr(response, "raw", None),
+        lambda: response,
+    ):
         try:
-            response.close()
+            candidate = getter()
+        except Exception:
+            candidate = None
+        if candidate is None:
+            continue
+        for attribute in ("_sock", "sock"):
+            try:
+                found = getattr(candidate, attribute, None)
+            except Exception:
+                found = None
+            if found is not None:
+                return found
+    return None
+
+
+def _abort_response(response: Any) -> None:
+    """Shut down the socket so a blocked read in another thread returns.
+
+    Shutting the socket down is what actually unblocks a reader; ``close()``
+    alone can leave the read hanging until the request timeout.
+
+    ``response.close()`` is deliberately not called here: ``http.client``
+    waits for the underlying socket to drain, which blocks for as long as the
+    peer keeps the connection open. The socket shutdown is enough to release
+    the reader, and the caller closes the response afterwards.
+    """
+    sock = _response_socket(response)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
         except Exception:
             pass
 
@@ -1408,9 +1575,7 @@ class BaseChatClient:
                 raise ChatCancelled()
             retry_after = None
             try:
-                response = urllib.request.urlopen(
-                    request, timeout=timeout or self.timeout
-                )
+                response = self._open_with_cancel(request, timeout, cancel_event)
                 raw = self._read_response(response, cancel_event).decode(
                     "utf-8", "replace"
                 )
@@ -1437,6 +1602,52 @@ class BaseChatClient:
             print(f"[retry] {error}; retrying in {delay:.1f}s", file=sys.stderr)
             time.sleep(delay)
 
+    def _open_with_cancel(
+        self,
+        request: Any,
+        timeout: float | None,
+        cancel_event: "threading.Event | None",
+    ) -> Any:
+        """Open a connection that stays responsive to a cancel request.
+
+        ``urlopen`` blocks until the response headers arrive and keeps the
+        socket hidden while it waits, so a cancel request would otherwise be
+        ignored until the server answers or the timeout expires. Running the
+        request on a worker thread lets the caller notice the cancel; the
+        worker keeps every urllib behaviour (redirects, proxies, error
+        mapping) intact.
+        """
+        limit = timeout or self.timeout
+        if cancel_event is None:
+            return urllib.request.urlopen(request, timeout=limit)
+
+        recorder = _ConnectionRecorder()
+        http_handler = _RecordingHTTPHandler()
+        http_handler.recorder = recorder
+        https_handler = _RecordingHTTPSHandler()
+        https_handler.recorder = recorder
+        opener = urllib.request.build_opener(http_handler, https_handler)
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                box["response"] = opener.open(request, timeout=limit)
+            except BaseException as exc:  # noqa: BLE001  forwarded to the caller
+                box["error"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while not done.wait(0.1):
+            if cancel_event.is_set():
+                recorder.abort()
+                done.wait(0.5)
+                raise ChatCancelled()
+        if "error" in box:
+            raise box["error"]
+        return box["response"]
     def _read_response(
         self,
         response: Any,
@@ -1455,7 +1666,7 @@ class BaseChatClient:
             watcher = threading.Thread(target=watch, daemon=True)
             watcher.start()
         try:
-            return response.read()
+            return self._read_body(response, cancel_event)
         except (TimeoutError, OSError, ValueError, HTTPException) as exc:
             if cancel_event is not None and cancel_event.is_set():
                 raise ChatCancelled() from exc
@@ -1464,10 +1675,52 @@ class BaseChatClient:
             stop.set()
             if watcher is not None:
                 watcher.join(timeout=0.5)
+            if cancel_event is None or not cancel_event.is_set():
+                # A cancelled response was already torn down by _abort_response;
+                # closing it again would block on the still-open socket.
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    def _read_body(
+        self,
+        response: Any,
+        cancel_event: "threading.Event | None" = None,
+    ) -> bytes:
+        """Read the whole body, staying responsive to a cancel request.
+
+        Closing the socket does not reliably wake a reader that is already
+        blocked inside ``recv`` on Windows, so the read runs on a worker
+        thread while this thread watches the cancel flag. The socket is shut
+        down on cancel to unblock the worker.
+        """
+        if cancel_event is None:
+            return response.read()
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def worker() -> None:
             try:
-                response.close()
-            except Exception:
-                pass
+                box["body"] = response.read()
+            except BaseException as exc:  # noqa: BLE001  forwarded to the caller
+                box["error"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while not done.wait(0.1):
+            if cancel_event.is_set():
+                _abort_response(response)
+                done.wait(0.5)
+                raise ChatCancelled()
+        if "error" in box:
+            error = box["error"]
+            if isinstance(error, (TimeoutError, OSError, ValueError, HTTPException)):
+                raise error
+            raise error
+        return box.get("body") or b""
 
     def _models_root(self) -> str:
         return self.base_url
@@ -5209,7 +5462,7 @@ def _image_mime(data: bytes) -> str | None:
 
 def check_image(path: str) -> str:
     """Validate an image without keeping its bytes; return the file name."""
-    full = os.path.abspath(os.path.expanduser(path))
+    full = os.path.abspath(_expand_user(path))
     name = os.path.basename(full)
     if not os.path.isfile(full):
         raise ImageError(f"not a file: {path}")
@@ -5228,7 +5481,7 @@ def check_image(path: str) -> str:
 def load_image(path: str) -> tuple[str, str]:
     """Return (data URL, file name) for a local image, using only the stdlib."""
     name = check_image(path)
-    full = os.path.abspath(os.path.expanduser(path))
+    full = os.path.abspath(_expand_user(path))
     try:
         with open(full, "rb") as handle:
             data = handle.read()
@@ -7378,6 +7631,31 @@ def scan_skill_directory(directory: str) -> dict[str, Any]:
     }
 
 
+def _force_rmtree(path: str) -> None:
+    """Remove a directory tree, clearing read-only flags first.
+
+    Git marks its object files read-only, and Windows refuses to delete
+    read-only files, so ``shutil.rmtree`` silently leaves the tree behind.
+    """
+    if not os.path.exists(path):
+        return
+    if os.name == "nt":
+        for root, dirs, files in os.walk(path):
+            for name in files:
+                target = os.path.join(root, name)
+                try:
+                    os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+                except OSError:
+                    pass
+            for name in dirs:
+                target = os.path.join(root, name)
+                try:
+                    os.chmod(target, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+                except OSError:
+                    pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 class SkillManager:
     """CRUD, installation and approval queue for workspace and user skills."""
 
@@ -7870,12 +8148,8 @@ class SkillManager:
             staging = os.path.join(parent, "skill")
             shutil.move(found, staging)
             shutil.rmtree(work, ignore_errors=True)
-            shutil.rmtree(
-                os.path.join(staging, ".git"), ignore_errors=True
-            )
-            shutil.rmtree(
-                os.path.join(staging, "__pycache__"), ignore_errors=True
-            )
+            _force_rmtree(os.path.join(staging, ".git"))
+            _force_rmtree(os.path.join(staging, "__pycache__"))
             skill_name, _meta = self._validate_staged(staging, requested)
             risk = scan_skill_directory(staging)
             try:
@@ -8009,7 +8283,7 @@ class SkillManager:
             else:
                 self._git_clone(source, work)
             return
-        path = os.path.expanduser(source)
+        path = _expand_user(source)
         if not os.path.exists(path):
             raise ToolError(f"source not found: {source}")
         if os.path.isdir(path):
@@ -12184,7 +12458,7 @@ class Workspace:
     def _resolve(self, path: str) -> str:
         if not path:
             raise ToolError("path must not be empty")
-        value = os.path.expanduser(str(path))
+        value = _expand_user(str(path))
         if os.path.isabs(value):
             return os.path.realpath(value)
         return os.path.realpath(os.path.join(self.root, value))
@@ -12500,7 +12774,7 @@ class Workspace:
         full = self._resolve(path)
         if not os.path.isdir(full):
             raise ToolError(f"not a directory: {path}")
-        pattern = os.path.expanduser(str(pattern))
+        pattern = _expand_user(str(pattern))
         if not pattern.strip():
             raise ToolError("pattern must not be empty")
         normalized = pattern.replace(os.sep, "/")
@@ -13478,7 +13752,7 @@ class Workspace:
 
 
 def normalize_workspace(path: str, base: str | None = None) -> str:
-    value = os.path.expanduser(str(path or "").strip())
+    value = _expand_user(str(path or "").strip())
     if not value:
         raise WorkspaceError("workspace path must not be empty")
     if not os.path.isabs(value):
@@ -13547,7 +13821,7 @@ def recent_workspaces(workspace: "Workspace", limit: int = 8) -> list[str]:
         if not raw or raw == "?":
             continue
         try:
-            root = os.path.realpath(os.path.expanduser(str(raw)))
+            root = os.path.realpath(_expand_user(str(raw)))
         except OSError:
             continue
         if root not in seen and os.path.isdir(root):
@@ -15162,7 +15436,7 @@ def run_config_command(
         source = rest or (config_path + ".bak")
         if not os.path.isabs(source):
             source = os.path.join(os.path.dirname(os.path.abspath(config_path)), source)
-        source = os.path.realpath(os.path.expanduser(source))
+        source = os.path.realpath(_expand_user(source))
         if not os.path.isfile(source):
             print(f"error: backup not found: {source}", file=sys.stderr)
             return
@@ -15340,6 +15614,20 @@ def _mcp_parse_pairs(text: str) -> dict[str, str]:
     return result
 
 
+def _split_command_args(text: str) -> list[str]:
+    """Split a command-argument string, keeping Windows paths intact.
+
+    ``shlex.split`` defaults to POSIX rules, where a backslash escapes the
+    next character; on Windows that turns ``C:\\dir\\file.py`` into
+    ``C:dirfile.py``. Non-POSIX mode keeps the backslashes and still honours
+    quotes for grouping.
+    """
+    value = str(text or "")
+    if os.name == "nt":
+        return shlex.split(value, posix=False)
+    return shlex.split(value)
+
+
 def _mcp_wizard(
     manager: "McpManager",
     name: str,
@@ -15381,7 +15669,7 @@ def _mcp_wizard(
         if args_text is None:
             return None
         try:
-            config["args"] = shlex.split(args_text)
+            config["args"] = _split_command_args(args_text)
         except ValueError as exc:
             print(f"error: {exc}")
             return None
@@ -17231,7 +17519,13 @@ def read_user_line(prompt: str) -> str:
     raw = buffer.readline()
     if not raw:
         raise EOFError
+    # Piped input is conventionally UTF-8; Windows would otherwise decode it
+    # with the legacy code page (GBK/CP936) and mangle non-ASCII text.
     encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+    if not sys.stdin.isatty() and encoding.lower().replace("_", "-") in (
+        "gbk", "gb2312", "gb18030", "cp936", "cp1252", "latin-1",
+    ):
+        encoding = "utf-8"
     return raw.decode(encoding, "replace").rstrip("\r\n")
 
 
@@ -24067,7 +24361,7 @@ def run_web(
                 normalized = _normalize_defaults(merged, errors)
                 cwd = normalized.get("cwd")
                 if cwd:
-                    expanded = os.path.expanduser(str(cwd))
+                    expanded = _expand_user(str(cwd))
                     if not os.path.isdir(expanded):
                         errors.append(
                             "cwd must be an existing directory"
@@ -27673,7 +27967,7 @@ def main(argv: list[str] | None = None) -> int:
                     print("pending images cleared")
                     continue
                 if not argument:
-                    names = ", ".join(os.path.basename(os.path.expanduser(path)) for path in pending_images)
+                    names = ", ".join(os.path.basename(_expand_user(path)) for path in pending_images)
                     print(f"pending images: {names or '(none)'}")
                     print(f"usage: /image <path> [path ...] | /image clear (max {MAX_IMAGES})")
                     continue
