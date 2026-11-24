@@ -178,6 +178,10 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
                                   配置上下文阈值自动压缩
     /compact idle [on|off|minutes|level|min|messages|presets]
                                   配置空闲后下一次对话前自动压缩
+    /compress                     查看工具输出压缩状态
+    /compress on|off              开关工具输出压缩
+    /compress limit <chars>       设置工具输出字符上限（limit default 恢复默认）
+    /compress test <text>         预览一段文本的压缩效果
     /skill                        列出技能
     /skill <name>                 查看技能说明和用法
     /skill <name> <问题>          强制加载指定技能来回答
@@ -3043,6 +3047,10 @@ def default_settings() -> dict[str, Any]:
             "min_context_percent": 20,
             "min_messages": 6,
         },
+        "compress": {
+            "enabled": True,
+            "limit": None,
+        },
         "command_timeout": 60,
         "max_command_timeout": 600,
         "background_after_seconds": 30,
@@ -3466,6 +3474,31 @@ def _normalize_defaults(
                 warn("idle_compact.min_messages must be an integer between 1 and 10000")
     elif idle is not None:
         warn("idle_compact must be an object")
+
+    compress = raw.get("compress")
+    if isinstance(compress, dict):
+        if "enabled" in compress:
+            if isinstance(compress["enabled"], bool):
+                defaults["compress"]["enabled"] = compress["enabled"]
+            elif compress["enabled"] is not None:
+                warn("compress.enabled must be true or false")
+        if "limit" in compress:
+            value = compress["limit"]
+            if value is None:
+                defaults["compress"]["limit"] = None
+            elif (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and COMPRESS_MIN_LIMIT <= value <= COMPRESS_MAX_LIMIT
+            ):
+                defaults["compress"]["limit"] = value
+            else:
+                warn(
+                    f"compress.limit must be null or an integer between "
+                    f"{COMPRESS_MIN_LIMIT} and {COMPRESS_MAX_LIMIT}"
+                )
+    elif compress is not None:
+        warn("compress must be an object")
 
     for key, minimum, maximum, label in (
         ("command_timeout", 1, 86400, "seconds"),
@@ -4403,6 +4436,13 @@ def resolve_settings(args: Any, config: dict[str, Any]) -> None:
     args.idle_compact_min_messages = int(
         pick("idle_compact_min_messages", idle.get("min_messages", 6))
     )
+    compress = defaults.get("compress")
+    if not isinstance(compress, dict):
+        compress = {}
+    args.compress_enabled = bool(
+        pick("compress_enabled", compress.get("enabled", True))
+    )
+    args.compress_limit = pick("compress_limit", compress.get("limit"))
     args.command_timeout = int(pick("command_timeout", 60))
     args.max_command_timeout = int(pick("max_command_timeout", 600))
     args.background_after_seconds = int(
@@ -6910,6 +6950,73 @@ def print_idle_compact_status(args: Any) -> None:
         f"min context: {idle['min_context_percent']}% | "
         f"min messages: {idle['min_messages']}"
     )
+
+
+def print_compress_status() -> None:
+    state = "on" if compression_enabled() else "off"
+    configured = COMPRESS_SETTINGS.get("limit")
+    budget = compression_limit()
+    source = "config" if isinstance(configured, int) else "default"
+    print(f"tool output compression: {state}")
+    print(f"character budget: {budget} ({source})")
+    if not compression_enabled():
+        print("output is cut at the budget; the tail is dropped")
+    else:
+        print(
+            "errors, warnings and declarations are kept first, then context "
+            "from both ends"
+        )
+
+
+def run_compress_command(args: Any, parts: list[str]) -> None:
+    """/compress — inspect and change how tool output is shortened."""
+    if len(parts) <= 1:
+        print_compress_status()
+        print(
+            "usage: /compress [on|off|limit <chars>|limit default|test <text>]"
+        )
+        return
+    action = parts[1].lower()
+    value = parts[2] if len(parts) > 2 else ""
+    if action in ("on", "off"):
+        configure_compression(action == "on")
+        args.compress_enabled = action == "on"
+        print(f"tool output compression: {action}")
+        return
+    if action == "status":
+        print_compress_status()
+        return
+    if action == "limit":
+        if not value or value == "default":
+            configure_compression(None, None)
+            args.compress_limit = None
+            print(f"character budget reset to the default ({MAX_TOOL_OUTPUT})")
+            return
+        try:
+            number = int(value)
+        except ValueError:
+            print(f"usage: /compress limit <chars>   (>= {COMPRESS_MIN_LIMIT})")
+            return
+        if not COMPRESS_MIN_LIMIT <= number <= COMPRESS_MAX_LIMIT:
+            print(
+                f"error: limit must be between {COMPRESS_MIN_LIMIT} and "
+                f"{COMPRESS_MAX_LIMIT}"
+            )
+            return
+        configure_compression(None, number)
+        args.compress_limit = number
+        print(f"character budget set to {number}")
+        return
+    if action == "test":
+        sample = " ".join(parts[2:])
+        if not sample:
+            print("usage: /compress test <text>")
+            return
+        print(compression_report(sample, compression_limit()))
+        print("---")
+        print(compress_tool_output(sample, compression_limit()))
+        return
+    print("usage: /compress [on|off|limit <chars>|limit default|test <text>]")
 
 
 def run_compact_settings_command(args: Any, kind: str, parts: list[str]) -> None:
@@ -17223,11 +17330,311 @@ def _one_line(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def _clip_tool_text(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
+def _clip_tool_text(text: str, limit: int | None = None) -> str:
+    """Trim tool text to the output budget without losing what matters.
+
+    A plain head cut throws away the tail of a log, where the actual failure
+    usually is. The compressor below looks at the content first, then keeps
+    the lines that carry signal (errors, warnings, declarations) before
+    spending what is left on context from both ends.
+
+    ``limit`` overrides the configured budget for a single call; ``None``
+    means "use whatever the config says".
+    """
+    budget = compression_limit() if limit is None else limit
+    if not compression_enabled():
+        return _hard_clip(text, budget)
+    return compress_tool_output(text, budget)
+
+
+# --------------------------------------------------------------------------- #
+# Tool output compression
+# --------------------------------------------------------------------------- #
+
+# Lines that must survive compression even when the budget is tight. The
+# pattern is deliberately broad: a dropped traceback is far more costly than
+# a kept line of noise.
+ERROR_RE = re.compile(
+    r"(?i)\b(?:error|errors|fatal|panic|exception|traceback|failed|failure|"
+    r"critical|denied|refused|unable|timeout|timed out|abort(?:ed)?|"
+    r"segfault|core dumped|cannot|can't|not found|no such file)\b"
+)
+WARN_RE = re.compile(r"(?i)\b(?:warn|warning|deprecated|skipping|ignored)\b")
+
+# A line that looks like it came from a logger.
+LOG_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"\[(?:\d{4}-\d{2}-\d{2}|\w{3,9})[^\]]*\]"
+    r"|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}"
+    r"|\d{2}:\d{2}:\d{2}"
+    r"|(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\b"
+    r"|\[\d+\]"
+    r")"
+)
+
+# A line that carries the shape of a source file.
+CODE_LINE_RE = re.compile(
+    r"^\s*(?:@|def |class |import |from \w+ import |async def |"
+    r"function |func |fn |pub fn |package |interface |type \w+ (?:struct|interface)|"
+    r"public |private |protected |static |return |#include|using |namespace )"
+)
+
+COMPRESS_MIN_LIMIT = 600
+COMPRESS_MAX_LIMIT = 1_000_000
+COMPRESS_ELLIPSIS = "…"
+# Share of the budget, in percent, reserved for each tier.
+COMPRESS_SIGNAL_SHARE = 55
+COMPRESS_HEAD_SHARE = 80
+COMPRESS_TAIL_SHARE = 95
+
+# Runtime switch, filled from the config file and the command line. Tool
+# output goes through it on every call, so it is read as a module-level dict
+# rather than being threaded through every tool implementation.
+COMPRESS_SETTINGS: dict[str, Any] = {"enabled": True, "limit": None}
+
+# Sentinel for configure_compression: "leave this setting alone".
+_UNSET = object()
+
+
+def compression_enabled() -> bool:
+    return COMPRESS_SETTINGS.get("enabled") is not False
+
+
+def compression_limit() -> int:
+    """The configured character budget, or the built-in default."""
+    value = COMPRESS_SETTINGS.get("limit")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return MAX_TOOL_OUTPUT
+
+
+def configure_compression(enabled: Any = _UNSET, limit: Any = _UNSET) -> None:
+    """Update the runtime compression switch.
+
+    Each argument is independent: ``_UNSET`` leaves the current value alone,
+    which is what ``/compress on`` needs (it must not reset the budget).
+    """
+    if enabled is not _UNSET and isinstance(enabled, bool):
+        COMPRESS_SETTINGS["enabled"] = enabled
+    if limit is not _UNSET and (
+        limit is None or (isinstance(limit, int) and not isinstance(limit, bool))
+    ):
+        COMPRESS_SETTINGS["limit"] = limit
+
+
+def _hard_clip(text: str, limit: int) -> str:
+    """The pre-compression behaviour: cut the head, drop the tail."""
     value = str(text or "")
     if len(value) <= limit:
         return value
     return value[:limit] + f"\n... (truncated at {limit} characters)"
+
+
+def output_kind(text: str) -> str:
+    """Guess what a block of tool output is: json, log, code or text."""
+    body = text.strip()
+    if not body:
+        return "text"
+    if body[:1] in "{[" and len(body) > 60:
+        try:
+            json.loads(body)
+            return "json"
+        except ValueError:
+            pass
+    sample = [line for line in body.splitlines()[:200] if line.strip()]
+    if not sample:
+        return "text"
+    log_hits = sum(1 for line in sample if LOG_LINE_RE.match(line))
+    if log_hits >= max(2, len(sample) * 4 // 10):
+        return "log"
+    code_hits = sum(1 for line in sample if CODE_LINE_RE.match(line))
+    if code_hits >= max(2, len(sample) * 15 // 100):
+        return "code"
+    return "text"
+
+
+def _line_rank(line: str) -> int:
+    """Higher is more important; drives how the budget is spent."""
+    if ERROR_RE.search(line):
+        return 3
+    if WARN_RE.search(line):
+        return 2
+    if CODE_LINE_RE.match(line):
+        return 1
+    return 0
+
+
+def _collapse_repeats(lines: list[str]) -> list[str]:
+    """Fold runs of identical lines into one labelled line."""
+    folded: list[str] = []
+    index = 0
+    while index < len(lines):
+        end = index
+        while end + 1 < len(lines) and lines[end + 1] == lines[index]:
+            end += 1
+        count = end - index + 1
+        if count >= 3:
+            folded.append(f"{lines[index]}    … (重复 {count} 次)")
+        else:
+            folded.extend([lines[index]] * count)
+        index = end + 1
+    return folded
+
+
+def _condense_lines(
+    lines: list[str],
+    limit: int,
+    dropped: int = 0,
+) -> str:
+    """Keep the important lines and elide the rest, staying under ``limit``."""
+    total = sum(len(line) + 1 for line in lines)
+    if total <= limit:
+        return "\n".join(lines)
+
+    lines = list(lines)  # own the list; oversized lines are truncated below
+    chosen: set[int] = set()
+    used = 0
+
+    def take(index: int, ceiling: int) -> bool:
+        nonlocal used
+        if index in chosen:
+            return True
+        line = lines[index]
+        cost = len(line) + 1
+        if used + cost <= ceiling:
+            chosen.add(index)
+            used += cost
+            return True
+        # A single oversized line still deserves a share of the budget.
+        # Dropping it outright would lose the only content there is.
+        room = ceiling - used - 40
+        if room < 60:
+            return False
+        lines[index] = line[:room] + "… (行内截断)"
+        chosen.add(index)
+        used += len(lines[index]) + 1
+        return True
+
+    # Tier 1: errors, warnings and declarations. These are the lines a reader
+    # came for, so they get first claim on the budget.
+    signal_ceiling = limit * COMPRESS_SIGNAL_SHARE // 100
+    for index, line in enumerate(lines):
+        if _line_rank(line):
+            take(index, signal_ceiling)
+
+    # Tier 2: leading context, which usually holds the cause.
+    head_ceiling = limit * COMPRESS_HEAD_SHARE // 100
+    for index in range(min(len(lines), 300)):
+        if not take(index, head_ceiling):
+            break
+
+    # Tier 3: trailing context, which usually holds the result or the crash.
+    tail_ceiling = limit * COMPRESS_TAIL_SHARE // 100
+    for index in range(len(lines) - 1, max(-1, len(lines) - 300), -1):
+        if not take(index, tail_ceiling):
+            break
+
+    parts: list[str] = []
+    previous: int | None = None
+    for index in range(len(lines)):
+        if index not in chosen:
+            continue
+        if previous is not None and index != previous + 1:
+            parts.append(f"… ({index - previous - 1} 行省略) …")
+        parts.append(lines[index])
+        previous = index
+    if previous is not None and previous != len(lines) - 1:
+        parts.append(f"… ({len(lines) - previous - 1} 行省略) …")
+
+    result = "\n".join(parts)
+    if len(result) > limit:
+        result = result[: max(0, limit - 60)] + f"\n… (压缩自 {total} 字符) …"
+    if dropped:
+        result += f"\n… (折叠 {dropped} 行重复内容) …"
+    return result
+
+
+def _compress_json_value(value: Any, depth: int = 0) -> Any:
+    """Shrink a parsed JSON document while keeping its shape readable."""
+    if depth > 6:
+        return "…"
+    if isinstance(value, str):
+        if len(value) <= 200:
+            return value
+        return value[:150] + f"… ({len(value)} 字符)"
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        if not value:
+            return []
+        if len(value) <= 6:
+            return [_compress_json_value(item, depth + 1) for item in value]
+        head = [_compress_json_value(item, depth + 1) for item in value[:3]]
+        tail = [_compress_json_value(item, depth + 1) for item in value[-2:]]
+        return head + [f"… ({len(value) - 5} 项省略)"] + tail
+    if isinstance(value, dict):
+        items = list(value.items())
+        if len(items) > 16:
+            kept = items[:12]
+            compressed = {key: _compress_json_value(item, depth + 1) for key, item in kept}
+            compressed[f"… ({len(items) - 12} 个键省略)"] = None
+            return compressed
+        return {
+            key: _compress_json_value(item, depth + 1) for key, item in items
+        }
+    return str(value)
+
+
+def _compress_json(text: str, limit: int) -> str:
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return _condense_lines(text.splitlines(), limit)
+    try:
+        shrunk = json.dumps(
+            _compress_json_value(parsed), ensure_ascii=False, indent=2
+        )
+    except (TypeError, ValueError):
+        return _condense_lines(text.splitlines(), limit)
+    if len(shrunk) <= limit:
+        return shrunk
+    # The structure is still too large: fall back to line selection so that
+    # at least the beginning and end of the document survive.
+    return _condense_lines(text.splitlines(), limit)
+
+
+def compress_tool_output(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
+    """Compress tool output to ``limit`` characters, content-aware."""
+    value = str(text or "")
+    if limit <= 0 or len(value) <= limit:
+        return value
+    if limit < COMPRESS_MIN_LIMIT:
+        # Below this there is no room for the markers to pay for themselves.
+        return value[:limit] + f"\n… (截断于 {limit} 字符)"
+
+    body = value.strip()
+    kind = output_kind(body)
+    if kind == "json":
+        return _compress_json(body, limit)
+
+    lines = body.splitlines()
+    folded = _collapse_repeats(lines)
+    collapsed = len(lines) - len(folded) if len(folded) < len(lines) else 0
+    return _condense_lines(folded, limit, dropped=collapsed)
+
+
+def compression_report(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
+    """Describe what ``compress_tool_output`` would do, for /compress."""
+    value = str(text or "")
+    kind = output_kind(value.strip())
+    if not value:
+        return "空内容"
+    after = compress_tool_output(value, limit)
+    ratio = 0.0 if not value else len(after) * 100 / len(value)
+    return (
+        f"类型={kind} 原始={len(value)} 字符 → 压缩后={len(after)} 字符 "
+        f"({ratio:.1f}%, 上限={limit})"
+    )
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -26142,6 +26549,27 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="override maximum retained user turns (1-100)",
     )
+    compress_group = parser.add_mutually_exclusive_group()
+    compress_group.add_argument(
+        "--compress",
+        dest="compress_enabled",
+        action="store_true",
+        default=None,
+        help="compress tool output, keeping errors and the tail (default)",
+    )
+    compress_group.add_argument(
+        "--no-compress",
+        dest="compress_enabled",
+        action="store_false",
+        help="disable tool output compression and cut at the limit",
+    )
+    parser.add_argument(
+        "--compress-limit",
+        type=int,
+        default=None,
+        metavar="CHARS",
+        help=f"character budget for tool output (>= {COMPRESS_MIN_LIMIT})",
+    )
     idle_compact_group = parser.add_mutually_exclusive_group()
     idle_compact_group.add_argument(
         "--idle-compact",
@@ -26530,6 +26958,19 @@ def main(argv: list[str] | None = None) -> int:
         ensure_models_file()
     model_registry = ModelRegistry(use_file=not args.no_config)
     resolve_settings(args, startup_config)
+    if args.compress_limit is not None and not (
+        COMPRESS_MIN_LIMIT <= args.compress_limit <= COMPRESS_MAX_LIMIT
+    ):
+        print(
+            f"error: --compress-limit must be between "
+            f"{COMPRESS_MIN_LIMIT} and {COMPRESS_MAX_LIMIT}",
+            file=sys.stderr,
+        )
+        return 2
+    configure_compression(
+        getattr(args, "compress_enabled", True),
+        getattr(args, "compress_limit", None),
+    )
     if raw_memory is False:
         args.memory_daily = False
         args.memory_daily_time = None
@@ -27852,6 +28293,9 @@ def main(argv: list[str] | None = None) -> int:
                 session = None
                 restore_session_plan(None)
                 print("history cleared; the next message starts a new session")
+                continue
+            if user_input == "/compress" or user_input.startswith("/compress "):
+                run_compress_command(args, user_input.split())
                 continue
             if user_input == "/compact" or user_input.startswith("/compact "):
                 parts = user_input.split()

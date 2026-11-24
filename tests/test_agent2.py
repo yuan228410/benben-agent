@@ -362,7 +362,11 @@ check("history tool args", "a.txt" in history_with_tools[1]["arguments"], histor
 check("history tool result", history_with_tools[2]["text"] == "file body", history_with_tools)
 check("history tools off", len(agent.history_view(history_messages)) == 1)
 clipped = agent._clip_tool_text("x" * 30000)
-check("clip tool text", len(clipped) < 30000 and "truncated" in clipped)
+check(
+    "clip tool text",
+    bool(clipped) and len(clipped) <= agent.MAX_TOOL_OUTPUT and "截断" in clipped,
+    f"len={len(clipped)}",
+)
 
 
 class CancelClient:
