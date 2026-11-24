@@ -142,6 +142,13 @@ agent.load_session(session.uuid, loaded3)
 check("second marker wins", len(loaded3) == 4, loaded3)
 check("second summary only", loaded3[1].get("_compact") is True and loaded3[2]["content"] == "压缩后问题", loaded3)
 
+# a repeated compaction carries the old summary in as "已有摘要" instead of
+# letting it reach the prompt through _summary_text as a fake user turn
+prompt2 = Handler.requests[-1]["messages"][0]["content"]
+check("second carries summary", "已有摘要：" in prompt2, prompt2[-300:])
+check("second summary not a user turn", "用户：[历史对话摘要]" not in prompt2, prompt2[-300:])
+check("second carries summary body", "测试摘要" in prompt2, prompt2[-300:])
+
 # resume -> append -> compact again using the resumed session object
 resumed = [{"role": "system", "content": "SYS"}]
 resumed_session = agent.load_session(session.uuid, resumed)
@@ -155,6 +162,9 @@ agent.load_session(session.uuid, again)
 check("resume compact load", len(again) == 4 and again[1].get("_compact"), again)
 check("resume compact tail", again[2]["content"] == "恢复后问题", again)
 check("resume compact no old", all(m.get("content") != "压缩后问题" for m in again), again)
+prompt_resume = Handler.requests[-1]["messages"][0]["content"]
+check("resume carries summary", "已有摘要：" in prompt_resume, prompt_resume[-300:])
+check("resume summary not a user turn", "用户：[历史对话摘要]" not in prompt_resume, prompt_resume[-300:])
 
 # keep=0: summary only
 session0 = agent.create_session("m", ws.root)

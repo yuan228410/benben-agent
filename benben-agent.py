@@ -146,9 +146,9 @@ function calling、会话持久化、Agent Skills、图片输入和网页界面�
     /memory search <关键词>        搜索长期记忆和情景记忆
     /memory read <日期|today>     读取某天情景记忆
     /memory summarize [日期]      手动生成某天情景总结
-    /memory dedupe [--yes]        去重长期记忆
-    /memory prune [--keep N] [--older-than 30d] [--episodes] [--yes]
-                                  清理长期记忆和/或旧情景记忆
+    /memory dedupe [--yes]        去重长期记忆（只删完全重复的条目）
+    /memory compact [--keep N] [--yes]
+                                  合并较早的长期记忆，最近 N 条原样保留
     /jobs                         后台任务列表和跟随控制
     /jobs status|output <id>      查看任务状态和输出
     /jobs follow <id>             跟随后台任务输出
@@ -401,10 +401,23 @@ MEMORY_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
 MEMORY_EPISODES_DIR = os.path.join(MEMORY_DIR, "episodes")
 MEMORY_MAX_FILE = 1_000_000
 MEMORY_MAX_EPISODE_FILE = 512_000
-MEMORY_MAX_ENTRY = 8_000
+# Long-term memory is an index of settled facts, not a notebook: one entry
+# is one short sentence. Episode summaries keep the larger budget.
+MEMORY_MAX_ENTRY = 300
+MEMORY_ENTRY_HINT = 120
+MEMORY_MAX_EPISODE_ENTRY = 8_000
 MEMORY_MAX_RESULTS = 50
 MEMORY_PROMPT_CHARS = 48_000
 MEMORY_SUMMARY_CHARS = 2_000
+# Long-term memory is not appended forever: once the file grows past this
+# many characters the older entries get merged by the model, keeping the
+# newest ones verbatim. See MemoryService.compact_memory.
+MEMORY_COMPACT_CHARS = 32_000
+MEMORY_COMPACT_KEEP_RECENT = 50
+# Characters ignored when comparing two memory entries for equality.
+_MEMORY_KEY_DROP = str.maketrans(
+    "", "", " \t\r\n，。、；：！？,.;:!?\"'“”‘’（）()【】[]《》<>·—-"
+)
 MEMORY_AUTO_MARKER = "benben:auto-summary"
 SESSION_VERSION = 1
 MAX_SESSION_TITLE = 200
@@ -415,6 +428,7 @@ COMPACT_MESSAGE_CHARS = 4_000
 COMPACT_TOOL_CHARS = 800
 COMPACT_ARGS_CHARS = 400
 COMPACT_SUMMARY_CHARS = 1_200
+COMPACT_SUMMARY_MARK = "[历史对话摘要]"
 AUTO_COMPACT_PRESETS: dict[str, dict[str, int]] = {
     "minimal": {"threshold": 95, "target_ratio": 85, "keep": 16},
     "very-light": {"threshold": 90, "target_ratio": 75, "keep": 12},
@@ -5919,8 +5933,8 @@ def history_view(
             else:
                 summary = ""
             summary = summary.strip()
-            if summary.startswith("[历史对话摘要]"):
-                summary = summary[len("[历史对话摘要]"):].strip()
+            if summary.startswith(COMPACT_SUMMARY_MARK):
+                summary = summary[len(COMPACT_SUMMARY_MARK):].strip()
             keep = message.get("_compact_keep")
             label = "上下文已压缩"
             if isinstance(keep, int) and not isinstance(keep, bool):
@@ -6124,7 +6138,7 @@ def _summary_message(record: dict[str, Any]) -> dict[str, Any]:
     keep = record.get("keep")
     message: dict[str, Any] = {
         "role": "user",
-        "content": "[历史对话摘要]\n\n" + (text or "(摘要为空)"),
+        "content": COMPACT_SUMMARY_MARK + "\n\n" + (text or "(摘要为空)"),
         "_compact": True,
     }
     if isinstance(keep, int) and not isinstance(keep, bool):
@@ -6631,6 +6645,14 @@ def _summary_text(message: dict[str, Any]) -> str:
     return ""
 
 
+def _compact_summary_text(message: dict[str, Any]) -> str:
+    """Plain body of a compact marker, without the role label or the mark."""
+    body, _images = _content_text(message)
+    if body.startswith(COMPACT_SUMMARY_MARK):
+        body = body[len(COMPACT_SUMMARY_MARK):].strip()
+    return body
+
+
 def _estimate_text_tokens(text: str) -> int:
     wide = 0
     for char in text:
@@ -6677,6 +6699,8 @@ def _compaction_chunks(messages: list[dict[str, Any]]) -> list[str]:
     current: list[str] = []
     size = 0
     for message in messages:
+        if message.get("_compact"):
+            continue
         text = _summary_text(message)
         if not text:
             continue
@@ -6708,6 +6732,15 @@ def compact_history(
     tail = messages[split:]
     if not prefix:
         raise CompactError("nothing to compact (history is too short)")
+    before_messages = len(prefix)
+    # A previous compaction leaves its summary at the head of the prefix.
+    # Carry it in as the seed summary rather than letting it run through
+    # _summary_text, which would prefix it with "用户：" and make it read
+    # like something the user typed.
+    carried = ""
+    if prefix[0].get("_compact"):
+        carried = _compact_summary_text(prefix[0])
+        prefix = prefix[1:]
     chunks = _compaction_chunks(prefix)
     if not chunks:
         raise CompactError("nothing to compact (no text in history)")
@@ -6716,7 +6749,7 @@ def compact_history(
     before_total = len(messages) - 1
     usage: dict[str, int] = {}
     truncated = False
-    summary = ""
+    summary = carried
     reasoning_warned = False
     for index, chunk in enumerate(chunks, 1):
         if progress is not None:
@@ -6745,7 +6778,7 @@ def compact_history(
 
     summary_message = {
         "role": "user",
-        "content": "[历史对话摘要]\n\n" + summary,
+        "content": COMPACT_SUMMARY_MARK + "\n\n" + summary,
         "_compact": True,
         "_compact_keep": keep,
     }
@@ -6756,7 +6789,7 @@ def compact_history(
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "keep": keep,
         "tail_count": len(tail),
-        "before_messages": len(prefix),
+        "before_messages": before_messages,
         "summary": summary,
     }
     if session is not None:
@@ -6768,7 +6801,7 @@ def compact_history(
     return {
         "summary": summary,
         "keep": keep,
-        "before_messages": len(prefix),
+        "before_messages": before_messages,
         "before_total": before_total,
         "after_messages": len(new_messages) - 1,
         "kept_messages": len(tail),
@@ -8986,6 +9019,8 @@ def build_system_prompt(
             "长期记忆与情景记忆：\n"
             "- 用户明确要求记住，或出现长期有效的偏好、环境、项目事实时，用 remember "
             "写入长期记忆；不要保存临时任务细节、猜测、密钥或隐私数据。\n"
+            "- 长期记忆是索引，不是笔记：一条一个事实，一句话说完，控制在 "
+            f"{MEMORY_ENTRY_HINT} 字以内；不写段落、不写前因后果、不把多件事塞进一条。\n"
             "- 完成有意义的任务或当天收尾时，用 save_episode 写简洁总结；同一天可以多次追加。\n"
             "- 回答涉及过去偏好、历史决策或“上次/之前”的问题前，先用 recall；"
             "按天查看用 list_episodes、read_episode。\n"
@@ -9390,14 +9425,21 @@ MEMORY_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Append a durable fact to long-term memory. Use only for stable "
                 "preferences, environment facts, project facts and decisions; never "
-                "store secrets, guesses or transient task details."
+                "store secrets, guesses or transient task details. Keep it to one "
+                f"short sentence of at most {MEMORY_ENTRY_HINT} characters: this is "
+                "an index of settled facts, not a place for notes or explanations. "
+                "Split unrelated facts into separate calls."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "Concise fact to remember.",
+                        "description": (
+                            "One short sentence, ideally under "
+                            f"{MEMORY_ENTRY_HINT} characters. Not a paragraph, "
+                            "not a list, no line breaks."
+                        ),
                     },
                     "tags": {
                         "type": "string",
@@ -14946,8 +14988,69 @@ def _memory_auto_marker(date: str) -> str:
     return f"<!-- {MEMORY_AUTO_MARKER}:{date} -->"
 
 
+MEMORY_MERGE_PROMPT = """你在整理一个 AI agent 的长期记忆文件。下面是一批较早的记忆条目，
+每条以「- [日期] 内容」开头。
+
+请合并它们，输出一份更短的条目列表：
+- 合并同一件事的多种说法，保留信息更完整的那条；
+- 丢弃已被更新条目推翻、明显过期或只是一次性任务细节的内容；
+- 稳定偏好、环境事实、项目约定和关键决策要保留；
+- 不要编造原文没有的事实，也不要添加标题、解释或任何额外文字；
+- 每条只写一个事实，一句话说完，尽量控制在百字以内；不要把多条拼成长句或段落；
+- 每条独立一行，沿用「- [YYYY-MM-DD] [标签] 内容」格式，日期和标签取该条原来的值；
+- 输出条数必须严格少于输入条数。
+"""
+
+
 def _looks_secret(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
+
+
+def _memory_key(text: str) -> str:
+    """Comparison key for duplicate detection.
+
+    Spacing, punctuation and case are noise here: "用户偏好简洁回答" and
+    "用户，偏好简洁的回答！" mean the same thing and only the first should
+    be stored.
+    """
+    return text.translate(_MEMORY_KEY_DROP).casefold()
+
+
+def _parse_memory_entries(text: str) -> list[tuple[str, str, str]]:
+    """Pull `- [YYYY-MM-DD] [tags] fact` lines out of a model reply."""
+    entries: list[tuple[str, str, str]] = []
+    for raw in (text or "").splitlines():
+        match = re.match(
+            r"^\s*[-*]\s*(?:\[(\d{4}-\d{2}-\d{2})\])?\s*(?:\[([^\]]*)\])?\s*(.+?)\s*$",
+            raw,
+        )
+        if not match:
+            continue
+        body = " ".join(match.group(3).split())
+        if not body or _looks_secret(body):
+            continue
+        if len(body) > MEMORY_MAX_ENTRY:
+            # Keep the beginning: the tail of an overlong fact is usually the
+            # elaboration we did not want in the first place.
+            body = body[: MEMORY_MAX_ENTRY - 1].rstrip() + "…"
+        tags = " ".join((match.group(2) or "").split()).replace("]", "")[:200]
+        entries.append((match.group(1) or _memory_today(), tags, body))
+    return entries
+
+
+def _memory_line(date: str, tags: str, text: str) -> str:
+    line = f"- [{date}]"
+    if tags:
+        line += f" [{tags}]"
+    return f"{line} {text}"
+
+
+def _memory_tags(lines: list[str], index: int) -> str:
+    """Tags of an existing entry, kept verbatim when compaction rewrites it."""
+    if not 0 <= index < len(lines):
+        return ""
+    match = re.match(r"^- \[\d{4}-\d{2}-\d{2}\](?: \[([^\]]*)\])? .*$", lines[index])
+    return match.group(1) if match and match.group(1) else ""
 
 
 class MemoryService:
@@ -15059,7 +15162,12 @@ class MemoryService:
             raise ToolError("tags must be a string")
         value = " ".join(text.split())
         if len(value) > MEMORY_MAX_ENTRY:
-            raise ToolError(f"memory entry is too long (max {MEMORY_MAX_ENTRY} characters)")
+            raise ToolError(
+                "memory entry is too long "
+                f"({len(value)} > {MEMORY_MAX_ENTRY} characters); "
+                f"compress it to one short sentence of about {MEMORY_ENTRY_HINT} "
+                "characters, and store unrelated facts separately"
+            )
         if _looks_secret(value):
             raise ToolError("refusing to store something that looks like a secret")
         clean_tags = " ".join(tags.split()).replace("]", "")[:200]
@@ -15070,14 +15178,17 @@ class MemoryService:
         with self._lock:
             current = self._read_text(self.memory_path)
             if len(current) > MEMORY_MAX_FILE:
-                raise ToolError("MEMORY.md is too large; prune it before adding more")
+                raise ToolError(
+                    "MEMORY.md is too large; run /memory compact or edit it manually"
+                )
+            key = _memory_key(value)
             lines = current.splitlines()
             for number, existing in enumerate(lines, 1):
                 match = re.match(
                     r"^- \[\d{4}-\d{2}-\d{2}\](?: \[[^\]]*\])? (.*)$",
                     existing,
                 )
-                if match and match.group(1) == value:
+                if match and _memory_key(match.group(1)) == key:
                     return f"already remembered in MEMORY.md:{number}"
             self._append_text(
                 self.memory_path,
@@ -15085,7 +15196,13 @@ class MemoryService:
                 header="# 长期记忆\n\n",
             )
             count = len(self._read_text(self.memory_path).splitlines())
-        return f"remembered in MEMORY.md:{count}"
+        note = self._maybe_compact_memory()
+        # Feed the length back so the model notices when it is writing an
+        # essay into what is meant to be a one-line index.
+        hint = ""
+        if len(value) > MEMORY_ENTRY_HINT:
+            hint = f"; {len(value)} chars, aim for under {MEMORY_ENTRY_HINT}"
+        return f"remembered in MEMORY.md:{count}{hint}" + note
 
     def _write_text(self, path: str, text: str) -> None:
         self._ensure_dirs()
@@ -15126,7 +15243,7 @@ class MemoryService:
         seen: set[str] = set()
         remove: set[int] = set()
         for index, _date, text in reversed(entries):
-            key = " ".join(text.split()).casefold()
+            key = _memory_key(text)
             if not key:
                 continue
             if key in seen:
@@ -15145,69 +15262,132 @@ class MemoryService:
             self._write_text(self.memory_path, "\n".join(kept).rstrip("\n") + "\n")
         return result
 
-    def prune_memory(
+    def _backup_memory(self) -> str:
+        """Copy MEMORY.md next to itself before rewriting it."""
+        self._ensure_dirs()
+        target = f"{self.memory_path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            with open(self.memory_path, "rb") as source:
+                data = source.read()
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise ToolError(f"memory backup failed: {exc}") from exc
+        return target
+
+    def compact_memory(
         self,
-        *,
-        keep_days: int | None = None,
-        keep_count: int | None = None,
-        dry_run: bool = True,
-    ) -> dict[str, int]:
-        if keep_days is None and keep_count is None:
-            raise ToolError("memory prune requires keep_days or keep_count")
-        lines = self._read_text(self.memory_path).splitlines()
+        keep_recent: int = MEMORY_COMPACT_KEEP_RECENT,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Merge older entries into a shorter list, keeping recent ones intact.
+
+        There is no time-based deletion: a year-old preference is usually
+        still valid while yesterday's note about a branch may already be
+        stale, so the model decides what still holds. The rewrite always
+        leaves a backup and never touches the newest entries.
+        """
+        keep = max(0, int(keep_recent))
         entries = self._memory_entries()
-        keep_indices: set[int] = {index for index, _date, _text in entries}
-        if keep_count is not None:
-            keep_indices = {
-                index
-                for index, _date, _text in entries[-max(0, int(keep_count)):]
-            }
-        if keep_days is not None:
-            cutoff = time.strftime(
-                "%Y-%m-%d",
-                time.localtime(time.time() - max(0, int(keep_days)) * 86400),
-            )
-            keep_indices &= {
-                index
-                for index, date, _text in entries
-                if date >= cutoff
-            }
-        remove = {
-            index for index, _date, _text in entries if index not in keep_indices
-        }
-        result = {
+        raw_lines = self._read_text(self.memory_path).splitlines()
+        result: dict[str, Any] = {
             "before": len(entries),
-            "removed": len(remove),
-            "after": len(entries) - len(remove),
+            "after": len(entries),
+            "merged": 0,
+            "keep_recent": keep,
+            "backup": "",
+            "skipped": True,
         }
-        if not dry_run and remove:
-            kept = [
-                line for index, line in enumerate(lines) if index not in remove
-            ]
-            self._write_text(self.memory_path, "\n".join(kept).rstrip("\n") + "\n")
+        if len(entries) <= keep:
+            return result
+        if keep:
+            older = entries[: len(entries) - keep]
+            recent = entries[len(entries) - keep:]
+        else:
+            older = entries
+            recent = []
+        body = "\n".join(
+            raw_lines[index] for index, _date, _text in older
+            if 0 <= index < len(raw_lines)
+        )
+        try:
+            client = self._make_client()
+            reply = client.chat(
+                [{"role": "user", "content": f"{MEMORY_MERGE_PROMPT}\n\n待合并的旧记忆：\n{body}"}],
+                [],
+            )
+        except ChatError as exc:
+            raise ToolError(f"memory compaction failed: {exc}") from exc
+        content, _images = _content_text(reply)
+        merged = _parse_memory_entries(content)
+        if not merged:
+            raise ToolError("memory compaction returned no usable entries")
+        if len(merged) >= len(older):
+            # The model did not shorten anything; leave the file alone and try
+            # again on the next write instead of logging noise every time.
+            return result
+        result.update(
+            merged=len(merged), after=len(merged) + len(recent), skipped=False
+        )
+        if dry_run:
+            return result
+        backup = self._backup_memory()
+        lines = ["# 长期记忆", ""]
+        lines.extend(_memory_line(date, tags, text) for date, tags, text in merged)
+        lines.extend(
+            _memory_line(date, _memory_tags(raw_lines, index), text)
+            for index, date, text in recent
+            if 0 <= index < len(raw_lines)
+        )
+        self._write_text(self.memory_path, "\n".join(lines).rstrip("\n") + "\n")
+        result["backup"] = backup
         return result
 
-    def prune_episodes(self, keep_days: int, dry_run: bool = True) -> dict[str, Any]:
-        cutoff = time.strftime(
-            "%Y-%m-%d",
-            time.localtime(time.time() - max(0, int(keep_days)) * 86400),
+    def memory_size(self) -> int:
+        try:
+            return os.path.getsize(self.memory_path)
+        except OSError:
+            return 0
+
+    def _maybe_compact_memory(self) -> str:
+        """Compact once the file passes the budget; never breaks the call."""
+        if self.memory_size() <= MEMORY_COMPACT_CHARS:
+            return ""
+        # A handful of very long entries can cross the budget without ever
+        # reaching keep_recent, so cap the kept tail at half the file to make
+        # sure compaction can actually make progress.
+        entries = len(self._memory_entries())
+        keep = min(MEMORY_COMPACT_KEEP_RECENT, entries // 2)
+        try:
+            stats = self.compact_memory(keep_recent=keep)
+        except (ToolError, OSError) as exc:
+            print(f"[memory] compaction skipped: {exc}", file=sys.stderr)
+            return ""
+        except Exception as exc:  # memory upkeep must not fail a tool call
+            print(
+                f"[memory] compaction skipped: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return ""
+        if stats.get("skipped"):
+            return ""
+        return (
+            f"; compacted MEMORY.md {stats['before']} -> {stats['after']} entries"
+            f" (backup: {os.path.basename(stats['backup'])})"
         )
-        dates = [date for date in self._episode_dates() if date < cutoff]
-        if not dry_run:
-            for date in dates:
-                try:
-                    os.remove(self._episode_path(date))
-                except OSError:
-                    pass
-        return {"cutoff": cutoff, "removed": len(dates), "dates": dates}
 
     # -- episodic memory -------------------------------------------------- #
 
     def save_episode(self, summary: str, date: str = "", tags: str = "") -> str:
         if not isinstance(summary, str) or not summary.strip():
             raise ToolError("summary must be a non-empty string")
-        if len(summary) > MEMORY_MAX_ENTRY:
-            raise ToolError(f"summary is too long (max {MEMORY_MAX_ENTRY} characters)")
+        if len(summary) > MEMORY_MAX_EPISODE_ENTRY:
+            raise ToolError(
+                f"summary is too long (max {MEMORY_MAX_EPISODE_ENTRY} characters)"
+            )
         if MEMORY_AUTO_MARKER in summary:
             raise ToolError("summary must not contain the automatic summary marker")
         if _looks_secret(summary):
@@ -15220,7 +15400,9 @@ class MemoryService:
         with self._lock:
             try:
                 if os.path.getsize(path) > MEMORY_MAX_EPISODE_FILE:
-                    raise ToolError("episode file is too large; prune it before adding more")
+                    raise ToolError(
+                        "episode file is too large; edit or delete it manually"
+                    )
             except OSError:
                 pass
             stamp = datetime.now().strftime("%H:%M")
@@ -16315,7 +16497,7 @@ def run_memory_command(
             print(memory.status_text())
             print(
                 "usage: /memory [status|path|search <query>|read <date>|"
-                "summarize [date]|dedupe|prune ...]"
+                "summarize [date]|dedupe|compact ...]"
             )
         elif action == "path":
             print(memory.base_dir)
@@ -16337,74 +16519,51 @@ def run_memory_command(
             )
             if not confirmed:
                 print("dry-run: add --yes to write changes")
-        elif action == "prune":
+        elif action in ("compact", "merge"):
             tokens = rest.split()
-            keep_count = None
-            keep_days = None
-            episodes = False
+            keep = MEMORY_COMPACT_KEEP_RECENT
             confirmed = False
-            index = 0
             try:
+                index = 0
                 while index < len(tokens):
                     token = tokens[index]
                     if token == "--yes":
                         confirmed = True
                         index += 1
-                    elif token == "--episodes":
-                        episodes = True
-                        index += 1
                     elif token == "--keep" and index + 1 < len(tokens):
-                        keep_count = int(tokens[index + 1])
-                        if keep_count < 0:
+                        keep = int(tokens[index + 1])
+                        if keep < 0:
                             raise ValueError
-                        index += 2
-                    elif token in ("--older-than", "--days") and index + 1 < len(tokens):
-                        keep_days = parse_days_value(tokens[index + 1])
                         index += 2
                     else:
                         raise ValueError
             except ValueError:
+                print("usage: /memory compact [--keep N] [--yes]")
+                return
+            stats = memory.compact_memory(keep_recent=keep, dry_run=not confirmed)
+            if stats.get("skipped"):
                 print(
-                    "usage: /memory prune [--keep N] [--older-than 30d] "
-                    "[--episodes] [--yes]"
+                    f"nothing to compact ({stats['before']} entries, "
+                    f"keep {stats['keep_recent']})"
                 )
                 return
-            if keep_count is None and keep_days is None:
-                print(
-                    "usage: /memory prune [--keep N] [--older-than 30d] "
-                    "[--episodes] [--yes]"
-                )
-                return
-            stats = memory.prune_memory(
-                keep_count=keep_count,
-                keep_days=keep_days,
-                dry_run=not confirmed,
-            )
             print(
                 f"long-term memory: {stats['before']} -> {stats['after']} "
-                f"entries, removed {stats['removed']}"
+                f"entries, merged into {stats['merged']}"
             )
-            if episodes and keep_days is not None:
-                episode_stats = memory.prune_episodes(
-                    keep_days, dry_run=not confirmed
-                )
-                print(
-                    f"episodes: removed {episode_stats['removed']} "
-                    f"file(s) older than {episode_stats['cutoff']}"
-                )
-                if episode_stats["dates"]:
-                    print("  " + ", ".join(episode_stats["dates"]))
+            if stats.get("backup"):
+                print(f"backup: {stats['backup']}")
             if not confirmed:
                 print("dry-run: add --yes to write changes")
         elif action == "help":
             print(
                 "usage: /memory [status|path|search <query>|read <date>|"
-                "summarize [date]|dedupe|prune ...]"
+                "summarize [date]|dedupe|compact ...]"
             )
         else:
             print(
                 "usage: /memory [status|path|search <query>|read <date>|"
-                "summarize [date]|dedupe|prune ...]"
+                "summarize [date]|dedupe|compact ...]"
             )
     except ToolError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -17916,7 +18075,7 @@ def print_help() -> None:
     print("          /stream [on|off|auto|status],")
     print("          /mcp [status|on|off|add|edit|remove|enable|disable|test|tools|resources|resource|prompts|prompt|logs|restart],")
     print("          /skill [list|create|install|remove|reload|pending|approve|reject],")
-    print("          /memory [status|path|search <query>|read <date>|summarize [date]|dedupe|prune],")
+    print("          /memory [status|path|search <query>|read <date>|summarize [date]|dedupe|compact],")
     print("          /config [path|save|backup|backups|restore [file]],")
     print("          /status,")
     print("          /exit (Ctrl-D)")
