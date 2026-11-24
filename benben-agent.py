@@ -288,7 +288,7 @@ from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import islice
 from typing import Any, Callable, NamedTuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 try:
     import termios
@@ -1570,18 +1570,37 @@ class BaseChatClient:
                 pass
 
     def list_models(self) -> list[str]:
-        data = self._request(f"{self._models_root()}/models", timeout=min(self.timeout, 30.0))
-        self.last_models_payload = data
-        models = extract_model_ids(data)
+        url = f"{self._models_root()}/models"
+        timeout = min(self.timeout, 30.0)
+        payload = self._request(url, timeout=timeout)
+        pages: list[Any] = [payload]
+        visited = {url}
+        next_url = model_page_url(url, payload)
+        while (
+            next_url
+            and next_url not in visited
+            and len(pages) < MODEL_LIST_MAX_PAGES
+        ):
+            visited.add(next_url)
+            page = self._request(next_url, timeout=timeout)
+            pages.append(page)
+            next_url = model_page_url(next_url, page)
+        if len(pages) > 1:
+            items: list[Any] = []
+            for page in pages:
+                items.extend(model_list_items(page) or [])
+            payload = {"object": "list", "data": items}
+        self.last_models_payload = payload
+        models = extract_model_ids(payload)[:MODEL_LIST_MAX_ITEMS]
         if models:
             return models
-        if isinstance(data, list):
+        if isinstance(payload, list):
             return []
-        if isinstance(data, dict) and any(
-            key in data for key in ("data", "models", "model_list", "items")
+        if isinstance(payload, dict) and any(
+            key in payload for key in ("data", "models", "model_list", "items")
         ):
             return []
-        raise ChatError(f"Unexpected models response: {json.dumps(data)[:500]}")
+        raise ChatError(f"Unexpected models response: {json.dumps(payload)[:500]}")
 
 
 class ChatClient(BaseChatClient):
@@ -4284,6 +4303,59 @@ def extract_model_ids(payload: Any) -> list[str]:
             seen.add(value)
             ids.append(value)
     return sorted(ids, key=_natural_key)
+
+
+MODEL_LIST_MAX_PAGES = 20
+MODEL_LIST_MAX_ITEMS = 5000
+
+
+def model_list_items(payload: Any) -> list[Any] | None:
+    """Return the raw item list from a /models response, if it has one."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    for key in ("data", "models", "model_list", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    if any(key in payload for key in ("id", "name", "model", "model_name")):
+        return [payload]
+    return None
+
+
+def _with_query(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[key] = [value]
+    query = "&".join(
+        f"{quote(name, safe='')}={quote(item, safe='')}"
+        for name, values in params.items()
+        for item in values
+    )
+    return parsed._replace(query=query).geturl()
+
+
+def model_page_url(current_url: str, payload: Any) -> str | None:
+    """Find the next page URL for common /models pagination shapes."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("next_page_url", "nextPageUrl"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("next_page_token", "nextPageToken", "next_page", "nextPage"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            token = value.strip()
+            if token.startswith(("http://", "https://")):
+                return token
+            return _with_query(current_url, "page_token", token)
+    if payload.get("has_more") is True or payload.get("hasMore") is True:
+        last_id = payload.get("last_id") or payload.get("lastId")
+        if isinstance(last_id, str) and last_id.strip():
+            return _with_query(current_url, "after_id", last_id.strip())
+    return None
 
 
 def build_client(
@@ -16894,10 +16966,14 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
     <div class="form-row">
       <label for="conn-model">模型</label>
       <div class="conn-model-row">
-        <input id="conn-model" list="conn-model-options" autocomplete="off">
-        <datalist id="conn-model-options"></datalist>
+        <input id="conn-model" autocomplete="off">
         <button id="conn-fetch" type="button">获取模型</button>
       </div>
+    </div>
+    <div class="form-row" id="conn-model-picker" hidden>
+      <label for="conn-model-select">模型列表</label>
+      <select id="conn-model-select"></select>
+      <div id="conn-model-count" class="modal-note"></div>
     </div>
     <div class="form-row">
       <label for="conn-name">连接名称</label>
@@ -17982,7 +18058,9 @@ const connKeyEl = document.getElementById("conn-key");
 const connAuthRowEl = document.getElementById("conn-auth-row");
 const connAuthEl = document.getElementById("conn-auth");
 const connModelEl = document.getElementById("conn-model");
-const connModelOptionsEl = document.getElementById("conn-model-options");
+const connModelPickerEl = document.getElementById("conn-model-picker");
+const connModelSelectEl = document.getElementById("conn-model-select");
+const connModelCountEl = document.getElementById("conn-model-count");
 const connNameEl = document.getElementById("conn-name");
 const connFetchEl = document.getElementById("conn-fetch");
 const connSaveEl = document.getElementById("conn-save");
@@ -17995,6 +18073,7 @@ let menuSession = null;
 let connectionsData = null;
 let editingConnection = "";
 let loadingConnectionForm = false;
+let fetchedConnModels = [];
 
 function openLightbox(src, objectUrl) {
   if (lightboxObjectUrl) {
@@ -19728,12 +19807,36 @@ function renderConnectionList() {
   setSelectOptions(connListEl, options, editingConnection);
 }
 
+function resetFetchedModels() {
+  fetchedConnModels = [];
+  connModelPickerEl.hidden = true;
+  connModelSelectEl.textContent = "";
+  connModelCountEl.textContent = "";
+}
+
+function renderFetchedModels(models, current) {
+  fetchedConnModels = Array.isArray(models) ? models.slice() : [];
+  if (!fetchedConnModels.length) {
+    resetFetchedModels();
+    return;
+  }
+  const options = [{
+    value: "",
+    label: "选择已获取的模型（共 " + fetchedConnModels.length + " 个）",
+  }];
+  for (const name of fetchedConnModels) options.push({ value: name, label: name });
+  const selected = fetchedConnModels.includes(current) ? current : "";
+  setSelectOptions(connModelSelectEl, options, selected);
+  connModelPickerEl.hidden = false;
+  connModelCountEl.textContent = "共 " + fetchedConnModels.length + " 个模型；也可直接在上方输入自定义模型名。";
+}
+
 function loadConnectionForm(name) {
   loadingConnectionForm = true;
   try {
     editingConnection = name || "";
     connectStatusEl.textContent = "";
-    connModelOptionsEl.textContent = "";
+    resetFetchedModels();
     connKeyEl.value = "";
     if (!name) {
       connNameEl.value = "";
@@ -19861,14 +19964,10 @@ async function fetchConnectionModels() {
   connectStatusEl.textContent = "正在获取模型列表…";
   try {
     const data = await api("/api/connections/models", payload);
-    connModelOptionsEl.textContent = "";
-    for (const name of data.models || []) {
-      const option = document.createElement("option");
-      option.value = name;
-      connModelOptionsEl.appendChild(option);
-    }
-    if (!connModelEl.value && data.models && data.models.length) connModelEl.value = data.models[0];
-    connectStatusEl.textContent = "找到 " + ((data.models || []).length) + " 个模型";
+    const models = data.models || [];
+    if (!connModelEl.value.trim() && models.length) connModelEl.value = models[0];
+    renderFetchedModels(models, connModelEl.value.trim());
+    connectStatusEl.textContent = "找到 " + models.length + " 个模型";
   } catch (err) {
     connectStatusEl.textContent = "获取失败: " + String(err);
   } finally {
@@ -19973,6 +20072,15 @@ connFormatEl.onchange = () => {
   connAuthRowEl.hidden = connFormatEl.value !== "anthropic-messages";
 };
 connFetchEl.onclick = fetchConnectionModels;
+connModelSelectEl.onchange = () => {
+  if (connModelSelectEl.value) connModelEl.value = connModelSelectEl.value;
+};
+connModelEl.addEventListener("input", () => {
+  const typed = connModelEl.value.trim();
+  if (connModelSelectEl.value && connModelSelectEl.value !== typed) {
+    connModelSelectEl.value = "";
+  }
+});
 connSaveEl.onclick = saveConnection;
 connUseEl.onclick = useConnection;
 connDeleteEl.onclick = deleteConnection;

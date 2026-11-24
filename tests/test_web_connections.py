@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 AGENT = str(Path(__file__).resolve().parents[1] / "benben-agent.py")
 MCP_SERVER = str(Path(__file__).resolve().parent / "mcp_stdio_server.py")
@@ -78,9 +79,40 @@ class ModelHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class PagedModelHandler(BaseHTTPRequestHandler):
+    requests = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        PagedModelHandler.requests.append(self.path)
+        query = parse_qs(urlparse(self.path).query)
+        after = (query.get("after_id") or [""])[0]
+        pages = {
+            "": (["pm-1", "pm-2"], "pm-2", True),
+            "pm-2": (["pm-3", "pm-4"], "pm-4", True),
+            "pm-4": (["pm-5", "pm-6"], "", False),
+        }
+        ids, last_id, has_more = pages.get(after, ([], "", False))
+        body = json.dumps({
+            "data": [{"id": name} for name in ids],
+            "has_more": has_more,
+            "last_id": last_id,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
 threading.Thread(target=model.serve_forever, daemon=True).start()
 model_base = f"http://127.0.0.1:{model.server_port}/v1"
+paged_model = ThreadingHTTPServer(("127.0.0.1", 0), PagedModelHandler)
+threading.Thread(target=paged_model.serve_forever, daemon=True).start()
+paged_base = f"http://127.0.0.1:{paged_model.server_port}/v1"
 
 home = tempfile.mkdtemp(prefix="web-connections-")
 config_path = os.path.join(home, "config.json")
@@ -183,6 +215,13 @@ try:
     check("web html export", 'id="session-export"' in html and 'id="export-modal"' in html)
     check("web html tool details", "addToolDetail" in html and "tool-detail" in html)
     check("web html model info", 'id="model-info"' in html and "renderModelInfo" in html)
+    check(
+        "web html model dropdown",
+        'id="conn-model-picker"' in html
+        and 'id="conn-model-select"' in html
+        and "renderFetchedModels" in html,
+    )
+    check("web html no model datalist", 'id="conn-model-options"' not in html)
     check("web html connection select", 'id="connection-select"' in html)
     check(
         "web html help modal",
@@ -223,6 +262,32 @@ try:
     })
     fetched = json.loads(text)
     check("fetch models", fetched["models"] == ["model-a", "model-b"])
+
+    # Paginated /models responses must be followed to completion.
+    code, text = api("/api/connections/models", {
+        "provider": "custom",
+        "base_url": paged_base,
+        "api_format": "openai-chat-completions",
+        "model": "pm-1",
+        "api_key": "sk-paged",
+    })
+    paged_models = json.loads(text)["models"]
+    check(
+        "fetch models all pages",
+        paged_models == ["pm-1", "pm-2", "pm-3", "pm-4", "pm-5", "pm-6"],
+        paged_models,
+    )
+    check(
+        "fetch models page cursor",
+        any("after_id=pm-2" in path for path in PagedModelHandler.requests),
+        PagedModelHandler.requests,
+    )
+    check(
+        "fetch models next cursor",
+        any("after_id=pm-4" in path for path in PagedModelHandler.requests)
+        and len(PagedModelHandler.requests) == 3,
+        PagedModelHandler.requests,
+    )
 
     # Save and activate.
     code, text = api("/api/connections/save", {
@@ -921,6 +986,7 @@ finally:
         web.kill()
     log_handle.close()
     model.shutdown()
+    paged_model.shutdown()
     shutil.rmtree(home, ignore_errors=True)
 
 print()

@@ -111,7 +111,7 @@ python3 benben-agent.py --connect
 | MiniMax | `openai-responses` | `https://api.minimaxi.com/v1` |
 | MiniMax | `anthropic-messages` | `https://api.minimaxi.com/anthropic` |
 
-向导会尝试通过 `/models` 拉取模型列表；接口不支持时可以直接输入模型名。MiniMax 默认使用 `bearer` 认证，其他 Anthropic 连接默认 `x-api-key`。
+向导会尝试通过 `/models` 拉取模型列表（分页接口会自动翻页取全）；接口不支持时可以直接输入模型名。Web 连接设置会把结果放进可滚动的“模型列表”下拉框，选择后填入模型输入框。MiniMax 默认使用 `bearer` 认证，其他 Anthropic 连接默认 `x-api-key`。
 
 配置优先级：
 
