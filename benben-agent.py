@@ -262,7 +262,7 @@ import base64
 import binascii
 import codecs
 import copy
-from collections import deque
+from collections import deque, OrderedDict
 from datetime import datetime, timedelta
 import fnmatch
 import getpass
@@ -451,7 +451,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.28.0"
+AGENT_VERSION = "0.29.0"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -3957,12 +3957,28 @@ def context_usage(
             tokens = projected
     window = max(1, int(info.context_window))
     percent = min(100, int(tokens * 100 / window))
-    return {
+    usage: dict[str, Any] = {
         "tokens": tokens,
         "window": window,
         "percent": percent,
         "remaining": max(0, window - tokens),
     }
+    # 带上最近一次真实调用的明细，让 /api/runtime 与流式期间的 usage_live
+    # 能拼出同样完整的一行（in/cached/new/hit）。没有历史调用时留空。
+    last_usage = getattr(client, "last_usage", None) if client is not None else None
+    if isinstance(last_usage, dict):
+        prompt_tokens = int(last_usage.get("prompt_tokens", 0) or 0)
+        if prompt_tokens > 0:
+            cached_tokens = int(last_usage.get("cached_tokens", 0) or 0)
+            details = last_usage.get("prompt_tokens_details")
+            if not cached_tokens and isinstance(details, dict):
+                cached_tokens = int(details.get("cached_tokens", 0) or 0)
+            cached_tokens = max(0, min(prompt_tokens, cached_tokens))
+            usage["input"] = prompt_tokens
+            usage["cached"] = cached_tokens
+            usage["new"] = prompt_tokens - cached_tokens
+            usage["hit"] = min(100, cached_tokens * 100 // prompt_tokens)
+    return usage
 
 
 def project_context_tokens(
@@ -12784,13 +12800,50 @@ class Workspace:
         if not os.path.isfile(full):
             raise ToolError(f"not a file: {path}")
         limit = max(1, min(int(max_items), 2000))
+        # ast.parse 在大文件上很贵（本仓 29000 行约 0.5 s），而解析结果只
+        # 取决于文件内容和解析方式。按 (realpath, mtime, size) 缓存原始 items，
+        # 命中后仍按本次的 max_items 重新切片，避免不同 limit 互相串结果。
+        try:
+            stat = os.stat(full)
+        except OSError as exc:
+            raise ToolError(str(exc)) from exc
+        cache_key = (full, stat.st_mtime_ns, stat.st_size)
+        parsed = _outline_cache_get(cache_key)
+        if parsed is None:
+            parsed = self._parse_outline(full)
+            _outline_cache_put(cache_key, parsed)
+        total, items, parser = parsed
+        display = self._display(full)
+        if not items:
+            return (
+                f"{display}: {total} lines, no declarations found "
+                f"(parser={parser or 'regex'})"
+            )
+        headers = [
+            f"{line_no:>6} | {'  ' * depth}{label}"
+            for line_no, depth, label in items[:limit]
+        ]
+        header = (
+            f"{display}: {total} lines, "
+            f"{len(items)} declaration{'s' if len(items) != 1 else ''} (parser={parser})"
+        )
+        if len(items) > limit:
+            headers.append(f"... (truncated; {len(items)} declarations total)")
+        return header + "\n" + "\n".join(headers)
+
+    def _parse_outline(
+        self, full: str
+    ) -> tuple[int, list[tuple[int, int, str]], str]:
+        """Parse a file into ``(total_lines, items, parser)``; cached by caller."""
         try:
             with open(full, "r", encoding="utf-8", errors="replace") as handle:
                 source = handle.read()
         except OSError as exc:
             raise ToolError(str(exc)) from exc
         if "\x00" in source[:1024]:
-            raise ToolError("this looks like a binary file; attach pictures with /image or --image")
+            raise ToolError(
+                "this looks like a binary file; attach pictures with /image or --image"
+            )
         lines = source.splitlines()
         total = len(lines)
         items: list[tuple[int, int, str]] = []
@@ -12806,21 +12859,9 @@ class Workspace:
         if not items:
             items = _generic_outline(lines, language)
             parser = language or "regex"
-        if not items:
-            return f"{self._display(full)}: {total} lines, no declarations found (parser={parser or 'regex'})"
-        items.sort(key=lambda item: item[0])
-        trimmed = items[:limit]
-        rendered = [
-            f"{line_no:>6} | {'  ' * depth}{label}"
-            for line_no, depth, label in trimmed
-        ]
-        header = (
-            f"{self._display(full)}: {total} lines, "
-            f"{len(items)} declaration{'s' if len(items) != 1 else ''} (parser={parser})"
-        )
-        if len(items) > limit:
-            rendered.append(f"... (truncated; {len(items)} declarations total)")
-        return header + "\n" + "\n".join(rendered)
+        if items:
+            items.sort(key=lambda item: item[0])
+        return total, items, parser
 
     def read_file(
         self,
@@ -16896,6 +16937,9 @@ def run_turn(
             print(_style(f"  [result] {indented}", DIM, supports_color()), flush=True)
         elif kind == "usage":
             print(_style(f"  {text}", DIM, supports_color()), file=sys.stderr, flush=True)
+        elif kind == "usage_live":
+            # 只在网页端右上角状态条用，命令行不打印（避免每次工具调用刷屏）。
+            pass
         elif kind == "plan":
             for line in (text or "").splitlines():
                 print(_style(f"  {line}", DIM, supports_color()), flush=True)
@@ -16919,6 +16963,103 @@ def run_turn(
         nonlocal call_count
         call_count += 1
         merge_usage(usage_total, usage)
+
+    def format_usage(include_total: bool) -> str:
+        """Build the ``[usage]`` line.
+
+        ``include_total=False`` is used for the live per-call update shown in
+        the web composer: only the latest call and the current context matter
+        there, and a running total would be noise in a one-line status.
+
+        When the turn made a single model call, the ``total`` block is identical
+        to the ``last`` block, so it is dropped to keep the line short.
+        """
+        parts = []
+        # last: 最后一次模型调用；total: 整轮所有调用累计。
+        if last_call_usage:
+            last_cached = max(
+                0, int(last_call_usage.get("cached_tokens", 0) or 0)
+            )
+            last_input = max(
+                0, int(last_call_usage.get("prompt_tokens", 0) or 0)
+            )
+            last_hit = (
+                min(100, last_cached * 100 // last_input)
+                if last_input > 0
+                else 0
+            )
+            parts.append(
+                f"in:{last_input} cached:{last_cached} "
+                f"new:{max(0, last_input - last_cached)} hit:{last_hit}%"
+            )
+        if context_window:
+            window = max(1, int(context_window))
+            context_tokens = 0
+            is_estimate = True
+            if last_call_usage:
+                real_tokens = int(
+                    last_call_usage.get("prompt_tokens", 0) or 0
+                )
+                if real_tokens > 0:
+                    completion_tokens = max(
+                        0,
+                        int(last_call_usage.get("completion_tokens", 0) or 0),
+                    )
+                    # Anchor to the real prompt count and add the real
+                    # completion. Any messages appended after the final
+                    # reply (for example tool results) are estimated.
+                    context_tokens = real_tokens + completion_tokens
+                    baseline = getattr(client, "last_prompt_estimate", None)
+                    if (
+                        isinstance(baseline, int)
+                        and baseline >= 0
+                        and last_reply is not None
+                    ):
+                        delta = estimate_tokens(messages) - baseline
+                        reply_estimate = estimate_tokens([last_reply])
+                        context_tokens += max(0, delta - reply_estimate)
+                    is_estimate = False
+            if is_estimate:
+                context_tokens = estimate_tokens(messages)
+            percent = min(100, int(context_tokens * 100 / window))
+            tilde = "~" if is_estimate else ""
+            parts.append(
+                f"ctx:{percent}%({tilde}{context_tokens}/{window})"
+            )
+        # 累计：整轮任务内所有模型调用的用量之和，反映"总消耗"。
+        # 只调用一次时和上面完全重复，省略。
+        if include_total and usage_total and call_count > 1:
+            total_cached = max(
+                0, int(usage_total.get("cached_tokens", 0) or 0)
+            )
+            total_input = max(
+                0, int(usage_total.get("prompt_tokens", 0) or 0)
+            )
+            total_output = max(
+                0, int(usage_total.get("completion_tokens", 0) or 0)
+            )
+            total_hit = (
+                min(100, total_cached * 100 // total_input)
+                if total_input > 0
+                else 0
+            )
+            total_parts = [
+                f"{call_count}x",
+                f"in:{total_input}",
+                f"hit:{total_hit}%",
+                f"out:{total_output}",
+            ]
+            reasoning_tokens = int(
+                usage_total.get("reasoning_tokens", 0) or 0
+            )
+            if reasoning_tokens > 0:
+                total_parts.append(f"reasoning:{reasoning_tokens}")
+            total_tokens = usage_total.get("total_tokens", 0)
+            if not isinstance(total_tokens, int) or total_tokens <= 0:
+                total_tokens = total_input + total_output
+            total_parts.append(f"tokens:{total_tokens}")
+            parts.append("total: " + " ".join(total_parts))
+        return "[usage] " + " | ".join(parts)
 
     try:
         for _ in range(max_steps):
@@ -16995,6 +17136,12 @@ def run_turn(
             last_reply = reply
             messages.append(reply)
 
+            # 实时用量：每次模型调用后立刻推一条精简版（last + context），
+            # 供网页端右上角状态条刷新。整轮结束时的完整版（含 total）在
+            # finally 里再发一次，CLI 只认那个，不受这里影响。
+            if last_call_usage or context_window:
+                report("usage_live", format_usage(include_total=False))
+
             if show_thinking and isinstance(reasoning, str) and reasoning.strip():
                 report("thinking", reasoning)
 
@@ -17070,97 +17217,7 @@ def run_turn(
         client.last_turn_usage = dict(usage_total)
         client.last_turn_truncated = truncated
         if usage_total or last_call_usage or context_window:
-            parts = []
-            # last: 最后一次模型调用；total: 整轮所有调用累计。
-            if last_call_usage:
-                last_cached = max(
-                    0, int(last_call_usage.get("cached_tokens", 0) or 0)
-                )
-                last_input = max(
-                    0, int(last_call_usage.get("prompt_tokens", 0) or 0)
-                )
-                last_hit = (
-                    min(100, last_cached * 100 // last_input)
-                    if last_input > 0
-                    else 0
-                )
-                parts.append(
-                    f"last: input={last_input} "
-                    f"cached={last_cached} "
-                    f"new={max(0, last_input - last_cached)} "
-                    f"hit={last_hit}%"
-                )
-            if context_window:
-                window = max(1, int(context_window))
-                context_tokens = 0
-                is_estimate = True
-                if last_call_usage:
-                    real_tokens = int(
-                        last_call_usage.get("prompt_tokens", 0) or 0
-                    )
-                    if real_tokens > 0:
-                        completion_tokens = max(
-                            0,
-                            int(
-                                last_call_usage.get("completion_tokens", 0)
-                                or 0
-                            ),
-                        )
-                        # Anchor to the real prompt count and add the real
-                        # completion. Any messages appended after the final
-                        # reply (for example tool results) are estimated.
-                        context_tokens = real_tokens + completion_tokens
-                        baseline = getattr(
-                            client, "last_prompt_estimate", None
-                        )
-                        if (
-                            isinstance(baseline, int)
-                            and baseline >= 0
-                            and last_reply is not None
-                        ):
-                            delta = estimate_tokens(messages) - baseline
-                            reply_estimate = estimate_tokens([last_reply])
-                            context_tokens += max(
-                                0, delta - reply_estimate
-                            )
-                        is_estimate = False
-                if is_estimate:
-                    context_tokens = estimate_tokens(messages)
-                percent = min(100, int(context_tokens * 100 / window))
-                tilde = "~" if is_estimate else ""
-                parts.append(
-                    f"context={tilde}{context_tokens}/{window} ({percent}%)"
-                )
-            # 累计：整轮任务内所有模型调用的用量之和，反映"总消耗"。
-            if usage_total:
-                total_cached = max(
-                    0, int(usage_total.get("cached_tokens", 0) or 0)
-                )
-                total_input = max(
-                    0, int(usage_total.get("prompt_tokens", 0) or 0)
-                )
-                total_output = max(
-                    0, int(usage_total.get("completion_tokens", 0) or 0)
-                )
-                total_hit = (
-                    min(100, total_cached * 100 // total_input)
-                    if total_input > 0
-                    else 0
-                )
-                total_tokens = usage_total.get("total_tokens", 0)
-                if not isinstance(total_tokens, int) or total_tokens <= 0:
-                    total_tokens = total_input + total_output
-                parts.append(
-                    f"total: calls={call_count} "
-                    f"input={total_input} "
-                    f"new={max(0, total_input - total_cached)} "
-                    f"cached={total_cached} "
-                    f"hit={total_hit}% "
-                    f"output={total_output} "
-                    f"reasoning={usage_total.get('reasoning_tokens', 0)} "
-                    f"tokens={total_tokens}"
-                )
-            report("usage", "[usage] " + " | ".join(parts))
+            report("usage", format_usage(include_total=True))
         if truncated:
             report("warning", "输出被 max_tokens 截断，回答可能不完整")
         if session is not None:
@@ -17317,6 +17374,35 @@ _BRACE_LANGS = frozenset({"go", "rust", "ts", "js", "java", "kotlin", "csharp",
                           "proto"})
 
 _PY_SUFFIXES = (".py", ".pyi")
+
+# read_file_outline 的解析结果缓存。ast.parse 在大文件上很贵（本仓 29000 行
+# 约 0.5 s），而模型经常反复看同一个文件，缓存按 (realpath, mtime_ns, size)
+# 失效即可，文件一改自动重算。缓存的只是解析结果，max_items 由调用方切。
+_OUTLINE_CACHE: "OrderedDict[tuple[str, int, int], tuple[int, list, str]]" = OrderedDict()
+_OUTLINE_CACHE_LOCK = threading.Lock()
+_OUTLINE_CACHE_MAX = 128
+
+
+def _outline_cache_get(key: "tuple[str, int, int]") -> "tuple[int, list, str] | None":
+    with _OUTLINE_CACHE_LOCK:
+        cached = _OUTLINE_CACHE.get(key)
+        if cached is None:
+            return None
+        _OUTLINE_CACHE.move_to_end(key)
+        return cached
+
+
+def _outline_cache_put(key: "tuple[str, int, int]", value: "tuple[int, list, str]") -> None:
+    with _OUTLINE_CACHE_LOCK:
+        _OUTLINE_CACHE[key] = value
+        _OUTLINE_CACHE.move_to_end(key)
+        while len(_OUTLINE_CACHE) > _OUTLINE_CACHE_MAX:
+            _OUTLINE_CACHE.popitem(last=False)
+
+
+def _outline_cache_clear() -> None:
+    with _OUTLINE_CACHE_LOCK:
+        _OUTLINE_CACHE.clear()
 
 
 def _outline_language(path: str) -> str:
@@ -18371,7 +18457,23 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .plan-actions button.primary { border-color: #4a6cf7; background: #4a6cf7; color: #fff; }
 .plan-actions button:hover { filter: brightness(0.97); }
 .plan-actions button[disabled] { opacity: 0.6; cursor: default; }
-#status { min-height: 20px; padding: 0 18px; color: #8a919c; }
+/* 实时上下文指示器：单独占一行放在输入框上方，跟着每次模型调用的
+   usage_live 事件更新，而不是等整轮结束。放在 composer 里而不是 #status 里，
+   因为页面有 90 多处会直接赋值 statusEl.textContent，会把子元素一起清掉。 */
+.ctx-meter { display: block; margin: 0 0 6px; padding: 0; color: #8a919c; font-size: 11px; line-height: 1.5; font-variant-numeric: tabular-nums; text-align: right; cursor: default; user-select: none; }
+.ctx-meter[hidden] { display: none; }
+.ctx-meter.estimate { font-style: italic; }
+/* 分段着色：区分输入构成 / 命中率 / 上下文占用三类信息。 */
+.ctx-meter .seg-inputs { color: #a0a6b0; }
+.ctx-meter .seg-hit { color: #0e9384; }
+.ctx-meter .seg-ctx { color: #3b5bdb; }
+.ctx-meter .seg-sep { color: #c4c9d0; }
+/* 上下文紧张时只让 ctx 段变色，不影响 hit 和输入构成。 */
+.ctx-meter.warn .seg-ctx { color: #b54708; }
+.ctx-meter.danger .seg-ctx { color: #d92d20; font-weight: 600; }
+
+/* 窄屏收起“输入构成”那一组（in/cached/new），只留 hit 和 ctx。 */
+@media (max-width: 900px) { .ctx-meter .seg-inputs { display: none; } .ctx-meter .seg-inputs + .seg-sep { display: none; } }
 #composer { border-top: 1px solid #e3e6ea; background: #fff; padding: 12px 18px; }
 #input { width: 100%; height: 72px; resize: vertical; padding: 8px; border: 1px solid #c9ced6; border-radius: 6px; font: inherit; }
 .row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
@@ -18584,6 +18686,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
     <div id="log"></div>
     <div id="status"></div>
     <div id="composer">
+      <span id="ctx-meter" class="ctx-meter" hidden></span>
       <textarea id="input" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
       <div id="previews" class="previews"></div>
       <div class="row">
@@ -19575,6 +19678,7 @@ function restoreSideGroup(el, openByDefault) {
 }
 
 const statusEl = document.getElementById("status");
+const ctxMeterEl = document.getElementById("ctx-meter");
 const inputEl = document.getElementById("input");
 const sendEl = document.getElementById("send");
 const stopEl = document.getElementById("stop");
@@ -20980,7 +21084,136 @@ function formatContextSize(value) {
   return String(number);
 }
 
+// 实时用量/上下文指示器。数据来源有两个：
+//   1) /api/runtime 的 context（切会话、整轮结束后）—— 只有 context，没有 last-call 明细
+//   2) 流式期间每次模型调用后的 usage_live 事件 —— 带完整的 last/hit 明细
+// 两条路径走同一个 buildMeterLabel()，所以格式一致；只是来源 1 缺的字段不显示。
+function renderContextMeter(context) {
+  if (!ctxMeterEl) return;
+  const tokens = Number(context && context.tokens) || 0;
+  const window = Number(context && context.window) || 0;
+  if (!window) {
+    ctxMeterEl.hidden = true;
+    ctxMeterEl.textContent = "";
+    return;
+  }
+  const percent = typeof context.percent === "number"
+    ? context.percent
+    : Math.min(100, Math.round((tokens * 100) / window));
+  setContextMeter(
+    buildMeterLabel({
+      percent: percent,
+      tokens: tokens,
+      window: window,
+      input: typeof context.input === "number" ? context.input : undefined,
+      cached: typeof context.cached === "number" ? context.cached : undefined,
+      new: typeof context.new === "number" ? context.new : undefined,
+      hit: typeof context.hit === "number" ? context.hit : undefined,
+    }),
+    percent,
+    !!context.estimated
+  );
+}
+
+// 拼状态条内容。所有路径都用它，避免同一个位置出现两种格式。
+//
+//   in:267k cached:262k new:4.8k·hit:98%·ctx:26%(267k/1M)
+//   —— 切会话时没有 last-call 明细，只剩：
+//   ctx:26%(267k/1M)
+//
+// 标签后冒号不留空格，前三项（输入构成）用单空格连成一组，组间用·分隔。
+// 返回 HTML：输入构成那组包在 .seg-inputs 里，窄屏由 CSS 整组臧起来。
+function buildMeterLabel(info) {
+  const segments = [];
+  const inputs = [];
+  if (info && typeof info.input === "number") {
+    inputs.push("in:" + formatContextSize(info.input));
+  }
+  if (info && typeof info.cached === "number") {
+    inputs.push("cached:" + formatContextSize(info.cached));
+  }
+  if (info && typeof info.new === "number") {
+    inputs.push("new:" + formatContextSize(info.new));
+  }
+  if (inputs.length) {
+    segments.push('<span class="seg-inputs">' + inputs.join(" ") + "</span>");
+  }
+  if (info && typeof info.hit === "number") {
+    segments.push('<span class="seg-hit">hit:' + info.hit + "%</span>");
+  }
+  if (info && typeof info.percent === "number") {
+    let ctxPart = "ctx:" + info.percent + "%";
+    if (typeof info.tokens === "number" && typeof info.window === "number") {
+      ctxPart += "(" + formatContextSize(info.tokens)
+        + "/" + formatContextSize(info.window) + ")";
+    } else if (typeof info.tokens === "number") {
+      ctxPart += "(" + formatContextSize(info.tokens) + ")";
+    }
+    segments.push('<span class="seg-ctx">' + ctxPart + "</span>");
+  }
+  return segments.join('<span class="seg-sep">·</span>');
+}
+
+// 把后端拼好的 "[usage] last: ... | context=..." 拆成结构化的字段。
+function renderUsageMeter(text) {
+  if (!ctxMeterEl) return;
+  const raw = String(text || "").replace(/^\[usage\]\s*/, "").trim();
+  if (!raw) return;
+  const context = parseUsageContext(text);
+
+  // 完整行 80+ 字符太长，只取关键数字重建；信息一项不少。
+  const hit = raw.match(/hit=(\d+)%/);
+  const cached = raw.match(/cached=(\d+)/);
+  const input = raw.match(/input=(\d+)/);
+  const fresh = raw.match(/new=(\d+)/);
+  const label = buildMeterLabel({
+    hit: hit ? Number(hit[1]) : undefined,
+    cached: cached ? Number(cached[1]) : undefined,
+    input: input ? Number(input[1]) : undefined,
+    new: fresh ? Number(fresh[1]) : undefined,
+    percent: context ? context.percent : undefined,
+    tokens: context ? context.tokens : undefined,
+    window: context ? context.window : undefined,
+  });
+  if (!label) return;
+  setContextMeter(
+    label,
+    context ? context.percent : null,
+    context ? context.estimated : false
+  );
+}
+
+function setContextMeter(label, percent, estimated) {
+  if (!ctxMeterEl) return;
+  ctxMeterEl.hidden = false;
+  // label 里含分段 span（窄屏要整组藏起“输入构成”），所以用 innerHTML。
+  // 内容全部来自本地拼装、数字与固定标签，不包含用户输入。
+  ctxMeterEl.innerHTML = label;
+  ctxMeterEl.classList.toggle("estimate", !!estimated);
+  ctxMeterEl.classList.toggle(
+    "warn", typeof percent === "number" && percent >= 70 && percent < 90
+  );
+  ctxMeterEl.classList.toggle(
+    "danger", typeof percent === "number" && percent >= 90
+  );
+  // 不加悬停提示：状态条本身就是完整信息，颜色已经表示紧张程度。
+  ctxMeterEl.removeAttribute("title");
+}
+
+// 从 usage 文本里解析 context=1234/256000 (12%)
+function parseUsageContext(text) {
+  const match = String(text || "").match(/context=(~?)(\d+)\/(\d+)\s*\((\d+)%\)/);
+  if (!match) return null;
+  return {
+    estimated: match[1] === "~",
+    tokens: Number(match[2]),
+    window: Number(match[3]),
+    percent: Number(match[4]),
+  };
+}
+
 function renderModelInfo(info, context) {
+  if (ctxMeterEl && context && context.window) renderContextMeter(context);
   if (!info) {
     modelInfoEl.textContent = "";
     modelInfoEl.title = "";
@@ -23986,9 +24219,16 @@ async function send(explicitText) {
           finishStreamBubble();
           addLine("tool", "思考: " + event.text);
         }
+        else if (event.type === "usage_live") {
+          // 每次模型调用后到达的精简用量行（无 total），只刷新右上角状态条，
+          // 不往对话流里追加文本，免得每调一次工具就多一行噪声。
+          renderUsageMeter(event.text);
+        }
         else if (event.type === "usage") {
           finishStreamBubble();
           endStreamThinking();
+          // 整轮结束时的完整用量（含 total）：状态条和对话流都更新。
+          renderUsageMeter(event.text);
           addLine("tool", event.text);
         }
         else if (event.type === "approval") {
@@ -28170,7 +28410,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         reasoning_label = client.reasoning.label if client.reasoning is not None else "default"
         print(f"confirm: {'on' if workspace.confirm else 'off'} | thinking: {'on' if show_thinking else 'off'} | skills: {'on' if args.skills else 'off'} | schedule: {'on' if scheduler is not None else 'off'} | memory: {'on' if memory is not None else 'off'} | reasoning: {reasoning_label}")
-        print_help()
+        # 启动时不再打印整份命令清单，需要时用 /help 查看。
         enable_utf8_input()
         guard = InterruptGuard()
         last_activity = time.monotonic()

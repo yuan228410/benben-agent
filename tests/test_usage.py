@@ -55,15 +55,15 @@ print("events:", events)
 check("turn ok", ok)
 usage_text = next((t for k, t in events if k == "usage"), "")
 check("usage event", bool(usage_text), events)
-# 新格式：last / total 分段，含 hit 命中率、new 新增、calls 调用次数
-check("usage last segment", "last:" in usage_text, usage_text)
+# 新格式：第一段是最后一次调用（in/cached/new/hit），随后是 ctx 段。
+# 只调用一次模型时不再输出 total 段（它与第一段完全相同）。
+check("usage first segment", "in:10" in usage_text, usage_text)
 check("usage no turn label", "turn:" not in usage_text, usage_text)
-check("usage total segment", "total:" in usage_text, usage_text)
-check("usage calls", "calls=1" in usage_text, usage_text)
-check("usage hit rate", "hit=20%" in usage_text, usage_text)
-check("usage new field", "new=8" in usage_text, usage_text)
-check("usage total tokens", "tokens=15" in usage_text, usage_text)
-check("usage reasoning", "reasoning=3" in usage_text, usage_text)
+check("usage hit rate", "hit:20%" in usage_text, usage_text)
+check("usage cached field", "cached:2" in usage_text, usage_text)
+check("usage new field", "new:8" in usage_text, usage_text)
+# calls=1 时 total 省略，避免与第一段重复
+check("usage omits total for single call", "total:" not in usage_text, usage_text)
 check("warning event", any(k == "warning" and "截断" in t for k, t in events), events)
 check("usage totals", client.last_turn_usage == {
     "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
@@ -89,13 +89,13 @@ agent.run_turn(
 check(
     "usage context emitted",
     any(
-        k == "usage" and "| context=" in t and "/1000" in t and "%" in t
+        k == "usage" and "| ctx:" in t and "/1000" in t and "%" in t
         for k, t in events3
     ),
     events3,
 )
 context_text = next((t for k, t in events3 if k == "usage"), "")
-context_match = re.search(r"context=~?(\d+)/1000", context_text)
+context_match = re.search(r"ctx:\d+%\(~?(\d+)/1000\)", context_text)
 check(
     "usage context includes output",
     bool(context_match) and int(context_match.group(1)) > 10,
@@ -133,9 +133,77 @@ agent.run_turn(
     context_window=100,
 )
 clamped_text = next((t for k, t in clamped_events if k == "usage"), "")
-check("usage new clamped", "new=0" in clamped_text, clamped_text)
-check("usage hit clamped", "hit=100%" in clamped_text, clamped_text)
-check("usage total fallback", "tokens=12" in clamped_text, clamped_text)
+check("usage new clamped", "new:0" in clamped_text, clamped_text)
+check("usage hit clamped", "hit:100%" in clamped_text, clamped_text)
+# 单次调用不输出 total 段（旧的 tokens=12 断言不再适用）；
+# 改为确认单次调用时确实省略 total，且第一段完整。
+check("usage omits total for single call", "total:" not in clamped_text, clamped_text)
+check("usage ctx clamp ok", "ctx:12%" in clamped_text, clamped_text)
+
+
+# ---- 多轮：触发一次工具调用，确认 total 段出现且格式正确 ----
+class ToolCallingHandler(BaseHTTPRequestHandler):
+    """第一次返回 tool_calls，第二次返回普通回答。"""
+
+    calls = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        ToolCallingHandler.calls += 1
+        if ToolCallingHandler.calls == 1:
+            message = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "list_dir", "arguments": '{"path": "."}'},
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": "done"}
+            finish = "stop"
+        body = json.dumps({"choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish,
+        }], "usage": {
+            "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+            "prompt_tokens_details": {"cached_tokens": 2},
+        }}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+tool_server = HTTPServer(("127.0.0.1", 0), ToolCallingHandler)
+threading.Thread(target=tool_server.serve_forever, daemon=True).start()
+tool_client = agent.ChatClient(
+    f"http://127.0.0.1:{tool_server.server_port}/v1", "", "m", timeout=5
+)
+tool_events = []
+agent.run_turn(
+    tool_client,
+    ws,
+    [{"role": "user", "content": "list files"}],
+    3,
+    emit=lambda kind, text: tool_events.append((kind, text)),
+)
+multi_text = next((t for k, t in tool_events if k == "usage"), "")
+print("multi-turn usage:", multi_text)
+check("multi-call emits total", "total:" in multi_text, multi_text)
+check("multi-call reports count", "total: 2x" in multi_text, multi_text)
+check("multi-call total has in", "in:20" in multi_text, multi_text)
+check("multi-call total has out", "out:10" in multi_text, multi_text)
+check("multi-call total has tokens", "tokens:30" in multi_text, multi_text)
+check("multi-call omits zero reasoning", "reasoning:" not in multi_text, multi_text)
+tool_server.shutdown()
 
 # --- normalize_usage：不同网关的缓存字段都要归一化 ---
 n1 = agent.normalize_usage({

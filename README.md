@@ -272,7 +272,7 @@ Windows 乱码处理：
 | `--stream` / `--no-stream` | 交互终端开 | 流式读取模型输出；管道和脚本默认关闭，`--no-stream` 保留完整 Markdown 渲染 |
 | `--stream-idle-timeout` | `300` | 流式期间多少秒没有任何事件视为超时 |
 | `--stream-flush-ms` | `40` | CLI 流式刷新间隔；`0` 表示每块都刷新 |
-| `--debug-stream` / `--no-debug-stream` | 关 | 只向 stderr 打印 SSE 事件类型，不打印正文 |
+| `--debug-stream` / `--no-debug-stream` | 关 | 只向 stderr 打印 SSE 事件类型，不打印正文；除了 `content_delta` 等正文事件，还能看到 `usage_live`（每次模型调用后的实时用量，Web 端用它刷新上下文指示器） |
 | `--mcp` / `--no-mcp` | 关 | 是否启用配置文件里的 MCP 服务；默认关闭，需要显式开启 |
 | `--mcp-timeout` | `60` | MCP 请求超时（秒） |
 | `--skill` / `--no-skill` | 关 | 是否扫描 Agent Skills 并向模型暴露技能工具；默认关闭，需显式加 `--skill` |
@@ -838,19 +838,27 @@ Web 端点击「+ 新建」会打开工作空间对话框，默认填当前全�
 每次回答结束会在 stderr 打印一行用量（Web 端同样透传到聊天界面）：
 
 ```text
-[usage] last: input=2757 cached=2656 new=101 hit=96% | context=2848/1000000 (0%) | total: calls=2 input=5413 new=2571 cached=2842 hit=52% output=91 reasoning=0 tokens=5504
+[usage] in:2757 cached:2656 new:101 hit:96% | ctx:0%(2848/1000000)
+```
+
+调用过工具、一轮内发生多次模型调用时，末尾多一段累计：
+
+```text
+[usage] in:2757 cached:2656 new:101 hit:96% | ctx:0%(2848/1000000) | total: 2x in:5413 hit:52% out:91 tokens:5504
 ```
 
 | 段 | 字段 | 含义 |
 | --- | --- | --- |
-| `last:` | `input` / `cached` / `new` / `hit` | 最后一次模型调用的用量；`new = input - cached` 是实际新读入，`hit` 是缓存命中率 |
-| `context=` | `tokens/window (percent)` | 下一轮上下文占用；以最后一次真实 prompt token 为锚点，加上本轮输出和本地估算增量。没有可用基线时才回退到字符估算并带 `~` |
-| `total:` | `calls` / `input` / `cached` / `hit` / `output` / `reasoning` / `tokens` | 本次回答内所有模型调用的累计；`calls` 是调用次数，`tokens = input + output` |
+| 第一段 | `in` / `cached` / `new` / `hit` | 最后一次模型调用的用量；`new = in - cached` 是实际新读入，`hit` 是缓存命中率 |
+| `ctx:` | `percent%(tokens/window)` | 下一轮上下文占用；以最后一次真实 prompt token 为锚点，加上本轮输出和本地估算增量。没有可用基线时才回退到字符估算并带 `~`，如 `ctx:5%(~50000/1000000)` |
+| `total:` | `Nx` / `in` / `hit` / `out` / [`reasoning`] / `tokens` | 本次回答内所有模型调用的累计；`Nx` 是调用次数，`tokens = in + out` |
 
-- 只调用一次模型时 `last` 与 `total` 数值相同；触发工具调用后 `calls` 增长，`total` 是累加值；
-- `last` 是“最后一次调用”，不是整轮累计；
-- `hit` 里 `last` 反映最后一次调用命中情况，`total` 会被首轮冷启动拉低；
-- `reasoning` 是 `output` 的子集，不会再次计入 `tokens`；
+- **只调用一次模型时不打印 `total` 段**：它与第一段数值完全相同，省掉可缩短一半长度；
+- 第一段是“最后一次调用”，不是整轮累计；
+- `hit` 在第一段里反映最后一次调用命中情况，`total` 会被首轮冷启动拉低；
+- `reasoning` 为 `0` 时省略，非零时才出现在 `total` 段；
+- `reasoning` 是 `out` 的子集，不会再次计入 `tokens`；
+- 数值均为精确 token 数（不压缩成 `k`/`M`）；
 - `/context` 命令同样优先用真实值推算；压缩会重置基线并回退到估算。
 
 ### 压缩上下文
@@ -1489,6 +1497,7 @@ python3 benben-agent.py --web
 - 默认只监听 `127.0.0.1`，`--host` / `--port` 可改，`--port 0` 由系统分配；
 - 启动时生成随机 token，页面和所有 API 都必须带 token，重启后失效；`GET /healthz` 无 token 返回 `ok`，`GET /api/health` 带 token 返回版本、运行时间和状态；
 - `--version` 输出当前版本；`--check` / `--doctor` 用于部署前后自检；
+- 输入框上方有一行上下文指示器，显示 `in:267k cache:262k new:5k·hit:98%·ctx:26%(267k/1.0M)`：灰段是输入构成、青绿是缓存命中率、蓝段是上下文占用（≥70% 转橙、≥90% 转红加粗）。它跟着每次模型调用的 `usage_live` 事件实时刷新，不用等整轮结束；窗口宽度小于 900px 时自动隐去灰段，只留 `hit` 和 `ctx`；
 - 页面支持对话、新建/切换/移入回收站历史会话（新建时可选择工作空间）、上传图片；侧边栏会话区占据主要高度，连接和模型收在底部「连接与模型」折叠组里；
 - 侧边栏「帮助 / 指令」打开帮助弹窗，列出 Web 支持的斜杠命令和常用操作；输入 `/help` 也可以打开；
 - 会话列表支持右键置顶、归档、修改名称、导出 Markdown、移到回收站；支持搜索标题、uuid、模型和工作空间，默认每次加载 50 个，可继续加载；按「置顶 / 今天 / 昨天 / 日期」分组；
@@ -1576,7 +1585,7 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | --- | --- | --- |
 | `list_dir` | 列出目录内容 | 无 |
 | `read_file` | 按行读取文本文件（带行号，可分页） | 无 |
-| `read_file_outline` | 只返回文件结构骨架（类、函数及嵌套层级，带行号，不含函数体）。Python 用 `ast` 精确解析，Go/Rust/TS/JS/Java/Kotlin/C#/C/C++/PHP/Swift/Ruby 等按语言关键字匹配并用括号计数恢复嵌套；其余扩展名走通用回退 | 无 |
+| `read_file_outline` | 只返回文件结构骨架（类、函数及嵌套层级，带行号，不含函数体）。Python 用 `ast` 精确解析，Go/Rust/TS/JS/Java/Kotlin/C#/C/C++/PHP/Swift/Ruby 等按语言关键字匹配并用括号计数恢复嵌套；其余扩展名走通用回退。解析结果按 `(realpath, mtime, size)` 缓存（LRU，上限 128 个文件），重复读取同一文件直接命中，命中后仍按本次 `max_items` 重新切片 | 无 |
 | `search` | 按正则搜索文件内容，支持工作区外路径（`输出=content` 返回 `文件:行号: 内容`；`输出=lines` 只返回 `文件:行号`；`context=N` 附带匹配行前后 N 行，上限 20） | 无 |
 | `glob` | 按通配符查找文件，支持 `**` 递归 | 无 |
 | `write_file` | 创建或覆盖文件 | `--confirm` 时询问 |
@@ -1681,6 +1690,7 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 - 模型返回的工具调用参数如果不是合法 JSON，错误会作为工具结果回传给模型，让它自行修正。
 - 工具结果超过字符上限（默认 20000）时按内容压缩：先保住报错、警告和声明行，再用剩余预算覆盖首尾，跳过的部分标出省略行数；JSON 会解析后保留结构，压缩结果仍是合法 JSON。`--no-compress` 恢复成从头截断。`run_command` 在读取输出时就按上限截断，不会把整份输出缓冲进内存；文件读取默认最多 1000 行。
 - `search`/`glob` 是纯 Python 实现，跳过 `.git`、`node_modules`、`__pycache__` 等目录，支持工作区外路径；`glob` 在遍历阶段就剪枝并限制 10 秒扫描预算，`search` 跳过常见二进制扩展名，并限制单文件 2 MB、默认最多 20k 文件/200 MB/10 秒。
+- `read_file_outline` 的解析结果按 `(realpath, mtime_ns, size)` 做 LRU 缓存（上限 128 个文件，带锁）：`ast.parse` 在 3 万行的文件上要 0.5 秒左右，而模型经常反复看同一个文件，命中后降到 0.2 毫秒。缓存的是解析出的结构列表而非最终字符串，所以不同 `max_items` 不会串结果；文件一改，`mtime`/`size` 变化会自动重算。
 - 文件工具不再限制在工作区内：`write_file`、`edit_file` 可以写任意可写路径。默认 `--confirm` 关闭，Web 模式默认也不审批；需要写操作确认时请加 `--confirm`（Web 用 `--confirm --web`），不要让不可信的网页或文件内容驱动写系统配置。
 - `write_file`、`edit_file` 和 `/save` 使用同目录临时文件 + `os.replace` 原子替换，中断时不会留下半个文件。
 - 文件路径经过 `realpath` 规范化，相对路径按工作区根目录解析；绝对路径和 `~` 会原样解析到工作区之外，不会被限制在某个根目录内。
