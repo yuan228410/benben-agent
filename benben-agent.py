@@ -19529,6 +19529,14 @@ let jobBlocks = new Map();
 let jobPollTimers = new Map();
 let streamBubble = null;
 let streamText = "";
+// 流式渲染节流：模型逐 token 推送时不可能每个 token 都跑一次 Markdown 渲染
+// + innerHTML 重排，先按 ~60ms 节流，最后一次增量另用 setTimeout 补尾，
+// 保证停止叫时不会丢字。
+const STREAM_RENDER_INTERVAL = 60;
+let streamRenderTimer = null;
+let streamLastRender = 0;
+// 一段周期内内容没变就不用重渲染（增量可能是纯空白）
+let streamRenderedText = null;
 let streamThinkingEl = null;
 let autoScroll = true;
 let modelInfoProvider = "";
@@ -20079,27 +20087,120 @@ function safeImage(url) {
   return /^(https?:\/\/|data:image\/(?:png|jpeg|gif|webp|bmp);base64,)/i.test(url) ? url : null;
 }
 
-function renderInline(text) {
-  const parts = text.split(/(`[^`\n]+`)/g);
-  return parts.map((part) => {
-    if (part.length >= 2 && part.startsWith("`") && part.endsWith("`")) {
-      return "<code>" + part.slice(1, -1) + "</code>";
+// 把文本拆成“行内代码”和“普通文本”两类片段。
+function splitInlineCode(text) {
+  const segments = [];
+  let index = 0;
+  while (index < text.length) {
+    const open = text.indexOf("`", index);
+    if (open < 0) {
+      segments.push({ code: false, text: text.slice(index) });
+      break;
     }
-    return part
-      .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (match, alt, src) => {
-        const url = safeImage(src);
-        return url ? '<img src="' + url + '" alt="' + alt + '" loading="lazy" referrerpolicy="no-referrer">' : match;
-      })
-      .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, href) => {
-        return /^https?:\/\//i.test(href)
-          ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + "</a>"
-          : match;
-      })
-      .replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>")
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/~~([^~]+)~~/g, "<del>$1</del>")
-      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
-  }).join("");
+    if (open > index) segments.push({ code: false, text: text.slice(index, open) });
+    const close = text.indexOf("`", open + 1);
+    if (close < 0) {
+      // 没有配对的反引号，整段当普通文本
+      segments.push({ code: false, text: text.slice(open) });
+      break;
+    }
+    segments.push({ code: true, text: text.slice(open + 1, close) });
+    index = close + 1;
+  }
+  return segments;
+}
+
+// 行内代码先换成不透明占位符，等所有行内语法处理完再换回来。
+// 这样 **a `b` c** 这种“强调里包含行内代码”的写法才能整体生效：
+// 如果先按反引号切成几块分别处理，跨块的 **...** 永远配不上对，
+// 于是原文的星号会直接漏到页面上。
+const INLINE_CODE_OPEN = "\u0000C";
+const INLINE_CODE_CLOSE = "\u0001";
+
+function renderInline(text) {
+  if (text.indexOf("\u0000") >= 0) {
+    // 文本里本来就有 NUL，占位符方案不安全，退回“只处理行内代码”的老行为
+    return splitInlineCode(text)
+      .map((seg) => (seg.code ? "<code>" + seg.text + "</code>" : seg.text))
+      .join("");
+  }
+  const codes = [];
+  const flat = splitInlineCode(text)
+    .map((seg) => {
+      if (!seg.code) return seg.text;
+      codes.push("<code>" + seg.text + "</code>");
+      return INLINE_CODE_OPEN + (codes.length - 1) + INLINE_CODE_CLOSE;
+    })
+    .join("");
+  const html = flat
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (match, alt, src) => {
+      const url = safeImage(src);
+      return url ? '<img src="' + url + '" alt="' + alt + '" loading="lazy" referrerpolicy="no-referrer">' : match;
+    })
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, href) => {
+      return /^https?:\/\//i.test(href)
+        ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + "</a>"
+        : match;
+    })
+    .replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  return html.replace(
+    /\u0000C(\d+)\u0001/g,
+    (match, index) => codes[Number(index)] || match
+  );
+}
+
+// 引用块里的内容单独处理：纯文本行沿用原来的渲染方式（与改动前输出一致），
+// 但 > - 项目 这种引用内的列表要出真正的 <ul>/<ol>，不能把 "- " 原样吐在页面上。
+function renderQuoteBody(quoteLines) {
+  const out = [];
+  let list = null;
+  let textRows = [];
+  const flushList = () => {
+    if (list) {
+      out.push("<" + list.tag + ">" + list.items.join("") + "</" + list.tag + ">");
+      list = null;
+    }
+  };
+  const flushText = () => {
+    if (textRows.length) {
+      out.push(textRows.map((row) => renderInline(escapeHtml(row))).join("<br>"));
+      textRows = [];
+    }
+  };
+  for (const raw of quoteLines) {
+    let match;
+    if ((match = raw.match(/^\s*[-*+]\s+(.*)$/))) {
+      flushText();
+      if (!list || list.tag !== "ul") {
+        flushList();
+        list = { tag: "ul", items: [] };
+      }
+      list.items.push("<li>" + renderInline(escapeHtml(match[1])) + "</li>");
+      continue;
+    }
+    if ((match = raw.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      flushText();
+      if (!list || list.tag !== "ol") {
+        flushList();
+        list = { tag: "ol", items: [] };
+      }
+      list.items.push("<li>" + renderInline(escapeHtml(match[1])) + "</li>");
+      continue;
+    }
+    if (!raw.trim()) {
+      flushText();
+      flushList();
+      continue;
+    }
+    flushList();
+    textRows.push(raw);
+  }
+  flushText();
+  flushList();
+  return out.join("");
 }
 
 function tableCells(line) {
@@ -20179,8 +20280,12 @@ function renderMarkdown(text) {
       continue;
     }
     if ((match = line.match(/^\s*>\s?(.*)$/))) {
-      output.push("<blockquote>" + renderInline(escapeHtml(match[1])) + "</blockquote>");
-      i++;
+      const quoteLines = [];
+      while (i < lines.length && (match = lines[i].match(/^\s*>\s?(.*)$/))) {
+        quoteLines.push(match[1]);
+        i++;
+      }
+      output.push("<blockquote>" + renderQuoteBody(quoteLines) + "</blockquote>");
       continue;
     }
     if ((match = line.match(/^\s*[-*+]\s+(.*)$/))) {
@@ -20216,6 +20321,7 @@ function beginStreamBubble() {
   endStreamThinking();
   finishStreamBubble();
   streamText = "";
+  streamRenderedText = null;
   const div = document.createElement("div");
   div.className = "msg assistant";
   logEl.appendChild(div);
@@ -20223,14 +20329,59 @@ function beginStreamBubble() {
   scrollLog();
 }
 
-function appendStreamDelta(text) {
-  if (!streamBubble) beginStreamBubble();
-  streamText += text;
-  if (streamBubble) streamBubble.textContent = streamText;
+// 把当前累积的 streamText 渲染成 Markdown 写进气泡。
+// 注意：未闭合的语法会先原样显示，等闭合后自动修正（例如流式中途的 ** 星号）。
+function paintStreamBubble() {
+  if (!streamBubble) return;
+  if (streamRenderedText === streamText) return;
+  streamRenderedText = streamText;
+  streamBubble.innerHTML = renderMarkdown(streamText);
+  streamLastRender = Date.now();
   scrollLog();
 }
 
+function flushStreamRender() {
+  if (streamRenderTimer !== null) {
+    clearTimeout(streamRenderTimer);
+    streamRenderTimer = null;
+  }
+  paintStreamBubble();
+}
+
+// 清掉待执行的节流帧（切会话 / 发新消息时用），避免旧定时器把内容写到新气泡上。
+function cancelStreamRender() {
+  if (streamRenderTimer !== null) {
+    clearTimeout(streamRenderTimer);
+    streamRenderTimer = null;
+  }
+  streamRenderedText = null;
+}
+
+function appendStreamDelta(text) {
+  if (!streamBubble) beginStreamBubble();
+  streamText += text;
+  if (!streamBubble) return;
+  // 首帧立即上屏，避免用户盯着空白等一个节流周期
+  const now = Date.now();
+  const elapsed = now - streamLastRender;
+  if (elapsed >= STREAM_RENDER_INTERVAL) {
+    flushStreamRender();
+    return;
+  }
+  // 定时器只负责“最后一次增量后补一帧”，不每收到一个 token 就重置
+  if (streamRenderTimer === null) {
+    streamRenderTimer = setTimeout(() => {
+      streamRenderTimer = null;
+      paintStreamBubble();
+    }, STREAM_RENDER_INTERVAL - elapsed);
+  }
+}
+
 function finishStreamBubble(fullText) {
+  if (streamRenderTimer !== null) {
+    clearTimeout(streamRenderTimer);
+    streamRenderTimer = null;
+  }
   if (!streamBubble) {
     if (typeof fullText === "string" && fullText.length) addMarkdown(fullText);
     return;
@@ -20239,6 +20390,7 @@ function finishStreamBubble(fullText) {
   streamBubble.innerHTML = renderMarkdown(value);
   streamBubble = null;
   streamText = "";
+  streamRenderedText = null;
   scrollLog();
 }
 
@@ -20348,6 +20500,7 @@ function renderHistory(messages) {
   logEl.textContent = "";
   lastToolDetail = null;
   toolDetailIndex = new Map();
+  cancelStreamRender();
   streamBubble = null;
   streamText = "";
   streamThinkingEl = null;
@@ -23769,6 +23922,7 @@ async function send(explicitText) {
   lastToolDetail = null;
   // 新一轮从空的索引开始：历史里的 callId 不该再被这一轮的 tool_result 命中。
   toolDetailIndex = new Map();
+  cancelStreamRender();
   streamBubble = null;
   streamText = "";
   streamThinkingEl = null;
