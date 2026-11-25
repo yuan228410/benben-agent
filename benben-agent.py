@@ -19421,7 +19421,18 @@ function watchToolExpand(details) {
 }
 
 function resetLiveOutput() {
-  liveOut = { lines: [], pre: null, detail: null };
+  liveOut = { lines: [], pre: null, detail: null, summary: null, base: "" };
+}
+
+// 把运行状态写回折叠标题行：折叠时也能看出在跑、跑了多久、出了多少行。
+function updateLiveSummary() {
+  if (!liveOut.summary) return;
+  const n = liveOut.lines.length;
+  const bits = [];
+  if (liveOut.elapsed) bits.push("运行中 " + liveOut.elapsed + "s");
+  if (n) bits.push(n + " 行");
+  liveOut.summary.textContent = liveOut.base +
+    (bits.length ? "  ·  " + bits.join(" · ") : "");
 }
 
 function renderLiveOutput(text) {
@@ -19432,7 +19443,6 @@ function renderLiveOutput(text) {
     pre.className = "tool-live";
     liveOut.detail.appendChild(pre);
     liveOut.pre = pre;
-    if (liveOut.detail.open === false) liveOut.detail.open = true;
   }
   const incoming = String(text || "").split("\n");
   for (const line of incoming) {
@@ -19444,6 +19454,7 @@ function renderLiveOutput(text) {
   }
   liveOut.pre.textContent = liveOut.lines.join("\n");
   liveOut.pre.scrollTop = liveOut.pre.scrollHeight;
+  updateLiveSummary();
   if (!historyFragment) scrollLog(true);
 }
 
@@ -19454,13 +19465,17 @@ function addToolDetail(text, callId) {
   if (callId) details.dataset.callId = callId;
   const summary = document.createElement("summary");
   const firstLine = String(text || "(empty)").split("\n")[0];
-  summary.textContent = firstLine.length > 140 ? firstLine.slice(0, 137) + "..." : firstLine;
+  const title = firstLine.length > 140 ? firstLine.slice(0, 137) + "..." : firstLine;
+  summary.textContent = title;
   details.appendChild(summary);
   watchToolExpand(details);
   queueToolPart(details, String(text || "(empty)"), "");
   (historyFragment || logEl).appendChild(details);
   if (callId) toolDetailIndex.set(callId, details);
   if (!historyFragment) scrollLog(true);
+  // 记录基准标题，后续实时状态接在后面，不覆盖工具名和参数。
+  liveOut.base = title;
+  liveOut.summary = summary;
   lastToolDetail = details;
 }
 
@@ -23384,10 +23399,15 @@ async function send(explicitText) {
           renderLiveOutput(event.text);
         }
         else if (event.type === "command_tick") {
-          renderLiveOutput("still running · " + event.text + "s");
+          // 心跳只刷新标题的时间，不占实时窗口的行。
+          if (!liveOut.detail) liveOut.detail = lastToolDetail;
+          liveOut.elapsed = event.text;
+          updateLiveSummary();
         }
         else if (event.type === "tool_result") {
           finishStreamBubble();
+          // 命令结束：把标题恢复成工具名和参数，不再显示运行中。
+          if (liveOut.summary) liveOut.summary.textContent = liveOut.base;
           resetLiveOutput();
           addToolResult(event.text);
         }
