@@ -213,28 +213,37 @@ for (const c of [
     title: meter.title,
   });
 }
-console.log(JSON.stringify(out));
+fs.writeFileSync(process.argv[3], JSON.stringify(out), "utf8");
 """,
         encoding="utf-8",
     )
-    result = subprocess.run(
-        [node, runner_path, str(Path(runner) / "benben-web.js")],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
     # 上面把 js 当参数传，需要先落盘
     Path(str(Path(runner) / "benben-web.js")).write_text(js, encoding="utf-8")
+    # 结果走文件而不是 stdout：Windows 下 stdout 管道要跨一道编码，
+    # 解码偏了就会把非 ASCII 的分隔符 "·" 换成 U+FFFD，导到
+    # “只有那一条断言失败、其它 ASCII 断言全过” 的偶发假失败。
+    out_path = Path(runner) / "out.json"
     result = subprocess.run(
-        [node, runner_path, str(Path(runner) / "benben-web.js")],
+        [
+            node,
+            runner_path,
+            str(Path(runner) / "benben-web.js"),
+            str(out_path),
+        ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
-    if result.returncode != 0:
-        check("meter runner executes", False, (result.stdout + result.stderr)[-1200:])
+    if result.returncode != 0 or not out_path.exists():
+        check(
+            "meter runner executes",
+            False,
+            (result.stdout + result.stderr)[-1200:] or "no output file",
+        )
     else:
-        out = json.loads(result.stdout)
+        out = json.loads(out_path.read_text(encoding="utf-8"))
         parsed = out["parsed"]
         check("parse context line", parsed[0] == {
             "estimated": False, "tokens": 12345, "window": 256000, "percent": 4,

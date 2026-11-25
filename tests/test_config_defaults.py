@@ -180,15 +180,6 @@ full_config["defaults"].update({
     },
     "command_timeout": 15,
     "max_command_timeout": 120,
-    "background_after_seconds": 5,
-    "max_background_jobs": 4,
-    "background_output_chars": 3000,
-    "job_follow": False,
-    "job_poll_seconds": 7,
-    "job_follow_lines": 9,
-    "job_log": False,
-    "job_log_dir": "/tmp/jobs",
-    "job_log_keep": 11,
     "stream": False,
     "stream_idle_timeout": 123,
     "stream_flush_ms": 9,
@@ -233,15 +224,6 @@ check("all idle percent", full.idle_compact_min_percent == 30, full.idle_compact
 check("all idle messages", full.idle_compact_min_messages == 8, full.idle_compact_min_messages)
 check("all command timeout", full.command_timeout == 15, full.command_timeout)
 check("all max command", full.max_command_timeout == 120, full.max_command_timeout)
-check("all background", full.background_after_seconds == 5, full.background_after_seconds)
-check("all max jobs", full.max_background_jobs == 4, full.max_background_jobs)
-check("all output chars", full.background_output_chars == 3000, full.background_output_chars)
-check("all follow", full.job_follow is False, full.job_follow)
-check("all poll", full.job_poll_seconds == 7, full.job_poll_seconds)
-check("all lines", full.job_follow_lines == 9, full.job_follow_lines)
-check("all job log", full.job_log is False, full.job_log)
-check("all job dir", full.job_log_dir == "/tmp/jobs", full.job_log_dir)
-check("all keep", full.job_log_keep == 11, full.job_log_keep)
 check("all stream", full.stream is False, full.stream)
 check("all idle timeout", full.stream_idle_timeout == 123, full.stream_idle_timeout)
 check("all flush", full.stream_flush_ms == 9, full.stream_flush_ms)

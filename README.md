@@ -263,12 +263,6 @@ Windows 乱码处理：
 | `--shell` | `auto` | shell：`auto`、`pwsh`、`powershell`、`git-bash`、`cmd`、`bash`、`zsh`、`sh` 或绝对路径 |
 | `--no-shell-fallback` | 关 | 当前 shell 不认识命令时，不自动尝试其他 shell |
 | `--command-timeout` / `--max-command-timeout` | `60` / `600` | 命令默认超时和最大允许超时 |
-| `--background-after` / `--no-auto-background` | `30` | 前台命令超过多少秒自动转后台；`--no-auto-background` 关闭 |
-| `--max-background-jobs` / `--background-output-chars` | `8` / `20000` | 后台任务并发上限和每路输出保留字符数 |
-| `--job-follow` / `--no-job-follow` | 开 | 后台任务是否默认跟随输出 |
-| `--job-poll-seconds` / `--job-follow-lines` | `2` / `5` | 跟随轮询间隔和每次显示行数 |
-| `--job-log` / `--no-job-log` | 开 | 是否把后台任务输出写入日志文件 |
-| `--job-log-dir` / `--job-log-keep` | `~/.benben-agent/jobs` / `20` | 日志目录和保留数量 |
 | `--stream` / `--no-stream` | 交互终端开 | 流式读取模型输出；管道和脚本默认关闭，`--no-stream` 保留完整 Markdown 渲染 |
 | `--stream-idle-timeout` | `300` | 流式期间多少秒没有任何事件视为超时 |
 | `--stream-flush-ms` | `40` | CLI 流式刷新间隔；`0` 表示每块都刷新 |
@@ -367,15 +361,6 @@ Windows 乱码处理：
     },
     "command_timeout": 60,
     "max_command_timeout": 600,
-    "background_after_seconds": 30,
-    "max_background_jobs": 8,
-    "background_output_chars": 20000,
-    "job_follow": true,
-    "job_poll_seconds": 2,
-    "job_follow_lines": 5,
-    "job_log": true,
-    "job_log_dir": null,
-    "job_log_keep": 20,
     "stream": true,
     "stream_idle_timeout": 300,
     "stream_flush_ms": 40,
@@ -824,7 +809,7 @@ python3 benben-agent.py -c "继续刚才的任务"            # 最新会话 + �
 - 必须是已存在的目录；
 - 不指定时使用当前全局工作空间（启动时的 `--cwd` 或配置文件里的 `cwd`）；
 - 切换工作空间会清空当前会话历史，下一次消息写入新会话文件；
-- 旧工作空间里仍在运行的后台任务会继续运行，并给出提示；
+- 切换工作空间时，旧工作空间里还在跑的命令会被终止；
 - `/config save` 会把当前工作空间保存为默认 `cwd`。
 
 Web 端点击「+ 新建」会打开工作空间对话框，默认填当前全局工作空间，也可以从最近工作空间里选择或手动输入。Web 输入 `/session new <路径>` 或 `/workspace <路径>` 行为相同。
@@ -1357,47 +1342,39 @@ BENBEN_DEBUG_STREAM=1 python3 benben-agent.py --stream ...
 
 只输出事件类型，不输出正文。
 
-## 后台任务与跟随
+## 命令执行
 
-耗时命令不会一直阻塞会话。`run_command` 支持 `background` 和 `follow`：
+`run_command` 是同步的：命令跑完才返回，或者超时/被停止而中断。
 
 ```json
 {
   "command": "npm run build",
-  "timeout_seconds": 600,
-  "background": true,
-  "follow": true
+  "timeout_seconds": 600
 }
 ```
 
-- 前台命令超过 `background_after_seconds`（默认 30 秒）会自动转后台
-- 交互式 CLI 和 Web 默认跟随
-- 每 2 秒读取一次新增输出，只显示最近 5 行
-- 输出过多时显示省略行数
-- 跟随期间不调用模型，不消耗模型 token
-- 任务结束后返回退出码、耗时和输出尾部
-- 成功显示最后 5 行，失败显示最后 10 行
-- 完整输出同时写入 `~/.benben-agent/jobs/<job-id>.log`
-- `/jobs clean` 删除已完成任务和对应日志
-- 日志保留数量默认 20，可用 `--job-log-keep` 调整
+- 必须传 `timeout_seconds`，上限由 `--max-command-timeout`（默认 600 秒）决定
+- 超时后杀掉整个进程树，并返回已经捕获的部分输出
+- 输出每路最多保留 20000 字符，超出会截断
+- 当前 shell 不认识命令时，会自动尝试其他已安装的 shell（`--no-shell-fallback` 关闭）
+- Ctrl+C 或网页「停止」会杀掉整个进程树，返回 `[cancelled]` 和已捕获的部分输出
 
-CLI/Web 指令：
+运行期间会显示实时进度，不必再猜是慢还是卡死：
 
-```text
-/jobs                       列出任务
-/jobs status <id>           查看状态和最近输出
-/jobs output <id> [n]       查看输出
-/jobs follow <id>           开始跟随
-/jobs detach <id>           停止跟随，任务继续
-/jobs stop <id>             取消任务，杀进程树
-/jobs clean                 清理已完成任务
-/jobs poll 2                设置轮询间隔
-/jobs lines 5               设置跟随显示行数
-```
+- **有输出时**逐块推给终端或网页（默认节流 200ms）；终端里最多保留 100 行并原地重绘，
+  新行挤掉旧行，不会把对话刷走；重定向到管道或日志文件时改为逐行追加，不丢弃任何行
+- **没有输出时**每 5 秒报一次 `still running · Ns`
+- 实时预览单独限流 8000 字符；最终结果仍是完整的 20000 字符
 
-Ctrl+C 或 Web「停止跟随」只停止观察，后台任务继续运行。取消任务要使用 `/jobs stop` 或 `job_cancel`。agent 退出时会停止所有后台任务；后台任务不跨进程持久化。
+这三个参数都可调（命令行或 `config.json` 的 `defaults`，网页设置面板同样可改）：
 
-Web 端启动后台任务时会显示任务块，包含最近输出、「停止跟随」和「取消任务」按钮。
+| 参数 | 默认 | 范围 | 说明 |
+| --- | --- | --- | --- |
+| `--live-flush-ms` / `live_flush_ms` | `200` | 0–5000 | 推给前端的节流间隔，`0` 表示每块都推 |
+| `--live-max-lines` / `live_max_lines` | `100` | 1–1000 | 实时输出窗口保留的行数 |
+| `--live-tick-seconds` / `live_tick_seconds` | `5` | 1–3600 | 静默命令的心跳间隔 |
+
+需要跑很久的任务请把 `timeout_seconds` 设得足够大；没有后台模式。
 
 ## 长期记忆与情景记忆
 
@@ -1511,7 +1488,7 @@ python3 benben-agent.py --web
 - 在输入框直接输入 `/compact` 或 `/compact 3` 也会被前端拦截；
 - 压缩摘要渲染为对话末尾的虚线可展开块，标题显示保留回合数（如「上下文已压缩 · 保留最近 2 轮」）；点完「压缩」会自动展开并滚到可视区域，加载历史时默认折叠；
 - 侧边栏「工具与帮助」里显示「压缩设置」，上两块配置自动压缩和空闲压缩的档位、阈值、目标百分比和保留回合数，底部「工具输出压缩」配置工具输出是否按内容压缩和字符上限；改动全部立即生效，可勾选同时写入配置文件；聊天框输入 `/compact auto` 也会打开这个设置；
-- 侧边栏「工具与帮助 → 默认设置」可以编辑 `config.json` 的 `defaults`：常用开关、生成参数、Shell、后台任务、技能、定时、记忆、MCP、Web 和 CLI 行为；保存后立即生效项会更新当前进程，其余下次启动生效；
+- 侧边栏「工具与帮助 → 默认设置」可以编辑 `config.json` 的 `defaults`：常用开关、生成参数、Shell、技能、定时、记忆、MCP、Web 和 CLI 行为；保存后立即生效项会更新当前进程，其余下次启动生效；
 - 双击对话里的图片可以全屏查看，点击遮罩或按 Esc 关闭；
 - 历史会话里的图片默认只显示「点击加载」占位，点击后才请求 `/api/image` 并打开灯箱，避免首屏传输大量 base64；刚上传的图片仍直接显示本地预览；
 - Web 默认免确认；加 `--confirm --web` 后，写文件、修改状态的命令和技能脚本会弹出审批框。`run_command` 是否可用仍由 `--no-shell` 决定；shell 开启时启动会打印提醒；
@@ -1566,7 +1543,6 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `/shell` `/shell 名称` | 查看或切换 shell |
 | `/session ...` | 会话列表、切换、重命名、导出、删除 |
 | `/workspace ...` | 查看或切换工作空间 |
-| `/jobs ...` | 后台任务列表、状态、输出、跟随、停止 |
 | `/mcp ...` | MCP 服务状态、工具列表、重启服务 |
 | `/plan ...` | 计划模式开关和守卫档位 |
 | `/skill` | 打开技能管理；`/skill create`、`/skill install` 直达表单 |
@@ -1595,10 +1571,6 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `run_command` | 在工作区执行 shell 命令（可用 `shell` 参数指定本次用哪个 shell） | `--confirm` 时询问（只读命令不问） |
 | `list_shells` | 列出检测到的 shell 和当前 shell | 无 |
 | `switch_shell` | 切换默认 shell | 无 |
-| `job_status` | 查看后台任务状态和最近输出 | 无 |
-| `job_output` | 读取后台任务的输出 | 无 |
-| `job_cancel` | 取消后台任务并杀进程树 | 计划模式守卫 |
-| `list_jobs` | 列出后台任务 | 无 |
 | `submit_plan` | 提交实施计划并等待用户批准（仅计划模式下提供） | 无 |
 | `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 无 |
 | `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 无 |

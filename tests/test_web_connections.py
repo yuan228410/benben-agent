@@ -229,8 +229,7 @@ try:
         and 'id="help-modal"' in html
         and "openHelpModal" in html
         and "/session" in html
-        and "/compact" in html
-        and "/jobs" in html,
+        and "/compact" in html,
     )
     check(
         "web html model info modal",
@@ -317,14 +316,12 @@ try:
     models_payload = api_json("/api/models")
     check("models info", models_payload["info"]["context_window"] == 256000, models_payload.get("info"))
 
-    jobs_payload = api_json("/api/jobs")
-    check("jobs list empty", jobs_payload["jobs"] == [], jobs_payload)
-    job_config = api_json("/api/jobs/config", {"poll_seconds": 3, "follow_lines": 4})
-    check("jobs poll config", job_config["poll_seconds"] == 3, job_config)
-    check("jobs lines config", job_config["follow_lines"] == 4, job_config)
-    code, _ = api("/api/jobs/status", {"id": "job-nope"}, expect_error=True)
-    check("jobs unknown id", code == 404, code)
-    check("web html job block", "job-block" in html and "handleJobEvent" in html)
+    check(
+        "web html no background jobs",
+        "job-block" not in html
+        and "handleJobEvent" not in html
+        and "/api/jobs" not in html,
+    )
     check(
         "web html stream",
         "beginStreamBubble" in html

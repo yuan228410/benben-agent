@@ -176,7 +176,6 @@ try:
             "stream": False,
             "plan_mode": False,
             "plan_guard": "off",
-            "job_poll_seconds": 3,
             "skills": True,
             "max_steps": 50,
             "web": {"host": "127.0.0.1", "port": 9999},
@@ -186,7 +185,6 @@ try:
     check("settings saved steps", saved["defaults"]["max_steps"] == 50, saved)
     check("settings applied confirm", "confirm" in saved["applied"], saved)
     check("settings applied stream", "stream" in saved["applied"], saved)
-    check("settings applied poll", "job_poll_seconds" in saved["applied"], saved)
     check("settings restart skills", "skills" in saved["restart_required"], saved)
     check("settings restart steps", "max_steps" in saved["restart_required"], saved)
     check("settings runtime confirm true", saved["runtime"]["confirm"] is True, saved["runtime"])

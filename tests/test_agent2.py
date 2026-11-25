@@ -333,8 +333,7 @@ check(
     "all tools sent",
     messages[-1]["content"] == (
         "done:list_dir,read_file,read_files,read_file_outline,search,glob,write_file,edit_file,"
-        "multi_edit,run_command,list_shells,switch_shell,job_status,job_output,"
-        "job_cancel,list_jobs"
+        "multi_edit,run_command,list_shells,switch_shell"
     ),
     messages[-1],
 )
