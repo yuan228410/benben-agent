@@ -49,8 +49,9 @@ check("list_shells kept when no shell", "list_shells" in no_shell_tools, no_shel
 write("edit/a.txt", "alpha\nbeta\ngamma\n")
 check(
     "edit unique",
-    ws.edit_file("edit/a.txt", "beta", "BETA")
-    == f"edited {os.path.join('edit', 'a.txt')} (1 replacement)",
+    ws.edit_file("edit/a.txt", "beta", "BETA").startswith(
+        f"edited {os.path.join('edit', 'a.txt')} (1 replacement)"
+    ),
 )
 check("edit applied", open(os.path.join(base, "edit/a.txt")).read() == "alpha\nBETA\ngamma\n")
 try:
@@ -331,7 +332,7 @@ check("run_turn with edit_file", ok and "GAMMA" in open(os.path.join(base, "edit
 check(
     "all tools sent",
     messages[-1]["content"] == (
-        "done:list_dir,read_file,read_file_outline,search,glob,write_file,edit_file,"
+        "done:list_dir,read_file,read_files,read_file_outline,search,glob,write_file,edit_file,"
         "multi_edit,run_command,list_shells,switch_shell,job_status,job_output,"
         "job_cancel,list_jobs"
     ),

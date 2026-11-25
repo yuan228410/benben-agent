@@ -48,6 +48,12 @@ python3 tests/test_web_js.py
 python3 tests/test_web_approval.py
 python3 tests/test_settings_web.py
 python3 tests/test_plan_sessions_web.py
+python3 tests/test_context_meter.py
+python3 tests/test_outline_cache.py
+python3 tests/test_read_files_diff.py
+python3 tests/test_web_hardening.py
+python3 tests/test_web_markdown.py
+python3 tests/test_web_stream_render.py
 ```
 
 测试会：
@@ -99,3 +105,15 @@ python3 tests/test_plan_sessions_web.py
 | `test_session_features.py` | 会话置顶、归档、大小、CLI 列表标记 |
 | `test_memory_cleanup.py` | 长期记忆去重、按数量/时间清理、情景记忆清理 |
 | `test_mcp.py` | MCP stdio/HTTP 握手、工具注入、增删改、启停、资源/提示词、只读过滤、计划门控、配置持久化、CLI 向导、端到端调用 |
+| `test_outline.py` | `read_file_outline` 多语言解析：Python `ast` 嵌套、Go/Rust/TS/JS 等括号计数、通用回退、截断 |
+| `test_outline_cache.py` | outline 解析缓存：命中后结果一致、不同 `max_items` 不串、文件改动失效、LRU 上限、并发安全、二进制拒绝 |
+| `test_read_files_diff.py` | `read_files` 多文件读取（共享行预算、单文件出错不中断、数量上限）与 `edit_file`/`multi_edit` 的 unified diff 回显 |
+| `test_list_dir.py` | `list_dir` 排序、大小/条目数显示、隐藏文件、非目录报错 |
+| `test_multi_edit.py` | `multi_edit` 跨文件原子提交、顺序应用、失败全回滚 |
+| `test_search_context.py` | `search` 的 `context=N` 前后行、`output=lines`、`max_results` 上限 |
+| `test_compress.py` | 工具输出压缩：保留报错/警告/声明行、JSON 结构、`--no-compress` 回退 |
+| `test_web_compress.py` | Web 工具输出压缩设置、GET/POST、范围校验、持久化 |
+| `test_web_markdown.py` | Web Markdown 渲染：基础语法、行内代码跨边界的强调/链接、引用块内列表、HTML 转义 |
+| `test_web_stream_render.py` | 流式增量渲染：中途出现标题/加粗/列表/表格/代码块、节流、结束时内容完整、取消清理 |
+| `test_context_meter.py` | 输入框上方的上下文指示器：格式、分段着色、窄屏降级、无悬浮、`usage_live` 驱动实时刷新 |
+| `test_web_hardening.py` | Web 健壮性：`Content-Length` 撒谎/负数不挂死线程、半开连接不拖死服务、顶层异常返回 500 |

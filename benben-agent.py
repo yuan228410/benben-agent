@@ -264,6 +264,7 @@ import codecs
 import copy
 from collections import deque, OrderedDict
 from datetime import datetime, timedelta
+import difflib
 import fnmatch
 import getpass
 import glob as glob_mod
@@ -380,6 +381,13 @@ MAX_TOOL_OUTPUT = 20_000
 # usual file size so a normal module fits in one call, while still bounding
 # what one tool result can put into the context window.
 MAX_FILE_LINES = 3_000
+# 一次 read_files 最多读多少个文件。
+MAX_READ_FILES = 20
+# 不传 limit 时每个文件至少给这么多行（短文件不会因为均分而被砍得太短）。
+READ_FILES_MIN_LINES = 100
+# 编辑完成后回显的 unified diff 参数：上下各保留几行上下文、最多多少字符。
+DIFF_CONTEXT_LINES = 3
+DIFF_MAX_CHARS = 4_000
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGES = 4
 MAX_SEARCH_FILE = 2_000_000
@@ -444,6 +452,9 @@ AUTO_COMPACT_LEVELS = tuple(AUTO_COMPACT_PRESETS)
 REASONING_LEVELS = ("off", "minimal", "low", "medium", "high", "max")
 WEB_PORT = 8765
 WEB_MAX_BODY = 60 * 1024 * 1024
+# 一个请求体最多允许多久读完。Content-Length 撒谎（声明很大却不发）
+# 或客户端半途断掉时，靠它把 handler 线程放出来，避免线程泄漏。
+WEB_BODY_TIMEOUT = float(os.environ.get("BENBEN_WEB_BODY_TIMEOUT", "30"))
 try:
     WEB_APPROVAL_TIMEOUT = max(
         1.0,
@@ -451,7 +462,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.29.0"
+AGENT_VERSION = "0.30.0"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -9249,7 +9260,7 @@ LIST_SHELLS_SCHEMA: dict[str, Any] = {
     },
 }
 
-READ_ONLY_TOOL_NAMES = frozenset({"list_dir", "read_file", "read_file_outline", "search", "glob"})
+READ_ONLY_TOOL_NAMES = frozenset({"list_dir", "read_file", "read_files", "read_file_outline", "search", "glob"})
 SCHEDULE_TOOL_NAMES = frozenset({
     "create_schedule",
     "list_schedules",
@@ -9753,8 +9764,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "read_file",
             "description": (
                 "Read a text file inside the workspace, with line numbers. "
-                "One call can return up to the maximum line count, so read as much as "
-                "you need at once instead of paging through the file in many small reads."
+                f"One call returns up to {MAX_FILE_LINES} lines, so read as much as "
+                "you need at once instead of paging through the file in many small reads. "
+                "To look at several files at once, use read_files instead of calling "
+                "this repeatedly."
             ),
             "parameters": {
                 "type": "object",
@@ -9777,6 +9790,47 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_files",
+            "description": (
+                "Read several text files in one call, each shown with its own header. "
+                "Use this instead of calling read_file repeatedly when you want to look "
+                "at multiple files: each separate tool call costs an extra model turn. "
+                f"At most {MAX_READ_FILES} paths per call, and {MAX_FILE_LINES} lines in "
+                "total across all files. A failing path reports its error inline without "
+                "aborting the others."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "File paths relative to the workspace root.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "First line to read in each file, 1-based. Default 1.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum number of lines per file. Default: split the "
+                            f"{MAX_FILE_LINES}-line total budget evenly across the "
+                            f"paths (at least {READ_FILES_MIN_LINES} lines each)."
+                        ),
+                    },
+                    "numbered": {
+                        "type": "boolean",
+                        "description": "Prefix each line with its line number. Default true.",
+                    },
+                },
+                "required": ["paths"],
             },
         },
     },
@@ -12869,6 +12923,7 @@ class Workspace:
         offset: int = 1,
         limit: int = MAX_FILE_LINES,
         numbered: bool = True,
+        header: bool = False,
     ) -> str:
         full = self._resolve(path)
         if not os.path.isfile(full):
@@ -12897,7 +12952,70 @@ class Workspace:
         result = "\n".join(rendered)
         if more:
             result += "\n... (more lines; use offset to continue)"
+        if header:
+            return f"=== {self._display(full)} ===\n{result}"
         return result
+
+    def read_files(
+        self,
+        paths: list[str],
+        offset: int = 1,
+        limit: int | None = None,
+        numbered: bool = True,
+    ) -> str:
+        """Read several files in one call.
+
+        Reading files one at a time costs an extra model round-trip each: the
+        tool call plus the result both land in the context, so ten small reads
+        are ten turns. When the goal is "peek at these N files", this does it
+        in one. Per-file failures are reported inline instead of aborting the
+        whole call, and the shared budget is split across the files so one
+        huge file cannot crowd out the rest.
+        """
+        if not isinstance(paths, list) or not paths:
+            raise ToolError("paths must be a non-empty list of file paths")
+        if len(paths) > MAX_READ_FILES:
+            raise ToolError(
+                f"too many paths ({len(paths)}); at most {MAX_READ_FILES} per call"
+            )
+        offset = max(1, int(offset))
+        # 所有文件合计不超过 MAX_FILE_LINES。不传 limit 时把预算均分给各文件，
+        # 每文件至少 READ_FILES_MIN_LINES 行；否则 3 个文件各 100 行只用掉
+        # 300 行，白白浪费掉剩下的预算。
+        total_budget = MAX_FILE_LINES
+        if limit is None:
+            per_file = max(
+                READ_FILES_MIN_LINES,
+                total_budget // max(1, len(paths)),
+            )
+        else:
+            per_file = max(1, min(int(limit), total_budget))
+        chunks: list[str] = []
+        for raw_path in paths:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                chunks.append("=== (invalid path) ===\n(skipped: path must be a non-empty string)")
+                continue
+            remaining = total_budget - sum(part.count("\n") + 1 for part in chunks)
+            if remaining <= 0:
+                chunks.append(
+                    f"=== {raw_path} ===\n"
+                    f"(skipped: line budget of {MAX_FILE_LINES} exhausted)"
+                )
+                continue
+            try:
+                chunks.append(
+                    self.read_file(
+                        raw_path,
+                        offset=offset,
+                        limit=min(per_file, remaining),
+                        numbered=numbered,
+                        header=True,
+                    )
+                )
+            except ToolError as exc:
+                # 单个文件出错不影响其余文件，把原因就地写出来
+                chunks.append(f"=== {raw_path} ===\n(error: {exc})")
+        return "\n".join(chunks)
 
     def search(
         self,
@@ -13172,7 +13290,12 @@ class Workspace:
             self._write_text(full, updated, newline="")
         except OSError as exc:
             raise ToolError(str(exc)) from exc
-        return f"edited {self._display(full)} ({replaced} replacement{suffix})"
+        # 返回 unified diff，省掉事后单独跑 git diff 再看一遍的那一轮。
+        summary = f"edited {self._display(full)} ({replaced} replacement{suffix})"
+        patch = unified_diff_text(
+            original, updated, self._display(full), context=DIFF_CONTEXT_LINES
+        )
+        return f"{summary}\n{patch}" if patch else summary
 
     def multi_edit(
         self,
@@ -13256,15 +13379,21 @@ class Workspace:
                 self._write_text(full, working, newline="")
             except OSError as exc:
                 raise ToolError(str(exc)) from exc
-        if file_count == 1:
-            return (
-                f"edited {self._display(pending[0][0])} "
-                f"({len(edits)} edits, {total} replacements)"
+        # 每个文件附一份 unified diff，省掉事后单独看一眼的那一轮。
+        patches = []
+        for full, original, working in pending:
+            patch = unified_diff_text(
+                original, working, self._display(full), context=DIFF_CONTEXT_LINES
             )
-        return (
-            f"edited {file_count} files "
+            if patch:
+                patches.append(patch)
+        head = (
+            f"edited {self._display(pending[0][0])} "
             f"({len(edits)} edits, {total} replacements)"
+            if file_count == 1
+            else f"edited {file_count} files ({len(edits)} edits, {total} replacements)"
         )
+        return head + ("\n" + "\n".join(patches) if patches else "")
 
     def save_text(self, path: str, text: str) -> str:
         """Write text anywhere for an explicit user command."""
@@ -13941,6 +14070,7 @@ class Workspace:
         handlers = {
             "list_dir": self.list_dir,
             "read_file": self.read_file,
+            "read_files": self.read_files,
             "read_file_outline": self.read_file_outline,
             "search": self.search,
             "glob": self.glob,
@@ -17637,6 +17767,57 @@ def _human_size(size: int) -> str:
     return f"{int(size)} B"
 
 
+def unified_diff_text(
+    before: str,
+    after: str,
+    label: str,
+    context: int = DIFF_CONTEXT_LINES,
+    max_chars: int = DIFF_MAX_CHARS,
+) -> str:
+    """Return a compact unified diff of ``before`` -> ``after``.
+
+    Showed after a successful edit so the caller can see exactly what changed
+    without spending another turn on ``git diff``. Only the changed hunks plus
+    ``context`` lines around them are emitted: a whole-file diff of a 3000-line
+    source file would cost more context than the edit itself.
+
+    Returns an empty string when nothing changed, and truncates (with a note)
+    rather than blowing up the tool result on a huge rewrite.
+    """
+    if before == after:
+        return ""
+    old_lines = before.splitlines(keepends=True)
+    new_lines = after.splitlines(keepends=True)
+    # lineterm="" keeps difflib from appending its own newline markers; we
+    # re-add them per line below so the output reads like git's.
+    chunks = list(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{label}",
+            tofile=f"b/{label}",
+            n=context,
+            lineterm="",
+        )
+    )
+    if not chunks:
+        return ""
+    rendered = []
+    for line in chunks:
+        text = line.rstrip("\n")
+        if not text:
+            rendered.append("")
+            continue
+        # difflib 带 \r 时统一去掉，避免终端里显示成控制字符
+        rendered.append(text.replace("\r", ""))
+    text = "\n".join(rendered)
+    if len(text) > max_chars:
+        head = text[:max_chars]
+        total = len(text)
+        return f"{head}\n... (diff truncated; {total} chars total)"
+    return text
+
+
 def _apply_edit(
     text: str,
     old_string: str,
@@ -17682,6 +17863,12 @@ def _clip_tool_text(text: str, limit: int | None = None) -> str:
 
     ``limit`` overrides the configured budget for a single call; ``None``
     means "use whatever the config says".
+
+    IMPORTANT: this is a *display* helper. It is used for the terminal echo of
+    a tool result and for the web view. The raw result is what gets appended to
+    ``messages`` and sent to the model, so compression never hides content from
+    the model -- only from the human watching the stream. Keep it that way:
+    a compressed result would silently break any task that needs the full text.
     """
     budget = compression_limit() if limit is None else limit
     if not compression_enabled():
@@ -24710,6 +24897,47 @@ def run_web(
         def log_message(self, *args: Any) -> None:
             pass
 
+        def handle_one_request(self) -> None:
+            """Catch-all for unexpected errors in any HTTP method handler.
+
+            do_GET/do_POST validate their inputs carefully and handle known
+            business exceptions, but an unforeseen bug (a KeyError deep inside
+            a route, say) would otherwise kill the connection with no response:
+            the browser sees a reset instead of an error message, and nothing
+            useful reaches the log. Normalise that into a 500 so failures stay
+            visible and the client can react.
+            """
+            # A client that declares a large Content-Length and then sends
+            # nothing would block rfile.read() forever and pin this thread.
+            # The socket timeout is the only thing that can interrupt a
+            # blocking read, so set it before delegating.
+            try:
+                self.connection.settimeout(WEB_BODY_TIMEOUT)
+            except OSError:
+                pass
+            try:
+                super().handle_one_request()
+            except (ConnectionError, BrokenPipeError, socket.timeout):
+                # Browser navigated away or stalled mid-request.
+                self._client_gone = True
+                self.close_connection = True
+                try:
+                    self._error(408, "timed out reading request")
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as exc:  # noqa: BLE001 - last line of defence
+                import traceback
+
+                traceback.print_exc()
+                self._client_gone = True
+                self.close_connection = True
+                # Headers may already be out (SSE streams), in which case a
+                # second write is impossible and _send swallows the error.
+                try:
+                    self._error(500, f"internal error: {type(exc).__name__}: {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
+
         def _send(self, code: int, body: str, content_type: str) -> None:
             data = body.encode("utf-8")
             try:
@@ -24787,6 +25015,37 @@ def run_web(
                 self._error(403, "invalid or missing token")
                 return False
             return True
+
+        def _read_body(self) -> bytes | None:
+            """Read exactly Content-Length bytes, rejecting impossible values.
+
+            The socket timeout set in handle_one_request bounds the blocking
+            read, so a client that declares a large length and sends nothing
+            cannot pin this thread indefinitely.
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._error(400, "invalid content length")
+                return None
+            if length < 0:
+                self._error(400, "invalid content length")
+                return None
+            if length > WEB_MAX_BODY:
+                self._error(413, "request body too large")
+                return None
+            if length == 0:
+                return b""
+            try:
+                raw = self.rfile.read(length)
+            except socket.timeout:
+                self._error(408, "timed out reading request body")
+                return None
+            if raw is None or len(raw) < length:
+                # Client closed early: the declared length was a lie.
+                self._error(400, "incomplete request body")
+                return None
+            return raw
 
         def _handle_chat(self, payload: dict[str, Any], stream: bool) -> None:
             with chat_lock:
@@ -25473,15 +25732,9 @@ def run_web(
             parsed = urlparse(self.path)
             if not self._check_token():
                 return
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                self._error(400, "invalid content length")
+            raw = self._read_body()
+            if raw is None:
                 return
-            if length > WEB_MAX_BODY:
-                self._error(413, "request body too large")
-                return
-            raw = self.rfile.read(length) if length else b""
             try:
                 payload = json.loads(raw.decode("utf-8")) if raw else {}
             except (UnicodeDecodeError, json.JSONDecodeError):
