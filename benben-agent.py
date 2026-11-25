@@ -19519,6 +19519,11 @@ let uploads = [];
 let reading = 0;
 let chatController = null;
 let lastToolDetail = null;
+// callId -> <details>，避免 addToolResult 每条都去 logEl 里 querySelectorAll 扫一遍。
+// 回放历史时这些块先进离屏 fragment，扫 logEl 也根本扫不到。
+let toolDetailIndex = new Map();
+// 非 null 时 renderHistory 正在批量建树，所有 append 都落到这里，最后一次性挂载。
+let historyFragment = null;
 let exportSession = null;
 let jobBlocks = new Map();
 let jobPollTimers = new Map();
@@ -19988,6 +19993,41 @@ async function cancelJob(id) {
   }
 }
 
+// 工具块的 <pre> 正文延迟到第一次展开时才建。回放大会话时几百个工具块几乎
+// 全是折叠的，提前建好等于白付几百个节点的创建和排版开销。
+// parts 按入队顺序落盘，保证“参数”始终排在“结果”前面。
+function flushToolParts(details) {
+  const parts = details.__parts;
+  if (!parts || parts.mounted) return;
+  parts.mounted = true;
+  for (const part of parts.list) {
+    const pre = document.createElement("pre");
+    if (part.className) pre.className = part.className;
+    pre.textContent = part.text;
+    details.appendChild(pre);
+  }
+  parts.list.length = 0;
+}
+
+function queueToolPart(details, text, className) {
+  const parts = details.__parts || (details.__parts = { list: [], mounted: false });
+  if (parts.mounted) {
+    const pre = document.createElement("pre");
+    if (className) pre.className = className;
+    pre.textContent = text;
+    details.appendChild(pre);
+    return;
+  }
+  parts.list.push({ text: text, className: className });
+  if (details.open) flushToolParts(details);
+}
+
+function watchToolExpand(details) {
+  details.addEventListener("toggle", () => {
+    if (details.open) flushToolParts(details);
+  });
+}
+
 function addToolDetail(text, callId) {
   const details = document.createElement("details");
   details.className = "tool-detail";
@@ -19995,22 +20035,17 @@ function addToolDetail(text, callId) {
   const summary = document.createElement("summary");
   const firstLine = String(text || "(empty)").split("\n")[0];
   summary.textContent = firstLine.length > 140 ? firstLine.slice(0, 137) + "..." : firstLine;
-  const pre = document.createElement("pre");
-  pre.textContent = String(text || "(empty)");
   details.appendChild(summary);
-  details.appendChild(pre);
-  logEl.appendChild(details);
-  scrollLog(true);
+  watchToolExpand(details);
+  queueToolPart(details, String(text || "(empty)"), "");
+  (historyFragment || logEl).appendChild(details);
+  if (callId) toolDetailIndex.set(callId, details);
+  if (!historyFragment) scrollLog(true);
   lastToolDetail = details;
 }
 
 function addToolResult(text, callId) {
-  let target = null;
-  if (callId) {
-    target = Array.from(logEl.querySelectorAll(".tool-detail")).find(
-      element => element.dataset.callId === callId
-    ) || null;
-  }
+  let target = callId ? (toolDetailIndex.get(callId) || null) : null;
   if (!target) target = lastToolDetail;
   if (!target) {
     target = document.createElement("details");
@@ -20018,14 +20053,13 @@ function addToolResult(text, callId) {
     const summary = document.createElement("summary");
     summary.textContent = "[tool result]";
     target.appendChild(summary);
-    logEl.appendChild(target);
+    watchToolExpand(target);
+    (historyFragment || logEl).appendChild(target);
     lastToolDetail = target;
   }
-  const pre = document.createElement("pre");
-  pre.className = "tool-result";
-  pre.textContent = "结果:\n" + String(text || "(empty)");
-  target.appendChild(pre);
-  scrollLog(true);
+  if (callId) toolDetailIndex.set(callId, target);
+  queueToolPart(target, "结果:\n" + String(text || "(empty)"), "tool-result");
+  if (!historyFragment) scrollLog(true);
 }
 
 function formatToolCall(message) {
@@ -20232,8 +20266,8 @@ function addMarkdown(text) {
   const div = document.createElement("div");
   div.className = "msg assistant";
   div.innerHTML = renderMarkdown(text);
-  logEl.appendChild(div);
-  scrollLog(true);
+  (historyFragment || logEl).appendChild(div);
+  if (!historyFragment) scrollLog(true);
 }
 
 function addPlanBlock(text) {
@@ -20306,52 +20340,66 @@ function addUserMessage(text, images, lazy) {
     element.title = image.name;
     div.appendChild(element);
   }
-  logEl.appendChild(div);
-  scrollLog(true);
+  (historyFragment || logEl).appendChild(div);
+  if (!historyFragment) scrollLog(true);
 }
 
 function renderHistory(messages) {
   logEl.textContent = "";
   lastToolDetail = null;
+  toolDetailIndex = new Map();
   streamBubble = null;
   streamText = "";
   streamThinkingEl = null;
   autoScroll = true;
-  // 摘要消息在 messages 里排在保留对话之前（发给模型时顺序不能变，
-  // 否则模型会把旧摘要当成最新上下文），但给人看时它是"以上内容已压缩"
-  // 的边界提示，堆在列表末尾更直观，也不会把视口顶到顶部。
-  const notices = [];
-  for (const message of messages) {
-    if (message.role === "notice") {
-      notices.push(message);
-    } else if (message.role === "tool_call") {
-      addToolDetail(formatToolCall(message), message.call_id);
-    } else if (message.role === "tool_result") {
-      addToolResult(message.text || "", message.tool_call_id);
-    } else if (message.role === "assistant") {
-      addMarkdown(message.text);
-    } else {
-      const images = (message.images || []).map((item, index) => {
-        if (typeof item === "string") {
-          return { data_url: item, name: "图片 " + (index + 1) };
-        }
-        return item;
-      });
-      addUserMessage(message.text, images, true);
+  // 先在一张离屏 fragment 上把整个历史建完，最后一次性挂载。逐条 append 到
+  // 已经挂在文档里的 logEl 会让每次插入都触发一次样式重算和排版，几百条下来
+  // 就是几百次完整的重排。
+  const fragment = document.createDocumentFragment();
+  historyFragment = fragment;
+  try {
+    // 摘要消息在 messages 里排在保留对话之前（发给模型时顺序不能变，
+    // 否则模型会把旧摘要当成最新上下文），但给人看时它是"以上内容已压缩"
+    // 的边界提示，堆在列表末尾更直观，也不会把视口顶到顶部。
+    const notices = [];
+    for (const message of messages) {
+      if (message.role === "notice") {
+        notices.push(message);
+      } else if (message.role === "tool_call") {
+        addToolDetail(formatToolCall(message), message.call_id);
+      } else if (message.role === "tool_result") {
+        addToolResult(message.text || "", message.tool_call_id);
+      } else if (message.role === "assistant") {
+        addMarkdown(message.text);
+      } else {
+        const images = (message.images || []).map((item, index) => {
+          if (typeof item === "string") {
+            return { data_url: item, name: "图片 " + (index + 1) };
+          }
+          return item;
+        });
+        addUserMessage(message.text, images, true);
+      }
     }
+    for (const message of notices) {
+      const details = document.createElement("details");
+      details.className = "compact";
+      const summary = document.createElement("summary");
+      summary.textContent = message.text || "上下文已压缩";
+      const body = document.createElement("div");
+      body.className = "compact-body";
+      body.innerHTML = renderMarkdown(message.summary || "");
+      details.appendChild(summary);
+      details.appendChild(body);
+      fragment.appendChild(details);
+    }
+    logEl.appendChild(fragment);
+  } finally {
+    historyFragment = null;
   }
-  for (const message of notices) {
-    const details = document.createElement("details");
-    details.className = "compact";
-    const summary = document.createElement("summary");
-    summary.textContent = message.text || "上下文已压缩";
-    const body = document.createElement("div");
-    body.className = "compact-body";
-    body.innerHTML = renderMarkdown(message.summary || "");
-    details.appendChild(summary);
-    details.appendChild(body);
-    logEl.appendChild(details);
-  }
+  // 整个历史建完后只滚一次。以前每条消息都 scrollLog(true)，一千多条就是
+  // 一千多次强制同步排版。
+  scrollLog(true);
 }
 
 function renderPreviews() {
@@ -23719,6 +23767,8 @@ async function send(explicitText) {
   }
   sendEl.disabled = true;
   lastToolDetail = null;
+  // 新一轮从空的索引开始：历史里的 callId 不该再被这一轮的 tool_result 命中。
+  toolDetailIndex = new Map();
   streamBubble = null;
   streamText = "";
   streamThinkingEl = null;

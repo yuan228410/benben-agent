@@ -137,7 +137,12 @@ try:
     check("web server started", url is not None, text[-300:] if not url else "")
 
     if url:
-        base, token = url.split("?token=", 1)
+        # 启动时打印的是 "http://host:port/?token=..."，根路径带一个尾部斜杠。
+        # 直接 base + path 会拼出 "//api/..."，服务端 urlparse 得到
+        # path="//api/..."，匹配不上任何路由，于是全部 404。
+        # 先去掉查询串，再剥掉尾部斜杠，保证 base + "/api/..." 拼出正确路径。
+        base = url.split("?", 1)[0].rstrip("/")
+        token = url.split("?token=", 1)[1]
 
         def call(method, path, payload=None):
             data = None
