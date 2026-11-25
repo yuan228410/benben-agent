@@ -1371,7 +1371,7 @@ BENBEN_DEBUG_STREAM=1 python3 benben-agent.py --stream ...
 | 参数 | 默认 | 范围 | 说明 |
 | --- | --- | --- | --- |
 | `--live-flush-ms` / `live_flush_ms` | `200` | 0–5000 | 推给前端的节流间隔，`0` 表示每块都推 |
-| `--live-max-lines` / `live_max_lines` | `100` | 1–1000 | 实时输出窗口保留的行数 |
+| `--live-max-lines` / `live_max_lines` | `10` | 1–1000 | 实时输出窗口保留的行数 |
 | `--live-tick-seconds` / `live_tick_seconds` | `5` | 1–3600 | 静默命令的心跳间隔 |
 
 需要跑很久的任务请把 `timeout_seconds` 设得足够大；没有后台模式。

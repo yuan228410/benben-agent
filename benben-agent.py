@@ -365,7 +365,7 @@ MAX_TOOL_OUTPUT = 20_000
 # 每次推给前端的间隔（毫秒），节流用。
 LIVE_FLUSH_MS = 200
 # 终端/网页里实时输出窗口最多保留多少行，超过就滚动覆盖。
-LIVE_MAX_LINES = 100
+LIVE_MAX_LINES = 10
 # 运行中的命令每隔多少秒报一次「还在跑」的耗时，让用户分得清慢和卡死。
 LIVE_TICK_SECONDS = 5.0
 # A single read_file call may return this many lines. Kept well above the
@@ -18535,7 +18535,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         </div>
         <div class="form-row">
           <label for="set-live-max-lines">实时输出显示行数</label>
-          <input id="set-live-max-lines" type="number" min="1" max="1000" placeholder="100">
+          <input id="set-live-max-lines" type="number" min="1" max="1000" placeholder="10">
         </div>
         <div class="form-row">
           <label for="set-live-tick-seconds">无输出时心跳间隔（秒）</label>
@@ -19006,8 +19006,8 @@ let reading = 0;
 let chatController = null;
 let lastToolDetail = null;
 // 正在运行的命令的实时输出窗口：最多 liveMaxLines 行，新的挤掉旧的。
-// 默认 100，启动时由 /api/runtime 覆盖。
-let liveMaxLines = 100;
+// 默认 10，启动时由 /api/runtime 覆盖。
+let liveMaxLines = 10;
 let liveOut = { lines: [], pre: null, detail: null };
 // callId -> <details>，避免 addToolResult 每条都去 logEl 里 querySelectorAll 扫一遍。
 // 回放历史时这些块先进离屏 fragment，扫 logEl 也根本扫不到。
@@ -26561,7 +26561,7 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         metavar="N",
-        help="lines kept in the live output window (default: 100)",
+        help="lines kept in the live output window (default: 10)",
     )
     parser.add_argument(
         "--live-tick-seconds",
