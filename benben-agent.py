@@ -19465,7 +19465,12 @@ function addToolDetail(text, callId) {
   if (callId) details.dataset.callId = callId;
   const summary = document.createElement("summary");
   const firstLine = String(text || "(empty)").split("\n")[0];
-  const title = firstLine.length > 140 ? firstLine.slice(0, 137) + "..." : firstLine;
+  // 只做 DOM 体量的兜底，真正的视觉截断交给 CSS 的 ellipsis，
+  // 这样宽屏能看到完整参数，窄屏自动省略。
+  const TITLE_MAX = 400;
+  const title = firstLine.length > TITLE_MAX
+    ? firstLine.slice(0, TITLE_MAX - 3) + "..."
+    : firstLine;
   summary.textContent = title;
   details.appendChild(summary);
   watchToolExpand(details);
