@@ -254,6 +254,7 @@ import getpass
 import glob as glob_mod
 import hashlib
 import http.client
+import http.cookiejar
 import json
 import locale
 import os
@@ -379,6 +380,17 @@ READ_FILES_MIN_LINES = 100
 # 编辑完成后回显的 unified diff 参数：上下各保留几行上下文、最多多少字符。
 DIFF_CONTEXT_LINES = 3
 DIFF_MAX_CHARS = 4_000
+# 后台任务：同时最多几个、单条最长活多久、缓存多少输出。
+# 原来那套实现有 follow 模式、实时推送和 Web 任务卡片，1600 多行；
+# 模型真正需要的只是“起 → 读 → 停”，所以这里只留最小集，超时和数量
+# 上限都是硬约束，避免留下僵尸进程。
+MAX_BACKGROUND_JOBS = 5
+BACKGROUND_JOB_TIMEOUT = 600.0
+BACKGROUND_JOB_OUTPUT_CHARS = 20_000
+# HTTP 请求工具的默认与上限（秒）。
+HTTP_TIMEOUT_DEFAULT = 30.0
+HTTP_TIMEOUT_MAX = 300.0
+HTTP_MAX_RESPONSE_CHARS = 100_000
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGES = 4
 MAX_SEARCH_FILE = 2_000_000
@@ -456,7 +468,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.32.2"
+AGENT_VERSION = "0.33.0"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -1119,55 +1131,35 @@ SYSTEM_PROMPT = """你叫笨笨，是一个在终端中工作的 AI 助手。你
 - 长时间没有进展时停止尝试：连续两次同类失败、关键信息缺失、外部服务无响应，都属于这种情况。
   停下来说明试过什么、卡在哪里，总结已完成/未完成，请用户确认下一步；不要无限重试，
   接近最大步数时主动收尾。
-- 不确定的事实不要编造。需要最新信息或能联网查询时，如果 run_command 可用，
-  先用当前 shell 的 curl、Invoke-WebRequest 等命令查询，说明查询时间并给出可信来源；
-  查不到或无法联网时明确说明，区分事实、推测和传闻。价格、版本、政策这类易变信息
-  优先查最新来源，留意页面发布日期，不要用过期的信息冒充当前状态。
-- 需要精确当前时间时，用当前 shell 的只读时间命令
-  （POSIX：date；PowerShell：Get-Date；cmd：echo %DATE% %TIME%）。
+- 不确定的事实不要编造。需要最新信息或能联网查询时，先用 http_request 或当前 shell 的
+  curl/Invoke-WebRequest 查询，说明查询时间并给出可信来源；查不到就明说，区分事实、
+  推测和传闻。价格、版本、政策这类易变信息优先查最新来源，留意页面发布日期。
+- 需要精确当前时间时，用当前 shell 的只读时间命令（POSIX：date；PowerShell：Get-Date；
+  cmd：echo %DATE% %TIME%）。
 - 用户要求修改代码或文件时，用 edit_file/write_file 完成修改并说明结果，不要只给建议。
 - 能一次做完的事不要拆成多次调用：工具往返本身就是成本，且每次都要重新读取上下文。
-- 同一文件要改多处时用 multi_edit 一次提交：它按顺序应用、要么全成功要么全不改，
-  比多次 edit_file 更省往返。跨文件改动只在需要整体原子性（一处失败就全不改）时
-  用 multi_edit 并在每个 edit 上写 path；只是各文件各改一处时，逐个 edit_file 更省。
+- 同一文件要改多处时用 multi_edit 一次提交，比多次 edit_file 省往返；只在需要跨文件
+  整体原子性时才用它，各文件各改一处时逐个 edit_file 更省。
 - 工具失败时先看 exit code、stderr、路径和权限，再调整后重试；不要原样重复同一条失败命令。
-- 找文件用 glob，按内容搜索用 search；输出可能被截断，read_file 用 offset/limit，
-  不要遍历整棵树或整份倾倒日志。
-- 读代码文件要有预算，不要一段一段地磨：
-  - 动手读之前先花一次调用把结构看清楚：read_file_outline 一次拿到全部定义的“文件:行号”，
-    或 search 配 pattern="^(class |def )"、include="*.py"、output="lines"；再按行号用
-    read_file 精确取正文。
-  - read_file 一次最多能读 {file_lines} 行，能一次读完就别拆；确实读不完再带 offset
-    续读。
-  - 搜索时如果光看匹配行判断不了，直接用 search 的 context=N 看前后几行，不要接着再调
-    read_file。
-  - 同一个文件 read_file 超过 3 次、或同一段内容读了两次以上，说明方法错了：停下来换
-    read_file_outline、search 或一条只读命令。
-- 预览项目（“看下这个项目”“介绍下这个仓库”“这个项目怎么样”这类请求）只读关键文件，
-  不要通读：
-  - 先 list_dir 或 glob 看清目录结构，再挑关键文件读：README、入口文件、依赖清单、
-    配置文件、主要的模块目录。关键文件一般 3-8 个就够。
-  - 读之前先说明打算读哪几个、为什么读；读完直接给结论，不要顺手再翻别的文件。
-  - 够用就停：能说清“这个项目是干什么的、代码怎么组织、从哪跑起来、入口在哪”就够
-    了。预览不是代码审查，不要翻页看实现细节。
-  - 整轮预览的工具调用控制在十几次以内；超了说明在过度探索，收敛到结论。
-  - 用户点名要看的文件、或明确要细节时再深入；没点名就按预览处理。
+- 找文件用 glob，按内容搜索用 search。读代码要有预算：同一文件 read_file 超过 3 次、
+  或同一段内容读了两次以上，说明方法错了，换 read_file_outline 或 search 重新定位。
+- 预览项目（“看下这个项目”“介绍下这个仓库”这类请求）只读关键文件，不要通读：
+  先 list_dir 或 glob 看清结构，再挑 3-8 个关键文件（README、入口、依赖清单、配置、
+  主要模块目录）读，读之前说明打算读哪几个。够用就停：说清“做什么、怎么组织、从哪
+  跑起来、入口在哪”即可，不要翻页看实现细节，整轮工具调用控制在十几次以内。
+  用户点名要看的文件或明确要细节时才深入。
 - 用户可能用 /image 或 --image 附上图片；直接依据图片内容回答，不要声称不支持图片。
 - 先用只读命令；除非用户明确要求，不要改变系统状态，也不要执行破坏性命令
   （rm -rf、git reset --hard 等）。
 - run_command 默认会在当前 shell 明显不认识命令时尝试其他可用 shell；如果结果出现
   [fallback] reason，向用户解释原因并建议安装工具或更换命令，不要反复重试。
   禁用回退时不会自动切换 shell。
-- 执行可能耗时的命令前，必须主动设置 timeout_seconds 并预估耗时：快速查询 10-30 秒，
-  构建/测试/安装 60-180 秒，大任务最多 600 秒；不要省略超时。
-- 不要在前台运行会持续不退出的命令，如服务器、守护进程、tail -f、watch、
-  交互式编辑器；改用非交互命令、加次数限制，或说明需要后台运行。
-- 命令超时或被用户中断后，先说明已运行时间、部分输出和下一步；不要原样重试。
-  需要更多时间时提高 timeout_seconds，或拆分任务。
-- 构建、测试、安装、大目录扫描等可能超过 30 秒的命令要如实预估耗时，
-  把 timeout_seconds 设得够大；超时会杀掉进程并返回部分输出。
-  命令是同步执行的，跑完才返回。
-  不要在前台运行会持续不退出的命令。
+- 用 run_command 前必须设置 timeout_seconds 并如实预估：快速查询 10-30 秒，
+  构建/测试/安装 60-180 秒，大任务最多 600 秒。超时会杀掉进程并返回部分输出；
+  超时或被用户中断后，先说明已运行时间和下一步，需要更多时间就提高上限或拆分任务，
+  不要原样重试。
+- 不要在前台运行会持续不退出的命令（服务器、守护进程、tail -f、watch、交互式编辑器），
+  用 run_command 的 background=true 起后台任务，再 job_output 读输出、job_cancel 停掉。
 - 充分利用宿主机已有的开发环境和工具链，不限于 Python、Node.js、.NET、Java、C/C++。
   只要已安装、能可靠完成任务，任何运行时、编译器、构建系统、包管理器或 CLI 工具都可以用。
 - 不要假设环境里一定有什么。先检查命令是否存在、版本是否合适，再选择方案；
@@ -9115,7 +9107,6 @@ def build_system_prompt(
         current_date=time.strftime("%Y-%m-%d"),
         shell_section=shell_prompt_section(shell_state),
         mode_note=_prompt_mode_note(mode),
-        file_lines=MAX_FILE_LINES,
     )
     sections: list[str] = []
     sections.append(
@@ -9393,7 +9384,7 @@ LIST_SHELLS_SCHEMA: dict[str, Any] = {
     },
 }
 
-READ_ONLY_TOOL_NAMES = frozenset({"list_dir", "read_file", "read_files", "read_file_outline", "search", "glob"})
+READ_ONLY_TOOL_NAMES = frozenset({"list_dir", "read_file", "read_files", "read_file_outline", "search", "glob", "job_output", "job_list"})
 SCHEDULE_TOOL_NAMES = frozenset({
     "create_schedule",
     "list_schedules",
@@ -9950,9 +9941,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "limit": {
                         "type": "integer",
                         "description": (
-                            "Maximum number of lines per file. Default: split the "
-                            f"{MAX_FILE_LINES}-line total budget evenly across the "
-                            f"paths (at least {READ_FILES_MIN_LINES} lines each)."
+                            "Maximum number of lines per file. Omit to share the "
+                            f"{MAX_FILE_LINES}-line total evenly across the paths "
+                            f"(at least {READ_FILES_MIN_LINES} lines each); set it "
+                            "to cap each file individually."
                         ),
                     },
                     "numbered": {
@@ -10153,8 +10145,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "run_command",
             "description": (
                 "Run a shell command in the workspace root. Requires user approval. "
-                "Always estimate duration and set timeout_seconds. Do not run servers, "
-                "daemons, tail -f, watch, or interactive programs in the foreground."
+                "Always estimate duration and set timeout_seconds. For long-running "
+                "servers use background=true instead of running them in the foreground."
             ),
             "parameters": {
                 "type": "object",
@@ -10177,8 +10169,115 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "use that shell's syntax and no automatic fallback is tried."
                         ),
                     },
+                    "background": {
+                        "type": "boolean",
+                        "description": (
+                            "Start the command as a background job and return "
+                            "immediately with a job id. Use this for servers and "
+                            "daemons instead of running them in the foreground. "
+                            "Read output with job_output, stop with job_cancel. "
+                            "Jobs are killed automatically after "
+                            f"{int(BACKGROUND_JOB_TIMEOUT)}s and never survive a restart."
+                        ),
+                    },
                 },
                 "required": ["command", "timeout_seconds"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_output",
+            "description": (
+                "Return the status and recent output of a background job started "
+                "with run_command(background=true). A server needs a moment to bind "
+                "its port: if the output is still empty, wait briefly and read again "
+                "instead of assuming the start failed. Stop the job with job_cancel "
+                "when done."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Job id from run_command."},
+                    "tail_chars": {
+                        "type": "integer",
+                        "description": "How many trailing characters to return. Default 4000.",
+                    },
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_cancel",
+            "description": (
+                "Kill a background job and its whole process tree. Call this when "
+                "you are done verifying a server; jobs are also killed "
+                f"automatically after {int(BACKGROUND_JOB_TIMEOUT)}s."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Job id from run_command."},
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_list",
+            "description": "List background jobs with status, elapsed time and command.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "http_request",
+            "description": (
+                "Make an HTTP request and return the status, selected response "
+                "headers and the body. Use this instead of curl when you need to "
+                "POST JSON, inspect headers or follow redirects. Cookies set by a "
+                "redirect are sent on the next hop within the same call. Non-2xx "
+                "responses are returned (not raised) so you can read the error body."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Absolute http/https URL."},
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP verb. Default GET.",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Extra request headers as a JSON object.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": (
+                            "Request body. Defaults to Content-Type "
+                            "application/json when set."
+                        ),
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": (
+                            f"Request timeout. Default {int(HTTP_TIMEOUT_DEFAULT)}, "
+                            f"max {int(HTTP_TIMEOUT_MAX)}."
+                        ),
+                    },
+                    "follow_redirects": {
+                        "type": "boolean",
+                        "description": "Follow 3xx redirects. Default true.",
+                    },
+                },
+                "required": ["url"],
             },
         },
     },
@@ -10879,6 +10978,210 @@ def _kill_process_tree(process: "subprocess.Popen[Any]") -> None:
         process.wait(timeout=5)
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+
+class _BackgroundJob:
+    """One background command: the process plus a bounded output buffer."""
+
+    def __init__(self, job_id: str, command: str, shell_name: str) -> None:
+        self.id = job_id
+        self.command = command
+        self.shell_name = shell_name
+        self.process: "subprocess.Popen[bytes] | None" = None
+        self.started_at = time.monotonic()
+        self.finished_at: float | None = None
+        self.returncode: int | None = None
+        self.killed = False
+        self.timed_out = False
+        self._parts: list[str] = []
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def append(self, text: str) -> None:
+        """Store output, keeping only the newest BACKGROUND_JOB_OUTPUT_CHARS.
+
+        Long-running servers produce unbounded output; the model only ever
+        wants the tail, so trimming from the front keeps memory flat.
+        """
+        if not text:
+            return
+        with self._lock:
+            self._parts.append(text)
+            self._size += len(text)
+            if self._size > BACKGROUND_JOB_OUTPUT_CHARS:
+                joined = "".join(self._parts)[-BACKGROUND_JOB_OUTPUT_CHARS:]
+                self._parts = [joined]
+                self._size = len(joined)
+
+    def output(self, tail_chars: int) -> str:
+        with self._lock:
+            text = "".join(self._parts)
+        if tail_chars > 0:
+            text = text[-tail_chars:]
+        return text
+
+    def running(self) -> bool:
+        return self.finished_at is None and self.process is not None
+
+    def elapsed(self) -> float:
+        end = self.finished_at if self.finished_at is not None else time.monotonic()
+        return end - self.started_at
+
+    def status(self) -> str:
+        if self.running():
+            return "running"
+        if self.killed:
+            return "killed"
+        if self.timed_out:
+            return "timed out"
+        return "exited"
+
+
+class BackgroundJobManager:
+    """Run, inspect and stop background commands.
+
+    The model needs three primitives: start, read the tail, stop. The previous
+    implementation also had a follow mode, live streaming into the web UI and
+    per-job cards, which is what made it 1600 lines; none of that is needed for
+    an agent to bring a server up, verify it responds and shut it down again.
+
+    Two hard limits keep it from leaking: at most MAX_BACKGROUND_JOBS at once,
+    and every job is killed after BACKGROUND_JOB_TIMEOUT. Jobs never survive
+    the process -- there is no persistence across restarts on purpose.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: dict[str, _BackgroundJob] = {}
+        self._lock = threading.Lock()
+        self._counter = 0
+
+    def _next_id(self) -> str:
+        self._counter += 1
+        return f"job-{self._counter:03d}"
+
+    def reap(self) -> None:
+        """Record exit codes and enforce the timeout. Cheap; call before reads."""
+        now = time.monotonic()
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            process = job.process
+            if process is None or job.finished_at is not None:
+                continue
+            code = process.poll()
+            if code is not None:
+                job.returncode = code
+                job.finished_at = now
+                continue
+            if now - job.started_at > BACKGROUND_JOB_TIMEOUT:
+                job.timed_out = True
+                _kill_process_tree(process)
+                job.returncode = process.poll()
+                job.finished_at = time.monotonic()
+
+    def start(
+        self,
+        argv: list[str],
+        cwd: str,
+        command: str,
+        shell_name: str,
+        env: dict[str, str] | None = None,
+    ) -> _BackgroundJob:
+        self.reap()
+        with self._lock:
+            live = [j for j in self._jobs.values() if j.running()]
+            if len(live) >= MAX_BACKGROUND_JOBS:
+                ids = ", ".join(j.id for j in live)
+                raise ToolError(
+                    f"{MAX_BACKGROUND_JOBS} background jobs are already running "
+                    f"({ids}); stop one with job_cancel first"
+                )
+            job = _BackgroundJob(self._next_id(), command, shell_name)
+            self._jobs[job.id] = job
+
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            with self._lock:
+                self._jobs.pop(job.id, None)
+            raise ToolError(str(exc)) from exc
+        job.process = process
+
+        def drain() -> None:
+            assert process.stdout is not None
+            while True:
+                try:
+                    chunk = process.stdout.read1(4096)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    break
+                job.append(chunk.decode("utf-8", "replace"))
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=drain, daemon=True).start()
+        return job
+
+    def get(self, job_id: str) -> _BackgroundJob:
+        self.reap()
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            known = ", ".join(sorted(self._jobs)) or "none"
+            raise ToolError(f"unknown job: {job_id} (known: {known})")
+        return job
+
+    def stop(self, job_id: str) -> _BackgroundJob:
+        job = self.get(job_id)
+        if job.running() and job.process is not None:
+            job.killed = True
+            _kill_process_tree(job.process)
+            job.returncode = job.process.poll()
+            job.finished_at = time.monotonic()
+        return job
+
+    def stop_all(self) -> None:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            if job.running() and job.process is not None:
+                job.killed = True
+                _kill_process_tree(job.process)
+                # 记录退出状态，否则 status() 会一直报 running，
+                # job_list 看上去像没杀掉。
+                job.returncode = job.process.poll()
+                job.finished_at = time.monotonic()
+
+    def summary(self) -> str:
+        self.reap()
+        with self._lock:
+            jobs = list(self._jobs.values())
+        if not jobs:
+            return "no background jobs"
+        lines = []
+        for job in jobs:
+            lines.append(
+                f"{job.id}  {job.status():<10} {job.elapsed():6.1f}s  {job.command}"
+            )
+        return "\n".join(lines)
 
 
 class _LiveCommandPrinter:
@@ -12450,6 +12753,7 @@ class Workspace:
         self.cancel_event: threading.Event | None = None
         self.command_output: "Callable[[str], None] | None" = None
         self.command_tick: "Callable[[float], None] | None" = None
+        self.background_jobs = BackgroundJobManager()
         self.live_flush_ms = max(0, int(live_flush_ms))
         self.live_max_lines = max(1, int(live_max_lines))
         self.live_tick_seconds = max(1.0, float(live_tick_seconds))
@@ -13354,6 +13658,7 @@ class Workspace:
         command: str,
         timeout_seconds: int | None = None,
         shell: str | None = None,
+        background: bool = False,
     ) -> str:
         if not self.allow_shell:
             raise ToolError("the run_command tool is disabled")
@@ -13376,6 +13681,22 @@ class Workspace:
         )
         if not self._approve("run_command", command, read_only=read_only):
             raise ToolError("permission denied by user")
+        if background:
+            # 后台任务不走超时重试链：起不来就是起不来，换个 shell 重试
+            # 会让模型难以判断到底哪个在跑。
+            job = self.background_jobs.start(
+                current.command_argv(command),
+                self.root,
+                command,
+                current.name,
+            )
+            return (
+                f"started {job.id} (pid {job.process.pid if job.process else '?'}) "
+                f"with {current.name}\n"
+                f"read output: job_output(id=\"{job.id}\")\n"
+                f"stop: job_cancel(id=\"{job.id}\")\n"
+                f"killed automatically after {int(BACKGROUND_JOB_TIMEOUT)}s"
+            )
         if timeout_seconds is None:
             timeout_seconds = self.command_timeout
         timeout = max(1, min(int(timeout_seconds), self.max_command_timeout))
@@ -13490,6 +13811,150 @@ class Workspace:
         result = attempts[0][1] if attempts else (1, "", "", False, False)
         return self._format_command_result(current, result[:4], note=note)
 
+    def job_output(self, id: str = "", tail_chars: int = 4000) -> str:
+        if not isinstance(id, str) or not id.strip():
+            raise ToolError("id must be a non-empty job id")
+        limit = max(200, min(int(tail_chars or 4000), BACKGROUND_JOB_OUTPUT_CHARS))
+        job = self.background_jobs.get(id.strip())
+        head = (
+            f"{job.id}  {job.status()}  {job.elapsed():.1f}s  rc={job.returncode}"
+        )
+        text = job.output(limit)
+        if not text:
+            return head + "\n(no output yet)"
+        return f"{head}\n---\n{text}"
+
+    def job_cancel(self, id: str = "") -> str:
+        if not isinstance(id, str) or not id.strip():
+            raise ToolError("id must be a non-empty job id")
+        job = self.background_jobs.stop(id.strip())
+        return (
+            f"{job.id}  {job.status()}  {job.elapsed():.1f}s  "
+            f"rc={job.returncode} (process tree killed)"
+        )
+
+    def job_list(self) -> str:
+        return self.background_jobs.summary()
+
+    def http_request(
+        self,
+        url: str = "",
+        method: str = "GET",
+        headers: dict[str, Any] | None = None,
+        body: str | None = None,
+        timeout_seconds: float | None = None,
+        follow_redirects: bool = True,
+    ) -> str:
+        """Make an HTTP request and return status, key headers and the body.
+
+        curl plus a python one-liner can do this, but POSTing JSON, following
+        redirects and reading response headers turns into a quoting mess fast.
+        """
+        if not isinstance(url, str) or not url.strip():
+            raise ToolError("url must be a non-empty string")
+        url = url.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ToolError("url must start with http:// or https://")
+        verb = str(method or "GET").strip().upper()
+        if not verb.isalpha():
+            raise ToolError("method must be an HTTP verb")
+        timeout = HTTP_TIMEOUT_DEFAULT if timeout_seconds is None else float(timeout_seconds)
+        timeout = max(1.0, min(timeout, HTTP_TIMEOUT_MAX))
+
+        # 只读的 GET/HEAD 不问；其余方法可能改变远端状态或带上本机数据，
+        # 走和其它写操作一样的审批。
+        read_only = verb in ("GET", "HEAD", "OPTIONS")
+        detail = f"{verb} {url}"
+        if body:
+            detail += f"\n{body[:300]}"
+        if not self._approve("http_request", detail, read_only=read_only):
+            raise ToolError("permission denied by user")
+
+        request_headers: dict[str, str] = {}
+        if isinstance(headers, dict):
+            for key, value in headers.items():
+                if isinstance(key, str) and value is not None:
+                    request_headers[key] = str(value)
+        data = None
+        if body is not None:
+            data = body.encode("utf-8")
+            if not any(k.lower() == "content-type" for k in request_headers):
+                request_headers["Content-Type"] = "application/json; charset=utf-8"
+
+        request = urllib.request.Request(
+            url, data=data, headers=request_headers, method=verb
+        )
+        # 带 CookieJar 才能处理“先 POST 登录、再带会话访问”这类流程，
+        # 这是 curl 一条命令做不到、而模型常需要的事。
+        jar = http.cookiejar.CookieJar()
+        handlers: list[Any] = [urllib.request.HTTPCookieProcessor(jar)]
+        if not follow_redirects:
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, hdrs, newurl):  # noqa: D102
+                    return None
+
+            handlers.append(_NoRedirect())
+        opener = urllib.request.build_opener(*handlers)
+
+        started = time.monotonic()
+        try:
+            response = opener.open(request, timeout=timeout)
+            status = response.status
+            raw = response.read(HTTP_MAX_RESPONSE_CHARS * 4)
+            # getheaders() 保留重复头（Set-Cookie 会出现多次），
+            # dict() 会把它们合并成一个，登录流程里就丢了。
+            resp_headers = list(response.getheaders())
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            raw = exc.read(HTTP_MAX_RESPONSE_CHARS * 4)
+            resp_headers = list(exc.headers.items()) if exc.headers else []
+        except urllib.error.URLError as exc:
+            raise ToolError(f"request failed: {getattr(exc, 'reason', exc)}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise ToolError(f"request failed: {exc}") from exc
+        elapsed = (time.monotonic() - started) * 1000
+
+        charset = "utf-8"
+        ctype = ""
+        for key, value in resp_headers:
+            if key.lower() == "content-type":
+                ctype = value
+                match = re.search(r"charset=([\w-]+)", value, re.I)
+                if match:
+                    charset = match.group(1)
+                break
+        try:
+            text = raw.decode(charset, "replace")
+        except LookupError:
+            text = raw.decode("utf-8", "replace")
+        truncated = len(raw) > HTTP_MAX_RESPONSE_CHARS
+        if truncated:
+            text = text[:HTTP_MAX_RESPONSE_CHARS]
+
+        interesting = (
+            "content-type", "content-length", "location",
+            "server", "date", "set-cookie", "cache-control", "www-authenticate",
+        )
+        header_lines = []
+        for key, value in resp_headers:
+            if key.lower() in interesting:
+                if key.lower() == "set-cookie":
+                    # 只保留 cookie 名，值可能含会话令牌，不写进上下文
+                    name = value.split("=", 1)[0].strip()
+                    value = f"{name}=<redacted>"
+                header_lines.append(f"{key}: {value}")
+        parts = [f"HTTP {status}  {elapsed:.0f}ms  {len(raw)} bytes  {ctype or '?'}"]
+        if header_lines:
+            parts.append("--- headers ---")
+            parts.extend(header_lines)
+        parts.append("--- body ---")
+        parts.append(text if text else "(empty)")
+        if truncated:
+            parts.append(
+                f"\n[truncated] body exceeded {HTTP_MAX_RESPONSE_CHARS} chars"
+            )
+        return "\n".join(parts)
+
     def list_shells(self) -> str:
         return self.shell_state.describe()
 
@@ -13557,6 +14022,12 @@ class Workspace:
         return self._memory_service().generate_daily_episode(date)
 
     def close(self) -> None:
+        # 后台任务不跨进程存活：退出时把还跑着的一律杀掉，避免留下
+        # 孤儿服务占着端口。
+        try:
+            self.background_jobs.stop_all()
+        except Exception:  # noqa: BLE001 - closing must never raise
+            pass
         if self.mcp is not None:
             self.mcp.close()
 
@@ -13617,6 +14088,10 @@ class Workspace:
             "multi_edit": self.multi_edit,
             "submit_plan": self.submit_plan,
             "run_command": self.run_command,
+            "job_output": self.job_output,
+            "job_cancel": self.job_cancel,
+            "job_list": self.job_list,
+            "http_request": self.http_request,
             "list_shells": self.list_shells,
             "switch_shell": self.switch_shell,
             "create_schedule": self.create_schedule,

@@ -123,7 +123,8 @@ scheduled_names = [item["function"]["name"] for item in agent.tool_schemas(sched
 check(
     "read-only scheduled tools",
     scheduled_names == [
-        "list_dir", "read_file", "read_files", "read_file_outline", "search", "glob"
+        "list_dir", "read_file", "read_files", "read_file_outline", "search", "glob",
+        "job_output", "job_list",
     ],
     scheduled_names,
 )

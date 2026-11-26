@@ -1577,7 +1577,11 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `write_file` | 创建或覆盖文件 | `--confirm` 时询问 |
 | `edit_file` | 替换文件中的一段文本（类似 patch），成功后返回 unified diff（上下各 3 行、最多 4000 字符） | `--confirm` 时询问 |
 | `multi_edit` | 一次提交多处替换，可跨多个文件：每个编辑可带自己的 `path`，未带则用工具级 `path`。按顺序应用、每个编辑基于上一个的结果；任一文件任一编辑失败则全部不改。成功后每个文件返回一份 unified diff | `--confirm` 时询问 |
-| `run_command` | 在工作区执行 shell 命令（可用 `shell` 参数指定本次用哪个 shell） | `--confirm` 时询问（只读命令不问） |
+| `run_command` | 在工作区执行 shell 命令（可用 `shell` 参数指定本次用哪个 shell；`background=true` 则转成后台任务并立即返回 job id） | `--confirm` 时询问（只读命令不问） |
+| `job_output` | 读后台任务的状态和最近的输出（`tail_chars` 控制尾部长度） | 无 |
+| `job_cancel` | 杀掉后台任务及其整个进程树 | 无 |
+| `job_list` | 列出后台任务的状态、已运行时间和命令 | 无 |
+| `http_request` | 发 HTTP 请求，返回状态码、关键响应头和正文；支持任意方法、JSON body、自定义头、控制重定向。单次调用内跟随重定向时会带上 Cookie，重复的 `Set-Cookie` 都会保留（值打码只显示名字） | `--confirm` 时询问（GET/HEAD/OPTIONS 不问） |
 | `list_shells` | 列出检测到的 shell 和当前 shell | 无 |
 | `switch_shell` | 切换默认 shell | 无 |
 | `submit_plan` | 提交实施计划并等待用户批准（仅计划模式下提供） | 无 |
@@ -1600,7 +1604,7 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `read_episode` | 读取情景记忆文件（仅启用记忆时提供） | 无 |
 | `generate_daily_episode` | 生成自动日总结（仅启用记忆时提供） | 计划模式守卫 |
 
-全部功能开启时共 31 个工具（不含 MCP 动态注入的工具）。
+全部功能开启时共 35 个工具（不含 MCP 动态注入的工具）。
 
 审批列的含义：
 

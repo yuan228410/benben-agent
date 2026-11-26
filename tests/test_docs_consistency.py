@@ -124,9 +124,14 @@ if help_text:
     check("README CLI flags all exist", not ghost_flags, ghost_flags)
 
 # ---------- 6. 已移除的功能不应留下名字 ----------
-removed = ["job_status", "job_output", "job_cancel", "list_jobs"]
+# 后台任务在 v0.31.x 整体移除，v0.33.0 按最小集重新加回来（只有
+# start/read/stop，没有 follow 模式和 Web 任务卡片）。这里只检查那次
+# 移除后不该复活的部分仍然缺席。
+removed = ["job_status", "list_jobs", "job_follow"]
 leftovers = [name for name in removed if name in readme]
 check("removed background-job tools are gone from README", not leftovers, leftovers)
+check("background jobs are documented again",
+      "job_output" in readme and "job_cancel" in readme)
 
 # ---------- 7. 模型上下文的查找顺序与覆盖语义 ----------
 # 这段文档曾经写错过：只说 config.json 里的 model_info，漏掉 models.json
