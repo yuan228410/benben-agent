@@ -55,6 +55,7 @@ python3 tests/test_web_markdown.py
 python3 tests/test_web_stream_render.py
 python3 tests/test_docs_consistency.py
 python3 tests/test_plan_controller.py
+python3 tests/test_compact_single_request.py
 ```
 
 测试会：
@@ -119,3 +120,4 @@ python3 tests/test_plan_controller.py
 | `test_web_hardening.py` | Web 健壮性：`Content-Length` 撒谎/负数不挂死线程、半开连接不拖死服务、顶层异常返回 500 |
 | `test_docs_consistency.py` | 文档与代码一致：README 工具表/工具总数/行数上限/CLI 参数、tests/README 覆盖所有测试文件、已移除功能无残留 |
 | `test_plan_controller.py` | `PlanModeController`：切换/保存/恢复计划模式、无状态会话回落默认值、切模式清挂起计划、CLI 与 Web 各持一份互不干扰 |
+| `test_compact_single_request.py` | 压缩改单次请求：只发一次模型调用、超窗口时丢最早的消息、承接旧摘要、预算计算与截断 |

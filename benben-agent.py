@@ -421,7 +421,11 @@ SESSION_VERSION = 1
 MAX_SESSION_TITLE = 200
 COMPACT_VERSION = 1
 COMPACT_DEFAULT_KEEP = 2
-COMPACT_MAX_CHARS = 48_000
+# 拿不到模型窗口时用的乐观预算（token）。真正的兜底是缩减重试：
+# 估算偏高导致请求被拒时，compact_history 会按 COMPACT_SHRINK_STEPS 逐级收缩再试。
+COMPACT_FALLBACK_BUDGET = 48_000
+# 为摘要输出预留的最大 token；窗口很小时按窗口的 1/5 收缩。
+COMPACT_OUTPUT_RESERVE = 8_000
 COMPACT_MESSAGE_CHARS = 4_000
 COMPACT_TOOL_CHARS = 800
 COMPACT_ARGS_CHARS = 400
@@ -452,7 +456,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.31.4"
+AGENT_VERSION = "0.32.0"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -6686,25 +6690,116 @@ def _compact_split(messages: list[dict[str, Any]], keep: int) -> int:
     return 1
 
 
-def _compaction_chunks(messages: list[dict[str, Any]]) -> list[str]:
-    chunks: list[str] = []
-    current: list[str] = []
-    size = 0
-    for message in messages:
-        if message.get("_compact"):
-            continue
-        text = _summary_text(message)
-        if not text:
-            continue
-        if current and size + len(text) + 1 > COMPACT_MAX_CHARS:
-            chunks.append("\n".join(current))
-            current = []
-            size = 0
-        current.append(text)
-        size += len(text) + 1
-    if current:
-        chunks.append("\n".join(current))
-    return chunks
+# 上下文超限时模型返回的错误里通常带这些词。用来判断"该缩减重试"而不是"真出错"。
+CONTEXT_OVERFLOW_HINTS = (
+    "context length",
+    "context_length",
+    "context window",
+    "maximum context",
+    "max context",
+    "too many tokens",
+    "token limit",
+    "exceed",
+    "too long",
+    "payload too large",
+    "request entity too large",
+    "输入过长",
+    "超出",
+    "过长",
+)
+# 每次“过长”被拒后，下一次尝试按第一次请求大小的这个比例重新规划。
+# 和 opencode 的 SHRINK_STEPS 一致：先小幅收缩，尽量保留历史；
+# 直接砍半会一下子丢掉一半对话，而错误往往只是估算差几个百分点。
+COMPACT_SHRINK_STEPS = (0.85, 0.7, 0.5, 0.35)
+
+
+def _looks_like_context_overflow(error: BaseException) -> bool:
+    """判断这个错误是否值得靠缩减内容重试一次。"""
+    text = str(error).lower()
+    return any(hint in text for hint in CONTEXT_OVERFLOW_HINTS)
+
+
+# 单条 user 消息的格式开销（role、分隔符等），各家 chat 模板大致都在这个量级
+COMPACT_MESSAGE_OVERHEAD = 4
+
+
+def _compaction_fixed_overhead() -> int:
+    """摘要请求里与转录内容无关的固定 token 开销。
+
+    漏算这部分会让请求比预算大出约 150 token：`COMPACT_PROMPT` 本身有 145
+    token，加上"待压缩的对话："前缀和消息格式开销。预算本来就只有窗口减去
+    输出预留那么多，再漏算就会在窗口边缘被拒。
+    """
+    wrapper = "\n\n待压缩的对话：\n"
+    return (
+        _estimate_text_tokens(COMPACT_PROMPT)
+        + _estimate_text_tokens(wrapper)
+        + COMPACT_MESSAGE_OVERHEAD
+    )
+
+
+def _fit_compaction_transcript(
+    entries: list[str],
+    budget_tokens: int,
+    carried: str = "",
+) -> tuple[str, int]:
+    """Fit the pre-summary transcript into ``budget_tokens``, dropping the oldest.
+
+    The old implementation summarised the history in 48000-character chunks,
+    feeding each chunk the previous summary. That cost one full model call per
+    chunk and, worse, every call had a different prompt prefix, so prompt
+    caching never hit: a 950-message session meant nine serial calls that
+    re-prefilled ~47000 characters each time.
+
+    Summarising the whole prefix in one request keeps the prompt a stable
+    prefix (the conversation text) plus a fixed instruction, so the provider
+    cache applies and one call replaces nine. When the transcript does not fit,
+    the oldest exchanges are dropped rather than summarised in batches: what
+    survives is the most recent history, which is what a summary needs most.
+
+    Budget is in tokens and measured with ``_estimate_text_tokens``, which
+    counts CJK as one token and latin as one token per four characters. A fixed
+    characters-per-token constant cannot work: the real ratio is ~0.94 for pure
+    Chinese and ~4.3 for pure English, so any single multiplier is wrong by 4x
+    on one side or the other.
+
+    ``budget_tokens`` is the whole request budget, so the fixed prompt overhead
+    is subtracted here rather than at the call site; keeping the arithmetic in
+    one place is what stops the two from drifting apart.
+
+    Returns ``(transcript, dropped_count)`` where transcript already includes
+    the carried summary.
+    """
+    if not entries:
+        return "", 0
+    # Carried summaries are short and hold the decisions from the dropped past,
+    # so they are always kept; only the transcript is trimmed.
+    head = f"已有摘要：\n{carried}\n\n" if carried else ""
+    room = max(0, budget_tokens - _compaction_fixed_overhead())
+    head_tokens = _estimate_text_tokens(head)
+    if head_tokens >= room:
+        # 连已有摘要都放不下：窗口小到这个程度只能放弃摘要，只发转录的最新部分
+        head = ""
+        head_tokens = 0
+        room = max(1, room)
+    kept = list(entries)
+    dropped = 0
+    size = sum(_estimate_text_tokens(item) + 1 for item in kept)
+    while kept and size + head_tokens > room:
+        size -= _estimate_text_tokens(kept[0]) + 1
+        kept.pop(0)
+        dropped += 1
+    if not kept:
+        return head, dropped
+    body = "\n".join(kept)
+    if _estimate_text_tokens(body) + head_tokens > room:
+        # 单条消息就超出预算：按比例保留尾部（最近的进展）。按字符比例切
+        # 是因为这里只需要一个大概的截断点，精确值不影响正确性。
+        available = max(1, room - head_tokens)
+        ratio = available / max(1, _estimate_text_tokens(body))
+        cut = max(1, int(len(body) * ratio))
+        body = "…（更早内容已截断）…\n" + body[-cut:]
+    return head + body, dropped
 
 
 def compact_history(
@@ -6713,8 +6808,14 @@ def compact_history(
     session: "Session | None" = None,
     keep: int = COMPACT_DEFAULT_KEEP,
     progress: "Callable[[str], None] | None" = None,
+    context_window: "int | None" = None,
 ) -> dict[str, Any]:
-    """Summarize older turns, then append a marker plus the retained tail."""
+    """Summarize older turns in a single request, then keep a marker plus the tail.
+
+    One request instead of one per chunk: see ``_fit_compaction_transcript``
+    for why. ``context_window`` bounds how much history goes into that request;
+    exceeding it drops the oldest exchanges instead of summarizing in batches.
+    """
     if not messages or messages[0].get("role") != "system":
         raise CompactError("messages must start with the system prompt")
     if keep < 0:
@@ -6733,29 +6834,66 @@ def compact_history(
     if prefix[0].get("_compact"):
         carried = _compact_summary_text(prefix[0])
         prefix = prefix[1:]
-    chunks = _compaction_chunks(prefix)
-    if not chunks:
+    entries = [text for text in (_summary_text(m) for m in prefix) if text]
+    if not entries and not carried:
         raise CompactError("nothing to compact (no text in history)")
 
     before_tokens = estimate_tokens(messages)
     before_total = len(messages) - 1
+
+    # 预算：估算偏乐观，装不下就缩减重试（下面循环）。窗口未知时用一个
+    # 宽松的固定值，同样靠重试兜底。
+    if context_window and context_window > 0:
+        window = int(context_window)
+        # 摘要输出按窗口的 1/5 预留，最多 COMPACT_OUTPUT_RESERVE。
+        reserve = min(COMPACT_OUTPUT_RESERVE, max(256, window // 5))
+        budget_tokens = max(1, window - reserve)
+    else:
+        budget_tokens = COMPACT_FALLBACK_BUDGET
+
     usage: dict[str, int] = {}
     truncated = False
-    summary = carried
-    reasoning_warned = False
-    for index, chunk in enumerate(chunks, 1):
+    summary = ""
+    dropped = 0
+    attempts = 0
+    # 每次尝试的预算。首次用完整预算；被判定过长后按 COMPACT_SHRINK_STEPS
+    # 以“首次实际发送量”为基准逐级收缩，而不是在上一轮基础上砍半。
+    request_budget = budget_tokens
+    rejected_size: "int | None" = None
+    while True:
+        attempts += 1
+        transcript, dropped = _fit_compaction_transcript(entries, request_budget, carried)
         if progress is not None:
-            progress(f"正在总结第 {index}/{len(chunks)} 段…")
-        if summary:
-            prompt = (
-                f"{COMPACT_PROMPT}\n\n已有摘要：\n{summary}\n\n"
-                f"接下来要并入摘要的对话：\n{chunk}"
-            )
-        else:
-            prompt = f"{COMPACT_PROMPT}\n\n待压缩的对话：\n{chunk}"
-        reply = client.chat([{"role": "user", "content": prompt}], [])
-        if client.last_reasoning_ignored and not reasoning_warned:
-            reasoning_warned = True
+            if dropped:
+                progress(
+                    f"压缩中：丢弃最早的 {dropped} 条，发送剩余 {len(entries) - dropped} 条…"
+                )
+            else:
+                progress(f"压缩中：发送 {len(entries)} 条…")
+        prompt = (
+            f"{COMPACT_PROMPT}\n\n待压缩的对话：\n{transcript}"
+            if transcript
+            else f"{COMPACT_PROMPT}\n\n已有摘要：\n{carried}"
+        )
+        try:
+            reply = client.chat([{"role": "user", "content": prompt}], [])
+        except ChatError as exc:
+            # 只有像"超长"的错误才值得缩减重试；鉴权、网络等问题直接抛。
+            if not _looks_like_context_overflow(exc):
+                raise
+            if attempts > len(COMPACT_SHRINK_STEPS):
+                raise
+            step = COMPACT_SHRINK_STEPS[attempts - 1]
+            if rejected_size is None:
+                # 以首次实际发送量为基准：它才是被 provider 拒掉的那个尺寸
+                rejected_size = _estimate_text_tokens(prompt) + COMPACT_MESSAGE_OVERHEAD
+            request_budget = max(1, min(request_budget, int(rejected_size * step)))
+            if progress is not None:
+                progress(
+                    f"请求被判定过长，按 {int(step * 100)}% 缩减到约 {request_budget} token 后重试…"
+                )
+            continue
+        if client.last_reasoning_ignored:
             print(
                 "[reasoning] warning: 网关忽略了关闭思考的请求；摘要仍包含 reasoning token",
                 file=sys.stderr,
@@ -6764,9 +6902,18 @@ def compact_history(
         if client.last_finish_reason == "length":
             truncated = True
         content, _images = _content_text(reply)
-        if not content:
+        if content:
+            summary = content
+            break
+        # 空回复：同样逐级缩减重试；次数用完再报错。
+        step = COMPACT_SHRINK_STEPS[attempts - 1] if attempts <= len(COMPACT_SHRINK_STEPS) else None
+        if step is None:
             raise ChatError("summarization returned an empty answer")
-        summary = content
+        if rejected_size is None:
+            rejected_size = _estimate_text_tokens(prompt) + COMPACT_MESSAGE_OVERHEAD
+        request_budget = max(1, min(request_budget, int(rejected_size * step)))
+        if progress is not None:
+            progress(f"摘要为空，按 {int(step * 100)}% 缩减到约 {request_budget} token 后重试…")
 
     summary_message = {
         "role": "user",
@@ -6801,7 +6948,10 @@ def compact_history(
         "after_tokens": estimate_tokens(new_messages),
         "usage": usage,
         "truncated": truncated,
-        "chunks": len(chunks),
+        # 单次请求放不下时丢弃的最早消息数（0 表示全部纳入摘要）
+        "dropped": dropped,
+        # 因为判定过长而缩减重发的次数（0 表示首次就成功）
+        "attempts": attempts - 1,
         "persisted": session is not None,
     }
 
@@ -7263,6 +7413,7 @@ def run_auto_compact(
             session,
             keep,
             progress=progress,
+            context_window=int(info.context_window),
         )
     except (CompactError, ChatError, SessionError) as exc:
         client.last_usage = saved_usage
@@ -25974,7 +26125,13 @@ def run_web(
                         self._error(400, "nothing to compact (start a conversation first)")
                         return
                     try:
-                        stats = compact_history(runtime["client"], state["messages"], state["session"], keep)
+                        stats = compact_history(
+                            runtime["client"],
+                            state["messages"],
+                            state["session"],
+                            keep,
+                            context_window=int(current_model_info().context_window),
+                        )
                     except CompactError as exc:
                         self._error(400, str(exc))
                         return
@@ -28237,6 +28394,7 @@ def main(argv: list[str] | None = None) -> int:
                         progress=lambda text: print(
                             _style(f"  {text}", DIM, supports_color()), file=sys.stderr, flush=True
                         ),
+                        context_window=int(model_info.context_window),
                     )
                 except CompactError as exc:
                     print(str(exc))

@@ -85,7 +85,7 @@ check("stats kept", stats["kept_messages"] == 4, stats)
 check("stats after", stats["after_messages"] == 5, stats)
 check("persisted", stats["persisted"] is True)
 check("usage merged", stats["usage"]["total_tokens"] == 10, stats["usage"])
-check("uses one chunk", stats["chunks"] == 1, stats)
+check("nothing dropped", stats["dropped"] == 0, stats)
 
 prompt = Handler.requests[-1]["messages"][0]["content"]
 check("image omitted", "base64" not in prompt and "AAAA" not in prompt, prompt[:200])
@@ -200,9 +200,7 @@ except agent.ChatError:
 Handler.fail = False
 check("failure no write", os.path.getsize(path) == before)
 
-# long history triggers chunking
-old_max = agent.COMPACT_MAX_CHARS
-agent.COMPACT_MAX_CHARS = 300
+# 长历史：旧实现会按 48000 字符分块多次请求；现在只发一次，装不下就丢最早的
 Handler.requests.clear()
 session2 = agent.create_session("m", ws.root)
 messages2 = [{"role": "system", "content": "SYS"}]
@@ -210,11 +208,21 @@ for index in range(8):
     messages2.append({"role": "user", "content": ("问题%d " % index) + "很长的内容" * 30})
     messages2.append({"role": "assistant", "content": ("回答%d " % index) + "很长的回答" * 30})
 session2.log(messages2)
-stats3 = agent.compact_history(client, messages2, session2, 0)
-check("chunked", stats3["chunks"] > 1, stats3["chunks"])
-check("chunked calls", len(Handler.requests) == stats3["chunks"], len(Handler.requests))
-check("rolling prompt", "已有摘要" in Handler.requests[1]["messages"][0]["content"], Handler.requests[1]["messages"][0]["content"][:120])
-agent.COMPACT_MAX_CHARS = old_max
+stats3 = agent.compact_history(client, messages2, session2, 0, context_window=1_000_000)
+check("single request for long history", len(Handler.requests) == 1, len(Handler.requests))
+check("fits within a large window", stats3["dropped"] == 0, stats3["dropped"])
+
+# 窗口很小时丢最早的，但仍只发一次
+Handler.requests.clear()
+session3 = agent.create_session("m", ws.root)
+messages3 = [{"role": "system", "content": "SYS"}]
+for index in range(8):
+    messages3.append({"role": "user", "content": ("问题%d " % index) + "很长的内容" * 30})
+    messages3.append({"role": "assistant", "content": ("回答%d " % index) + "很长的回答" * 30})
+session3.log(messages3)
+stats4 = agent.compact_history(client, messages3, session3, 0, context_window=1_000)
+check("small window still single request", len(Handler.requests) == 1, len(Handler.requests))
+check("small window drops the oldest", stats4["dropped"] > 0, stats4["dropped"])
 
 # web notice shape
 check("notice keep label", "保留最近 2 轮" in view[0]["text"], view[0]["text"])
