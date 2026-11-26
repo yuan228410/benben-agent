@@ -20174,7 +20174,20 @@ function addUserMessage(text, images, lazy) {
   if (!historyFragment) scrollLog(true);
 }
 
-function renderHistory(messages) {
+function appendCompactBlock(message, parent) {
+  const details = document.createElement("details");
+  details.className = "compact";
+  const summary = document.createElement("summary");
+  summary.textContent = message.text || "上下文已压缩";
+  const body = document.createElement("div");
+  body.className = "compact-body";
+  body.innerHTML = renderMarkdown(message.summary || "");
+  details.appendChild(summary);
+  details.appendChild(body);
+  parent.appendChild(details);
+}
+
+function renderHistory(messages, inplaceCompact = false) {
   logEl.textContent = "";
   lastToolDetail = null;
   toolDetailIndex = new Map();
@@ -20190,12 +20203,18 @@ function renderHistory(messages) {
   historyFragment = fragment;
   try {
     // 摘要消息在 messages 里排在保留对话之前（发给模型时顺序不能变，
-    // 否则模型会把旧摘要当成最新上下文），但给人看时它是"以上内容已压缩"
-    // 的边界提示，堆在列表末尾更直观，也不会把视口顶到顶部。
+    // 否则模型会把旧摘要当成最新上下文）。刚压缩完时把它抽出来堆到列表
+    // 末尾，作为“以上内容已压缩”的边界提示；但重新加载历史时按它真实的
+    // 时间位置插入，不然多次压缩的块全挤在会话最后，看不出每次压缩影响
+    // 的是哪一段。
     const notices = [];
     for (const message of messages) {
       if (message.role === "notice") {
-        notices.push(message);
+        if (inplaceCompact) {
+          appendCompactBlock(message, fragment);
+        } else {
+          notices.push(message);
+        }
       } else if (message.role === "tool_call") {
         addToolDetail(formatToolCall(message), message.call_id);
       } else if (message.role === "tool_result") {
@@ -20213,16 +20232,7 @@ function renderHistory(messages) {
       }
     }
     for (const message of notices) {
-      const details = document.createElement("details");
-      details.className = "compact";
-      const summary = document.createElement("summary");
-      summary.textContent = message.text || "上下文已压缩";
-      const body = document.createElement("div");
-      body.className = "compact-body";
-      body.innerHTML = renderMarkdown(message.summary || "");
-      details.appendChild(summary);
-      details.appendChild(body);
-      fragment.appendChild(details);
+      appendCompactBlock(message, fragment);
     }
     logEl.appendChild(fragment);
   } finally {
@@ -21868,7 +21878,8 @@ async function openSession(uuid) {
     const data = await api("/api/open", { session: uuid });
     currentSession = data.session;
     if (data.workspace) currentWorkspace = data.workspace;
-    renderHistory(data.messages);
+    // 打开历史会话：压缩块回到它真实发生的位置。
+    renderHistory(data.messages, true);
     loadSessions();
     await loadRuntimeSettings();
     if (data.workspace_warning) {
@@ -23808,7 +23819,8 @@ inputEl.addEventListener("keydown", (event) => {
     currentWorkspace = state.workspace || currentWorkspace;
     globalWorkspace = state.default_workspace || globalWorkspace;
     if (currentModel) setModelOptions([currentModel], currentModel);
-    renderHistory(state.messages);
+    // 刷新页面等同重新加载历史：压缩块按真实位置渲染。
+    renderHistory(state.messages, true);
     renderModelInfo(state.model_info, state.context);
     applyRuntimeSettings(state);
   } catch (err) {
