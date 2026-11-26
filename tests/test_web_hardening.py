@@ -196,6 +196,19 @@ try:
     check("body reader guards short reads",
           "incomplete request body" in source)
 
+    # SSE 写入必须捕获 socket.timeout。它不是 ConnectionError 的子类，
+    # 只捕获 ConnectionError 时异常会穿透到 chat 工作线程，导致
+    # chat_state["active"] 一直为 True，前端表现为"显示已停止但按钮永久置灰"。
+    check("sse write catches socket.timeout via OSError",
+          re.search(r"except \(ConnectionError, OSError\):\s*\n\s*# socket\.timeout",
+                    source) is not None,
+          "sse handler still catches only ConnectionError")
+    senders = re.findall(r"except \(ConnectionError, OSError\):", source)
+    old_form = re.findall(r"^\s+except ConnectionError:$", source, re.M)
+    check("every response writer tolerates socket timeouts",
+          not old_form, old_form)
+    check("all response writers were converted", len(senders) >= 4, len(senders))
+
 finally:
     process.terminate()
     try:

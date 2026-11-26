@@ -24207,10 +24207,15 @@ def run_web(
                 self.send_header("X-Frame-Options", "DENY")
                 self.end_headers()
                 self.wfile.write(data)
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 # The client hung up. Windows reports ConnectionAbortedError
                 # (WinError 10053) where POSIX raises BrokenPipeError or
                 # ConnectionResetError; the ConnectionError base covers all.
+                # OSError also covers socket.timeout, which is what a write
+                # raises when the peer stops reading and the socket timeout
+                # (WEB_BODY_TIMEOUT, 30s by default) fires. socket.timeout is
+                # a plain OSError, NOT a ConnectionError, so catching only the
+                # latter let it escape and abort the whole request thread.
                 self._client_gone = True
 
         def _json(self, code: int, payload: Any) -> None:
@@ -24228,7 +24233,7 @@ def run_web(
                 self.send_header("X-Frame-Options", "DENY")
                 self.end_headers()
                 self.wfile.write(data)
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 self._client_gone = True
 
         def _error(self, code: int, message: str) -> None:
@@ -24246,7 +24251,7 @@ def run_web(
                 self.end_headers()
                 self.close_connection = True
                 return True
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 self._client_gone = True
                 return False
 
@@ -24260,7 +24265,12 @@ def run_web(
             try:
                 self.wfile.write(data.encode("utf-8"))
                 self.wfile.flush()
-            except ConnectionError:
+            except (ConnectionError, OSError):
+                # socket.timeout (raised when the peer stops reading and the
+                # 30s socket timeout fires) is an OSError but not a
+                # ConnectionError. Missing it here let the exception escape
+                # into the chat worker, which is what left the web UI stuck on
+                # "stopped" with the send button greyed out until a restart.
                 self._client_gone = True
 
         def _authorized(self, value: str | None) -> bool:
