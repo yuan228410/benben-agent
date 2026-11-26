@@ -53,6 +53,8 @@ python3 tests/test_read_files_diff.py
 python3 tests/test_web_hardening.py
 python3 tests/test_web_markdown.py
 python3 tests/test_web_stream_render.py
+python3 tests/test_docs_consistency.py
+python3 tests/test_plan_controller.py
 ```
 
 测试会：
@@ -115,3 +117,5 @@ python3 tests/test_web_stream_render.py
 | `test_web_stream_render.py` | 流式增量渲染：中途出现标题/加粗/列表/表格/代码块、节流、结束时内容完整、取消清理 |
 | `test_context_meter.py` | 输入框上方的上下文指示器：格式、分段着色、窄屏降级、无悬浮、`usage_live` 驱动实时刷新 |
 | `test_web_hardening.py` | Web 健壮性：`Content-Length` 撒谎/负数不挂死线程、半开连接不拖死服务、顶层异常返回 500 |
+| `test_docs_consistency.py` | 文档与代码一致：README 工具表/工具总数/行数上限/CLI 参数、tests/README 覆盖所有测试文件、已移除功能无残留 |
+| `test_plan_controller.py` | `PlanModeController`：切换/保存/恢复计划模式、无状态会话回落默认值、切模式清挂起计划、CLI 与 Web 各持一份互不干扰 |

@@ -452,7 +452,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.31.3"
+AGENT_VERSION = "0.31.4"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -13479,6 +13479,60 @@ class Workspace:
         return handler(**arguments)
 
 
+class PlanModeController:
+    """Plan-mode state transitions shared by the CLI and the web server.
+
+    Both entry points need the same three operations, and they had drifted
+    into near-duplicate closures inside ``main`` and ``run_web``. The only
+    real differences are how the current session id is obtained (a local
+    variable in the CLI, a locked read of shared state in the web server) and
+    which function refreshes the system prompt afterwards. Both are injected
+    here so the transition logic itself lives in one place.
+    """
+
+    def __init__(
+        self,
+        workspace: "Workspace",
+        current_session_id: "Callable[[], str | None]",
+        refresh_prompt: "Callable[[], None]",
+    ) -> None:
+        self.workspace = workspace
+        self._current_session_id = current_session_id
+        self._refresh_prompt = refresh_prompt
+        # Defaults captured at startup; switching sessions with no saved state
+        # falls back to these rather than to whatever the last session left.
+        self.defaults = {
+            "mode": bool(workspace.plan_mode),
+            "guard": str(workspace.plan_guard),
+        }
+
+    def apply(self, enabled: bool, guard: "str | None" = None) -> None:
+        """Switch plan mode, clearing any pending plan, then refresh the prompt."""
+        self.workspace.plan_mode = enabled
+        self.workspace.plan_result = None
+        if guard is not None:
+            self.workspace.plan_guard = guard
+        self._refresh_prompt()
+
+    def save_current(self) -> None:
+        """Persist the current plan state under the active session id."""
+        self.workspace.save_plan_state(self._current_session_id())
+
+    def restore(self, session_uuid: "str | None" = None) -> None:
+        """Load a session's saved plan state, falling back to startup defaults."""
+        self.workspace.restore_plan_state(
+            session_uuid,
+            self.defaults["mode"],
+            self.defaults["guard"],
+        )
+        self._refresh_prompt()
+
+    def update_defaults(self, mode: bool, guard: str) -> None:
+        """Record new startup defaults (used when settings are reloaded)."""
+        self.defaults["mode"] = bool(mode)
+        self.defaults["guard"] = str(guard)
+
+
 # --------------------------------------------------------------------------- #
 # Workspace switching
 # --------------------------------------------------------------------------- #
@@ -23689,32 +23743,26 @@ def run_web(
             if state["messages"]:
                 state["messages"][0] = system_message
 
-    plan_defaults = {
-        "mode": bool(workspace.plan_mode),
-        "guard": str(workspace.plan_guard),
-    }
+    def current_session_id() -> str | None:
+        with lock:
+            current = state["session"]
+        return current.uuid if current is not None else None
+
+    plan = PlanModeController(
+        workspace,
+        current_session_id,
+        refresh_web_system_message,
+    )
 
     def apply_plan_mode(enabled: bool, guard: str | None = None) -> None:
         """Switch plan mode and refresh the system prompt and the tool list."""
-        workspace.plan_mode = enabled
-        workspace.plan_result = None
-        if guard is not None:
-            workspace.plan_guard = guard
-        refresh_web_system_message()
+        plan.apply(enabled, guard)
 
     def save_current_plan_state() -> None:
-        with lock:
-            current = state["session"]
-            uuid = current.uuid if current is not None else None
-        workspace.save_plan_state(uuid)
+        plan.save_current()
 
     def restore_session_plan(uuid: str | None) -> None:
-        workspace.restore_plan_state(
-            uuid,
-            plan_defaults["mode"],
-            plan_defaults["guard"],
-        )
-        refresh_web_system_message()
+        plan.restore(uuid)
 
     def settings_snapshot() -> dict[str, Any]:
         with config_lock:
@@ -23756,11 +23804,14 @@ def run_web(
             with lock:
                 state["stream_enabled"] = bool(values["stream"])
             applied.append("stream")
+        if "plan_mode" in values or "plan_guard" in values:
+            plan.update_defaults(
+                bool(values.get("plan_mode", workspace.plan_mode)),
+                str(values.get("plan_guard", workspace.plan_guard)),
+            )
         if "plan_mode" in values:
-            plan_defaults["mode"] = bool(values["plan_mode"])
             applied.append("plan_mode")
         if "plan_guard" in values:
-            plan_defaults["guard"] = str(values["plan_guard"])
             applied.append("plan_guard")
         if "plan_mode" in values or "plan_guard" in values:
             apply_plan_mode(
@@ -27326,27 +27377,21 @@ def main(argv: list[str] | None = None) -> int:
         }
         tools = tool_schemas(workspace)
 
+    plan = PlanModeController(
+        workspace,
+        lambda: session.uuid if session else None,
+        refresh_system_prompt,
+    )
+
     def apply_plan_mode(enabled: bool) -> None:
         """Switch plan mode and refresh the system prompt and the tool list."""
-        workspace.plan_mode = enabled
-        workspace.plan_result = None
-        refresh_system_prompt()
-
-    plan_defaults = {
-        "mode": bool(workspace.plan_mode),
-        "guard": str(workspace.plan_guard),
-    }
+        plan.apply(enabled)
 
     def save_current_plan_state() -> None:
-        workspace.save_plan_state(session.uuid if session else None)
+        plan.save_current()
 
     def restore_session_plan(uuid: str | None = None) -> None:
-        workspace.restore_plan_state(
-            uuid,
-            plan_defaults["mode"],
-            plan_defaults["guard"],
-        )
-        refresh_system_prompt()
+        plan.restore(uuid)
 
     def run_current_turn() -> None:
         run_turn(
