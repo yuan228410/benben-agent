@@ -460,15 +460,21 @@ python3 benben-agent.py --memory --thinking --max-steps 50
 
 `fallback` 是自动生成的，可以手工改；`models` 里的条目由 `/model config` 或 Web「模型能力」写入。`fallback` 不写 `input`/`output` 时按文本模态处理，图片能力视为未知。
 
-查找顺序：
+查找顺序（`ModelRegistry.resolve`）：
 
-1. `models.json` 里 `provider/model` 精确匹配
-2. `models.json` 里键名等于模型名的条目
-3. `models.json` 里任意 `前缀/模型名` 的条目
+1. `models.json` 的 `models` 里 `provider/model` 精确匹配
+2. `models.json` 的 `models` 里键名等于模型名的条目
+3. `models.json` 的 `models` 里任意 `前缀/模型名` 后缀匹配的条目
 4. 上面都没命中时用 `models.json` 的 `fallback`；文件缺失或损坏时用内置兜底
-5. 最后叠加连接 profile 里的 `model_info` 覆盖
+5. 最后用连接 profile 里的 `model_info` **逐字段覆盖**上一步的结果
+
+第 5 步是覆盖而不是替换：`model_info` 里给出的字段生效，没给出的字段沿用第 1-4 步的结果。所以只写 `{"max_output_tokens": 4096}` 不会把 `models.json` 里的 `context_window` 清零。
+
+注意 `models.json` 的优先级**高于** `connection.model_info` 的缺省回退：模型已经在 `models.json` 里登记过（例如 `/model config` 写过 `custom/deepseek-v4.1-flash-1017-n`），`context_window` 就来自那里，`config.json` 里没有 `model_info` 也不影响。`model_info` 只在想临时压过 `models.json` 时才有用。
 
 当前兜底上下文为 **256000 tokens**，最大输出 `8192`。模型能力信息不包含价格。
+
+上下文窗口影响两处：网页端输入框上方的 `ctx:x%` 指示器，以及 `/compact` 的可用预算（窗口减去摘要输出预留，见「压缩上下文」）。窗口配大了会让这两个数字都偏乐观。
 
 连接级覆盖示例：
 

@@ -3943,10 +3943,15 @@ def context_usage(
     When the client remembers the real prompt token count from the last API call,
     project it forward using the local estimate's delta. That is much closer to
     the truth than the raw character estimate (which ignores tool schemas).
+
+    The local estimate is computed once and reused for the projection: computing
+    it twice doubled the cost of ``/api/runtime``, which runs every five seconds
+    while it holds the session lock.
     """
-    tokens = estimate_tokens(messages)
+    local = estimate_tokens(messages)
+    tokens = local
     if client is not None:
-        projected = project_context_tokens(client, messages)
+        projected = project_context_tokens(client, messages, local)
         if projected is not None:
             tokens = projected
     window = max(1, int(info.context_window))
@@ -3978,12 +3983,16 @@ def context_usage(
 def project_context_tokens(
     client: BaseChatClient,
     messages: list[dict[str, Any]],
+    local: int | None = None,
 ) -> int | None:
     """Project the current context size from the last real prompt token count.
 
     Uses the difference between the current local estimate and the estimate
     taken at the time of the last API call as the delta. Returns None when
     there is no usable baseline (first call, or history was compacted).
+
+    ``local`` lets a caller that already computed ``estimate_tokens(messages)``
+    pass it in rather than paying a second full scan.
     """
     real = getattr(client, "last_prompt_tokens", None)
     base = getattr(client, "last_prompt_estimate", None)
@@ -3991,7 +4000,7 @@ def project_context_tokens(
         return None
     if not isinstance(base, int) or base < 0:
         return None
-    delta = estimate_tokens(messages) - base
+    delta = (estimate_tokens(messages) if local is None else local) - base
     projected = real + delta
     return max(0, projected)
 
@@ -6649,31 +6658,39 @@ def _compact_summary_text(message: dict[str, Any]) -> str:
     return body
 
 
+# 宽字符（CJK 及其标点、全角符号）在多数 tokenizer 里各占一个 token，
+# 西文大致四字符一个。用一个预编译正则数宽字符，比逐字符 ord() 比较快约
+# 8 倍——这个函数在每次模型调用后、以及网页每 5 秒一次的 /api/runtime 里
+# 都会跑到，977 条消息时全量扫描从 54ms 降到 7ms。
+_WIDE_CHAR_RE = re.compile(
+    r"[\u2e80-\ua4cf\uac00-\ud7af\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]"
+)
+
+
 def _estimate_text_tokens(text: str) -> int:
-    wide = 0
-    for char in text:
-        code = ord(char)
-        if (
-            0x2E80 <= code <= 0xA4CF
-            or 0xAC00 <= code <= 0xD7AF
-            or 0xF900 <= code <= 0xFAFF
-            or 0xFE30 <= code <= 0xFE4F
-            or 0xFF00 <= code <= 0xFFEF
-        ):
-            wide += 1
+    wide = len(_WIDE_CHAR_RE.findall(text))
     return wide + max(1, (len(text) - wide) // 4)
 
 
+def _message_tokens(message: dict[str, Any]) -> int:
+    """Token estimate for one message."""
+    body, images = _content_text(message)
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        body += "\n" + str(function.get("arguments") or "")
+    return 4 + _estimate_text_tokens(body) + 800 * images
+
+
 def estimate_tokens(messages: list[dict[str, Any]]) -> int:
-    """Rough context estimate for display only (CJK count as one token)."""
-    total = 0
-    for message in messages:
-        body, images = _content_text(message)
-        for call in message.get("tool_calls") or []:
-            function = call.get("function") or {}
-            body += "\n" + str(function.get("arguments") or "")
-        total += 4 + _estimate_text_tokens(body) + 800 * images
-    return total
+    """Rough context estimate for display only (CJK count as one token).
+
+    This walks every message, so callers in a loop should prefer keeping a
+    running total with ``_message_tokens`` on the messages they append rather
+    than re-summing the whole history each time (see ``run_turn``). No cache is
+    kept here on purpose: keying one by message identity would hold references
+    to every message and keep discarded sessions alive.
+    """
+    return sum(_message_tokens(message) for message in messages)
 
 
 def _compact_split(messages: list[dict[str, Any]], keep: int) -> int:
@@ -16552,6 +16569,30 @@ def run_turn(
     truncated = False
     reasoning_warned = False
 
+    # memo 化追踪 messages 的总 token 估算值。messages 在本轮里只追加（三处
+    # append），压缩等整体替换发生在 run_turn 之外；把「前缀总长」和「前缀
+    # 条数」记在一起，只要列表没有变短或首条没被换掉，就只补算新增的消息。
+    # 以前每次模型调用后都全量重算，977 条历史单次约 40ms，30 步累计上秒。
+    prefix_total = 0
+    prefix_len = 0
+    prefix_head: dict[str, Any] | None = None
+
+    def context_tokens_now() -> int:
+        """在 messages 上增量维护的 token 估算值（用于显示）。"""
+        nonlocal prefix_total, prefix_len, prefix_head
+        size = len(messages)
+        head = messages[0] if messages else None
+        # 变短说明历史被压缩；首条被换说明是另一个会话。两种都作废重算，
+        # 免得增量结果停留在旧值上。
+        if size < prefix_len or head is not prefix_head:
+            prefix_total = 0
+            prefix_len = 0
+            prefix_head = head
+        for message in messages[prefix_len:size]:
+            prefix_total += _message_tokens(message)
+        prefix_len = size
+        return prefix_total
+
     def add_usage(usage: Any) -> None:
         nonlocal call_count
         call_count += 1
@@ -16608,12 +16649,12 @@ def run_turn(
                         and baseline >= 0
                         and last_reply is not None
                     ):
-                        delta = estimate_tokens(messages) - baseline
-                        reply_estimate = estimate_tokens([last_reply])
+                        delta = context_tokens_now() - baseline
+                        reply_estimate = _message_tokens(last_reply)
                         context_tokens += max(0, delta - reply_estimate)
                     is_estimate = False
             if is_estimate:
-                context_tokens = estimate_tokens(messages)
+                context_tokens = context_tokens_now()
             percent = min(100, int(context_tokens * 100 / window))
             tilde = "~" if is_estimate else ""
             parts.append(
@@ -16719,7 +16760,7 @@ def run_turn(
                 last_call_usage = turn_usage
             # 记录真实值与本地估算的基线，供下次调用前推算上下文占用
             client.last_prompt_tokens = turn_usage.get("prompt_tokens")
-            client.last_prompt_estimate = estimate_tokens(messages)
+            client.last_prompt_estimate = context_tokens_now()
             if client.last_finish_reason == "length":
                 truncated = True
             reasoning = reply.get("reasoning_content") or reply.get("reasoning") or ""

@@ -8,7 +8,9 @@
 """
 from pathlib import Path
 import importlib.util
+import json
 import re
+import shutil
 import sys
 import tempfile
 
@@ -125,6 +127,94 @@ if help_text:
 removed = ["job_status", "job_output", "job_cancel", "list_jobs"]
 leftovers = [name for name in removed if name in readme]
 check("removed background-job tools are gone from README", not leftovers, leftovers)
+
+# ---------- 7. 模型上下文的查找顺序与覆盖语义 ----------
+# 这段文档曾经写错过：只说 config.json 里的 model_info，漏掉 models.json
+# 会先命中，读者会以为没写 model_info 就走 fallback。
+spec = importlib.util.spec_from_file_location("agent_docs_mod", AGENT)
+mod = importlib.util.module_from_spec(spec)
+sys.argv = ["benben-agent.py"]
+spec.loader.exec_module(mod)
+
+# README 声明的查找步骤要按顺序出现（限定在「查找顺序」那一节内，
+# 否则 "fallback" 会在文档别处先命中）
+section_start = readme.find("查找顺序")
+section_end = readme.find("当前兜底上下文为")
+check("README has a model lookup section",
+      section_start >= 0 and section_end > section_start,
+      f"{section_start}..{section_end}")
+section = readme[section_start:section_end] if section_start >= 0 else ""
+steps = [
+    "provider/model",
+    "键名等于模型名",
+    "前缀/模型名",
+    "fallback",
+    "model_info",
+]
+positions = [section.find(s) for s in steps]
+check("README documents the model lookup order in order",
+      all(p >= 0 for p in positions) and positions == sorted(positions),
+      list(zip(steps, positions)))
+check("README explains model_info is a per-field overlay",
+      "逐字段覆盖" in readme, "missing 逐字段覆盖")
+check("README warns models.json wins over an absent model_info",
+      "没有 `model_info` 也不影响" in readme, "missing the models.json note")
+
+# 文档里写的兜底数字必须等于代码里的
+readme_fallback = re.search(r"兜底上下文为 \*\*(\d+) tokens\*\*", readme)
+check("README states the fallback context", readme_fallback is not None)
+if readme_fallback:
+    stated = int(readme_fallback.group(1))
+    info = mod.ModelRegistry(use_file=False).resolve("custom", "no-such-model")
+    check("fallback context in README matches code",
+          stated == info.context_window, f"{stated} != {info.context_window}")
+    stated_out = re.search(r"最大输出 `(\d+)`", readme)
+    if stated_out:
+        check("fallback max output in README matches code",
+              int(stated_out.group(1)) == info.max_output_tokens,
+              f"{stated_out.group(1)} != {info.max_output_tokens}")
+
+# 覆盖语义：model_info 只改给出的字段，其余沿用 models.json
+with tempfile.TemporaryDirectory() as tmp:
+    models_path = Path(tmp) / "models.json"
+    models_path.write_text(json.dumps({
+        "version": 1,
+        "fallback": {"name": "fallback", "context_window": 111111,
+                     "max_output_tokens": 8192},
+        "models": {"custom/known-model": {"name": "Known",
+                                          "context_window": 222222,
+                                          "max_output_tokens": 4096}},
+    }), encoding="utf-8")
+    registry = mod.ModelRegistry(str(models_path))
+    mixed = registry.resolve("custom", "known-model", "", {"max_output_tokens": 999})
+    check("model_info overrides only the fields it sets",
+          mixed.context_window == 222222 and mixed.max_output_tokens == 999,
+          f"ctx={mixed.context_window} out={mixed.max_output_tokens}")
+
+    # models.json 命中时，不传 model_info 也应取到该条目而不是 fallback
+    plain = registry.resolve("custom", "known-model", "", None)
+    check("models.json entry is used without any model_info",
+          plain.context_window == 222222, plain.context_window)
+
+    # 后缀匹配
+    suffix = registry.resolve("other", "known-model", "", None)
+    check("model name suffix match works",
+          suffix.context_window == 222222, suffix.context_window)
+
+    # 都没命中才用 fallback
+    miss = registry.resolve("custom", "missing", "", None)
+    check("fallback is used only when nothing matches",
+          miss.context_window == 111111, miss.context_window)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+# ---------- 8. 压缩文档的数值与代码一致 ----------
+compact_checks = [
+    ("窗口的 1/5，最多 8000 token", mod.COMPACT_OUTPUT_RESERVE == 8000),
+    ("85% → 70% → 50% → 35%", mod.COMPACT_SHRINK_STEPS == (0.85, 0.7, 0.5, 0.35)),
+    ("默认保留最近 2 个用户回合", mod.COMPACT_DEFAULT_KEEP == 2),
+]
+for label, ok in compact_checks:
+    check(f"compaction README matches code: {label}", ok and label in readme)
 
 print()
 if failures:
