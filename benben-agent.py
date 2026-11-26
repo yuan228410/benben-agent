@@ -24315,6 +24315,25 @@ def run_web(
                 return None
             return raw
 
+        def require_idle(self, action: str) -> bool:
+            """Return True when no chat turn is running; otherwise answer 409.
+
+            Replacing ``state["messages"]`` or ``state["session"]`` mid-turn
+            would corrupt the conversation the worker is writing into, so the
+            endpoints that do it refuse while a turn is active. The caller must
+            still hold ``lock`` when it performs the replacement: ``chat_lock``
+            here only rules out a turn that is already running, it does not
+            reserve the state for the caller.
+            """
+            with chat_lock:
+                if chat_state["active"]:
+                    self._error(
+                        409,
+                        f"cannot {action} while a request is running; stop it first",
+                    )
+                    return False
+                return True
+
         def _handle_chat(self, payload: dict[str, Any], stream: bool) -> None:
             with chat_lock:
                 if chat_state["active"]:
@@ -24371,6 +24390,19 @@ def run_web(
                 return
 
             events: list[dict[str, str]] = []
+            # 锁只保护 state 的读写，不覆盖 run_turn 和 SSE 写入。
+            #
+            # 原来整段（包括 run_turn 和每一次 _sse）都在 with lock 里，
+            # 一个对话回合可能持续几分钟，这期间 /api/open、/api/runtime
+            # （前端每 5 秒轮询）、/api/compact 全部阻塞。更糟的是 _sse 往
+            # 半开连接写入时会一直阻塞到 socket 超时（30 秒），持锁期间整
+            # 个 Web 服务挂起。
+            #
+            # 现在：锁内只准备本轮的状态（追加用户消息、跑压缩、取快照），
+            # 锁外执行 run_turn 和事件推送，最后再用锁收尾。并发安全由
+            # chat_state["active"] 保证——同一时刻只有一个对话回合，准备阶段
+            # 完成后 messages 不会再被别的请求替换（/api/open、/api/new、
+            # /api/delete 在忙时会被拒，见 require_idle）。
             with lock:
                 active_client = runtime["client"]
                 if not message.strip() and not loaded:
@@ -24428,98 +24460,102 @@ def run_web(
                                 f"~{auto_stats['after_tokens']} tokens "
                                 f"(kept {auto_stats['kept_messages']} messages)"
                             )
-                if stream and not self._sse_start():
-                    return
+                # 快照：锁外只用这一个列表对象。压缩会原地改写它，
+                # 但每轮只有本线程在动，不存在并发写。
+                turn_messages = state["messages"]
+                turn_session = state["session"]
+                turn_show_thinking = state.get("show_thinking", show_thinking)
+                turn_stream_enabled = bool(state.get("stream_enabled", True))
+            # 以下到收尾之前都不持锁。
+            if stream and not self._sse_start():
+                return
 
-                def emit(kind: str, text: str) -> None:
-                    if stream:
-                        self._sse({"type": kind, "text": text})
-                    else:
-                        events.append({"type": kind, "text": text})
+            def emit(kind: str, text: str) -> None:
+                if stream:
+                    self._sse({"type": kind, "text": text})
+                else:
+                    events.append({"type": kind, "text": text})
 
-                for note in auto_notes:
-                    emit("warning", note)
-                request_context = context_usage(
-                    state["messages"], request_model_info, active_client
+            for note in auto_notes:
+                emit("warning", note)
+            request_context = context_usage(
+                turn_messages, request_model_info, active_client
+            )
+            if request_context["percent"] >= 80:
+                emit(
+                    "warning",
+                    f"上下文估算约 {request_context['tokens']} / "
+                    f"{request_context['window']} tokens "
+                    f"({request_context['percent']}%); 建议 /compact",
                 )
-                if request_context["percent"] >= 80:
-                    emit(
-                        "warning",
-                        f"上下文估算约 {request_context['tokens']} / "
-                        f"{request_context['window']} tokens "
-                        f"({request_context['percent']}%); 建议 /compact",
-                    )
 
-                previous_approval_handler = workspace.approval_handler
-                if stream:
-                    workspace.approval_handler = (
-                        lambda action, detail: request_web_approval(
-                            action, detail, emit
-                        )
+            previous_approval_handler = workspace.approval_handler
+            if stream:
+                workspace.approval_handler = (
+                    lambda action, detail: request_web_approval(
+                        action, detail, emit
                     )
-                else:
-                    workspace.approval_handler = None
+                )
+            else:
+                workspace.approval_handler = None
+            try:
                 try:
-                    try:
-                        ok = run_turn(
-                            active_client,
-                            workspace,
-                            state["messages"],
-                            max_steps,
-                            render=False,
-                            show_thinking=state.get(
-                                "show_thinking", show_thinking
-                            ),
-                            session=state["session"],
-                            emit=emit,
-                            tools=tools,
-                            cancel_event=chat_state["cancel"],
-                            verbose_tools=True,
-                            context_window=request_model_info.context_window,
-                            stream=(
-                                stream
-                                and bool(state.get("stream_enabled", True))
-                            ),
-                            stream_flush_ms=0,
-                        )
-                    except ChatCancelled:
-                        emit("warning", "已停止")
-                        ok = False
-                    except ChatError as exc:
-                        detail = f"model request failed: {exc}"
-                        if stream:
-                            self._sse({"type": "error", "text": detail})
-                            self._sse({
-                                "type": "done",
-                                "session": state["session"].uuid,
-                                "ok": False,
-                                "usage": active_client.last_turn_usage,
-                                "truncated": active_client.last_turn_truncated,
-                            })
-                        else:
-                            self._error(502, detail)
-                        return
-                finally:
-                    workspace.approval_handler = previous_approval_handler
-                    cancel_pending_approval()
+                    ok = run_turn(
+                        active_client,
+                        workspace,
+                        turn_messages,
+                        max_steps,
+                        render=False,
+                        show_thinking=turn_show_thinking,
+                        session=turn_session,
+                        emit=emit,
+                        tools=tools,
+                        cancel_event=chat_state["cancel"],
+                        verbose_tools=True,
+                        context_window=request_model_info.context_window,
+                        stream=(stream and turn_stream_enabled),
+                        stream_flush_ms=0,
+                    )
+                except ChatCancelled:
+                    emit("warning", "已停止")
+                    ok = False
+                except ChatError as exc:
+                    detail = f"model request failed: {exc}"
+                    if stream:
+                        self._sse({"type": "error", "text": detail})
+                        self._sse({
+                            "type": "done",
+                            "session": turn_session.uuid,
+                            "ok": False,
+                            "usage": active_client.last_turn_usage,
+                            "truncated": active_client.last_turn_truncated,
+                        })
+                    else:
+                        self._error(502, detail)
+                    return
+            finally:
+                workspace.approval_handler = previous_approval_handler
+                cancel_pending_approval()
 
-                result = {
-                    "session": state["session"].uuid,
-                    "ok": ok,
-                    "stopped": chat_state["cancel"].is_set(),
-                    "usage": active_client.last_turn_usage,
-                    "truncated": active_client.last_turn_truncated,
-                }
-                if stream:
-                    self._sse({"type": "done", **result})
-                else:
-                    self._json(200, {
-                        **result,
-                        "reply": "\n".join(
-                            event["text"] for event in events if event["type"] == "content"
-                        ),
-                        "events": events,
-                    })
+            result = {
+                "session": turn_session.uuid,
+                "ok": ok,
+                "stopped": chat_state["cancel"].is_set(),
+                "usage": active_client.last_turn_usage,
+                "truncated": active_client.last_turn_truncated,
+            }
+            with lock:
+                state["last_activity"] = time.monotonic()
+            if stream:
+                self._sse({"type": "done", **result})
+            else:
+                self._json(200, {
+                    **result,
+                    "reply": "\n".join(
+                        event["text"] for event in events if event["type"] == "content"
+                    ),
+                    "events": events,
+                })
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -25101,6 +25137,8 @@ def run_web(
                 return
 
             if parsed.path == "/api/new":
+                if not self.require_idle("start a new session"):
+                    return
                 requested = payload.get("workspace")
                 changed = False
                 if requested is not None:
@@ -25573,6 +25611,8 @@ def run_web(
                 if not isinstance(uuid, str):
                     self._error(400, "session must be a string")
                     return
+                if not self.require_idle("delete a session"):
+                    return
                 was_current = False
                 with lock:
                     try:
@@ -25698,6 +25738,8 @@ def run_web(
                 uuid = payload.get("session")
                 if not isinstance(uuid, str):
                     self._error(400, "session must be a string")
+                    return
+                if not self.require_idle("open another session"):
                     return
                 changed = False
                 workspace_warning: str | None = None
