@@ -59,6 +59,7 @@ python3 tests/test_compact_single_request.py
 python3 tests/test_estimate_perf.py
 python3 tests/test_chat_lock_scope.py
 python3 tests/test_background_and_http.py
+python3 tests/test_compact_prompt.py
 ```
 
 测试会：
@@ -127,3 +128,4 @@ python3 tests/test_background_and_http.py
 | `test_estimate_perf.py` | token 估算改造：正则数宽字符与旧实现逐字节等价、`context_usage` 只扫描一次历史、`project_context_tokens` 复用传入的本地值 |
 | `test_chat_lock_scope.py` | 对话回合不持有全局会话锁：`run_turn` 与 SSE 写入在锁外、锁块足够窄、替换 state 的端点（`/api/open`、`/api/new`、`/api/delete`）在忙时返回 409、回合进行中其他请求仍能快速响应 |
 | `test_background_and_http.py` | 后台任务与 HTTP 工具：`background=true` 起任务、`job_output` 读尾部、`job_cancel` 杀进程树、数量上限与自动超时、`http_request` 的 GET/POST/4xx/重定向/非法 URL |
+| `test_compact_prompt.py` | 压缩摘要模板：8 个小节齐全、规则要点（省略系统指令/路径原样保留/不调用工具）、散文回复也照收且不额外发请求、滚动压缩的合并说明且不重复旧摘要 |

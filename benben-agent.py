@@ -468,7 +468,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.33.0"
+AGENT_VERSION = "0.33.1"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -6577,19 +6577,73 @@ def list_sessions() -> int:
 # --------------------------------------------------------------------------- #
 
 
-COMPACT_PROMPT = f"""你在为一个 AI agent 压缩对话历史。请把下面的对话总结成简洁、结构化的中文摘要，
-供之后继续任务时使用。只根据对话内容总结，不要编造，也不要回答对话里的问题。
+# 压缩摘要的模板与规则。结构参考 opencode 的 SUMMARY_TEMPLATE/SUMMARY_RULES，
+# 但保留中文输出、明确的字数上限和「执行过的命令」一节（调试类任务要靠它复现）。
+# 几个小节名会被 _compact_headings() 解析出来，用于校验模型有没有按模板回复。
+COMPACT_SUMMARY_SECTIONS = (
+    "目标",
+    "约束与偏好",
+    "关键决策",
+    "工作进展",
+    "下一步",
+    "涉及的文件与路径",
+    "执行过的命令",
+    "注意事项",
+)
 
-输出使用下面的小节（没有内容就写“无”）：
+COMPACT_SUMMARY_TEMPLATE = f"""输出必须使用下面的小节（不适用的写“无”），小节标题原样保留：
 ## 目标
-## 已完成
+- 用户想要达成什么，一到两句
+
+## 约束与偏好
+- 用户明确提出的限制、偏好、范围边界
+
 ## 关键决策
+- 已经定下来的选择以及为什么
+
+## 工作进展
+- 已完成：
+- 进行中：
+- 受阻：
+
+## 下一步
+1. 按顺序列出接下来要做的事
+
 ## 涉及的文件与路径
+- `路径`: 为什么重要（最多 15 个，按重要性排序，不要罗列所有碰过的文件）
+
 ## 执行过的命令
-## 未完成事项
+- 能复现问题或验证结果的关键命令
+
 ## 注意事项
+- 下一任 agent 无法自行查到、但必须知道的事实
 
 总长度控制在 {COMPACT_SUMMARY_CHARS} 字以内。"""
+
+COMPACT_PROMPT = f"""你在为一个 AI agent 压缩对话历史。把下面的对话总结成一份结构化摘要，
+供之后继续任务时使用。
+
+{COMPACT_SUMMARY_TEMPLATE}
+
+规则：
+- 每个小节写单行短句，不要写成段落或嵌套列表。
+- 只总结用户和助手说了什么、做了什么。省略助手被告知的系统指令、环境信息和仓库约定，
+  下一任 agent 会另外拿到这些内容的当前版本。
+- 文件路径、符号名、命令、错误原文、URL 原样保留，不要改写或简化。
+- 用户提出的问题或要求，只保留仍未解决的；已被后续对话解决或回答的不要重复。
+  保留未解决项的原话。
+- 只根据对话内容总结，不要编造，不要回答问题，也不要调用工具。
+- 不要提到“压缩”“摘要”这件事本身。
+- 只输出上列小节，不要加开头说明或结尾评论。"""
+
+
+def _compact_headings() -> tuple[str, ...]:
+    """模板要求的二级标题。
+
+    只用于文档和测试，不参与运行时校验：模型偶尔回散文时，下一次压缩会把
+    它当作「已有摘要」重新按模板整理，不需要为此多花一次完整调用。
+    """
+    return tuple(f"## {name}" for name in COMPACT_SUMMARY_SECTIONS)
 
 
 def _truncate_text(text: str, limit: int) -> str:
@@ -6879,11 +6933,28 @@ def compact_history(
                 )
             else:
                 progress(f"压缩中：发送 {len(entries)} 条…")
-        prompt = (
-            f"{COMPACT_PROMPT}\n\n待压缩的对话：\n{transcript}"
-            if transcript
-            else f"{COMPACT_PROMPT}\n\n已有摘要：\n{carried}"
-        )
+        if carried:
+            # 滚动压缩：告诉模型新历史与旧摘要冲突时以谁为准。不写这条，
+            # 模型容易把旧摘要里已完成的事继续挂在“未完成”，或者把两个
+            # 先后矛盾的方案并列写。
+            #
+            # transcript 里已经带了「已有摘要：...」这一段（见
+            # _fit_compaction_transcript 的 head），这里不要再拼一次。
+            merge_note = (
+                "下面是一份已有的摘要"
+                + ("，以及之后新增的对话。请把它更新成一份合并后的摘要。\n"
+                   "新对话优先于旧摘要：除非新对话明确否定了旧内容，否则保留旧摘要里的信息；\n"
+                   "已被新对话解决、回答或取代的内容要删掉，不要重复保留。\n"
+                   "工作进展和下一步要重新核对：做完的移出“进行中”，已解决的障碍和已回答的"
+                   "问题不要留着。\n"
+                   if transcript
+                   else "，没有需要合并的新对话。请按同样的格式整理它。\n")
+            )
+            prompt = f"{COMPACT_PROMPT}\n\n{merge_note}\n{transcript or f'已有摘要：{carried}'}"
+        elif transcript:
+            prompt = f"{COMPACT_PROMPT}\n\n待压缩的对话：\n{transcript}"
+        else:
+            prompt = f"{COMPACT_PROMPT}\n\n已有摘要：\n{carried}"
         try:
             reply = client.chat([{"role": "user", "content": prompt}], [])
         except ChatError as exc:

@@ -83,7 +83,8 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.dumps({
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "## 摘要\n- 做完了"},
+                "message": {"role": "assistant",
+                            "content": "## 目标\n- 做完了"},
                 "finish_reason": "stop",
             }],
             "usage": {"prompt_tokens": len(text) // 3, "completion_tokens": 10,
@@ -202,15 +203,16 @@ try:
 
     # ---------- 6. 预算计算 ----------
     fit = mod._fit_compaction_transcript
-    # 三条 100 字符英文各 26 token；固定开销 157，所以预算 200 只留得下最后一条
-    text, dropped = fit(["a" * 100, "b" * 100, "c" * 100], 200)
-    check("fit drops from the front", dropped == 2, dropped)
+    # 三条 100 字符英文各 26 token；固定开销随提示词变化，所以按实际值算。
+    overhead = mod._compaction_fixed_overhead()
+    text, dropped = fit(["a" * 100, "b" * 100, "c" * 100], overhead + 26 * 2 + 5)
+    check("fit drops from the front", dropped == 1, dropped)
     check("fit keeps only what fits",
           "a" * 100 not in text and "c" * 100 in text,
           f"dropped={dropped} len={len(text)}")
 
     # 预算连固定开销都不够：全部丢弃，但已有摘要仍然保留
-    text, dropped = fit(["a" * 100, "b" * 100], 100)
+    text, dropped = fit(["a" * 100, "b" * 100], overhead - 10)
     check("fit drops everything when budget is below overhead",
           dropped == 2 and text == "", f"dropped={dropped} len={len(text)}")
 
