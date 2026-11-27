@@ -217,6 +217,45 @@ check(
 )
 check("cmd never read only", not agent.is_read_only_command("dir", "cmd"))
 check("posix multi", agent.is_read_only_command("ls | grep x"))
+
+# ---------- read-only must not be fooled by hidden write channels ----------
+# shlex treats \n and \r as whitespace, so a two-line command tokenizes into one
+# innocent-looking segment while the shell runs both lines.
+check("newline blocks read only", not agent.is_read_only_command("ls\nrm -rf /tmp/x"))
+check("carriage return blocks read only", not agent.is_read_only_command("ls\rrm -rf /tmp/x"))
+# sed can write or execute from inside its script text, without any -i flag.
+check("sed e blocked", not agent.is_read_only_command("sed -n '1e touch /tmp/e' /etc/hostname"))
+check("sed w blocked", not agent.is_read_only_command("sed -n 'w /tmp/w' /etc/hostname"))
+check("sed s///w blocked", not agent.is_read_only_command("sed 's/a/b/w /tmp/w' f.txt"))
+check("sed s///e blocked", not agent.is_read_only_command("sed 's/a/b/e' f.txt"))
+check("sed -f blocked", not agent.is_read_only_command("sed -f script.sed f.txt"))
+# git -c can point at config keys that make git run a program.
+check(
+    "git -c core.fsmonitor blocked",
+    not agent.is_read_only_command("git -c core.fsmonitor='touch /tmp/g' status"),
+)
+check(
+    "git -c core.pager blocked",
+    not agent.is_read_only_command("git -c core.pager='id' log"),
+)
+check(
+    "git -c filter.* blocked",
+    not agent.is_read_only_command("git -c filter.x.clean='id' status"),
+)
+# The same commands in their honest form must stay read-only: over-blocking
+# would make the confirmation prompt useless.
+check("plain sed print still read only", agent.is_read_only_command("sed -n '1,10p' f.txt"))
+check("plain sed substitute still read only", agent.is_read_only_command("sed 's/red/blue/' f.txt"))
+check("sed regex address still read only", agent.is_read_only_command("sed -n '/error/p' log.txt"))
+check("sed -e still read only", agent.is_read_only_command("sed -e 's/a/b/' f.txt"))
+check(
+    "git -c harmless key still read only",
+    agent.is_read_only_command("git -c core.quotepath=false status"),
+)
+check(
+    "git -c user.name still read only",
+    agent.is_read_only_command("git -c user.name=test log --oneline"),
+)
 check("shell mismatch posix", agent._shell_mismatch("posix", 127, "", "foo: command not found"))
 check("shell mismatch posix localized", agent._shell_mismatch("posix", 127, "", "foo: 未找到命令"))
 check("shell mismatch real 127", not agent._shell_mismatch("posix", 127, "output", "done"))

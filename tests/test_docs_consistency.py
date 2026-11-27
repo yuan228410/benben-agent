@@ -38,6 +38,7 @@ readme = README.read_text(encoding="utf-8")
 # 全功能开启：把各子系统的开关都打开，取出全部工具名
 ws = mod.Workspace(tempfile.mkdtemp(prefix="doc-check-"))
 ws.allow_shell = True
+ws.allow_gui = True
 ws.skills_enabled = True
 ws.allow_skill_scripts = True
 ws.skills = {

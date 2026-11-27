@@ -262,9 +262,11 @@ Windows 乱码处理：
 | `--no-shell` | 关 | 禁用 `run_command` |
 | `--shell` | `auto` | shell：`auto`、`pwsh`、`powershell`、`git-bash`、`cmd`、`bash`、`zsh`、`sh` 或绝对路径 |
 | `--no-shell-fallback` | 关 | 当前 shell 不认识命令时，不自动尝试其他 shell |
+| `--gui-use` / `--no-gui-use` | 关 | 启用屏幕工具（`view_screen`、`list_windows`、`click`、`move_mouse`、`type_text`、`press_key`、`focus_window`）；需要 X11（`DISPLAY`）和 `xdotool`，定时任务里始终不提供 |
 | `--command-timeout` / `--max-command-timeout` | `60` / `600` | 命令默认超时和最大允许超时 |
 | `--stream` / `--no-stream` | 交互终端开 | 流式读取模型输出；管道和脚本默认关闭，`--no-stream` 保留完整 Markdown 渲染 |
-| `--stream-idle-timeout` | `300` | 流式期间多少秒没有任何事件视为超时 |
+| `--stream-idle-timeout` | `60` | 流式期间多少秒没有任何事件视为超时 |
+| `--stream-connect-timeout` | `30` | 请求发出后多少秒还没收到响应头就放弃 |
 | `--stream-flush-ms` | `40` | CLI 流式刷新间隔；`0` 表示每块都刷新 |
 | `--debug-stream` / `--no-debug-stream` | 关 | 只向 stderr 打印 SSE 事件类型，不打印正文；除了 `content_delta` 等正文事件，还能看到 `usage_live`（每次模型调用后的实时用量，Web 端用它刷新上下文指示器） |
 | `--mcp` / `--no-mcp` | 关 | 是否启用配置文件里的 MCP 服务；默认关闭，需要显式开启 |
@@ -303,10 +305,12 @@ Windows 乱码处理：
 | `--connect` | 关 | 打开连接配置向导；没有 prompt/`--web` 时配置完退出 |
 | `--profile NAME` | 无 | 使用指定保存连接，不修改配置里的 active |
 | `--config PATH` | `$BENBEN_CONFIG` 或 `~/.benben-agent/config.json` | 配置文件路径；文件不存在时写入完整默认值 |
-| `--no-config` | 关 | 启动时忽略配置文件，也不创建配置文件 |
+| `--no-config` | 关 | 启动时忽略配置文件，也不创建配置文件；**同时不读 `models.json`**，所有模型按 `fallback` 的 256000 上下文处理（见下） |
 | `--no-env` | 关 | 忽略 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` |
 
 > 有 active 保存连接时，`--base-url`、`--api-key`、`-m`、`--api-format` 的默认值来自保存连接；环境变量和显式参数会按上节优先级覆盖它。
+
+`--no-config` 不只跳过 `config.json`：它把 `models.json` 也一起跳过（`ModelRegistry(use_file=False)`），模型注册表因此为空，任何模型都落到 `fallback`。后果是上下文窗口按 256000 计算，页面和 CLI 的占用百分比、自动压缩的触发点、`max_output_tokens` 都按兜底值走。排障时用它可以，跑长会话前记得确认窗口数是不是想要的。
 
 ## 配置文件默认值
 
@@ -362,7 +366,8 @@ Windows 乱码处理：
     "command_timeout": 60,
     "max_command_timeout": 600,
     "stream": true,
-    "stream_idle_timeout": 300,
+    "stream_connect_timeout": 30,
+    "stream_idle_timeout": 60,
     "stream_flush_ms": 40,
     "debug_stream": false,
     "mcp": false,
@@ -1329,7 +1334,7 @@ CLI 和 Web 使用同一组指令。`/config save` 会把当前值写入 `defaul
 - 网关不支持流式时自动回退非流式
 - 网关忽略 `stream` 直接返回 JSON 时按完整响应处理
 - 首字节前失败可重试；已经输出后中断会报错，不自动续写
-- 流式无事件超过 `stream_idle_timeout` 会断开
+- 流式无事件超过 `stream_idle_timeout` 会断开；响应头迟迟不来超过 `stream_connect_timeout` 会放弃重试
 - 取消或 Ctrl+C 不会把半截回复写入会话历史
 
 配置：
@@ -1338,7 +1343,8 @@ CLI 和 Web 使用同一组指令。`/config save` 会把当前值写入 `defaul
 {
   "defaults": {
     "stream": true,
-    "stream_idle_timeout": 300,
+    "stream_connect_timeout": 30,
+    "stream_idle_timeout": 60,
     "stream_flush_ms": 40,
     "debug_stream": false
   }
@@ -1586,6 +1592,13 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `http_request` | 发 HTTP 请求，返回状态码、关键响应头和正文；支持任意方法、JSON body、自定义头、控制重定向。单次调用内跟随重定向时会带上 Cookie，重复的 `Set-Cookie` 都会保留（值打码只显示名字） | `--confirm` 时询问（GET/HEAD/OPTIONS 不问） |
 | `list_shells` | 列出检测到的 shell 和当前 shell | 无 |
 | `switch_shell` | 切换默认 shell | 无 |
+| `view_screen` | 截取整个屏幕并把画面附到对话里，模型能直接看到界面（需 `--gui-use`） | 无（只读） |
+| `list_windows` | 列出可操作的窗口：id、pid、位置尺寸、标题，标出当前活动窗口（需 `--gui-use`） | 无（只读） |
+| `click` | 移动鼠标到屏幕坐标并点击，支持左中右键和双击（需 `--gui-use`） | `--confirm` 时询问 |
+| `move_mouse` | 只移动鼠标不点击，用来悬停展开菜单（需 `--gui-use`） | `--confirm` 时询问 |
+| `type_text` | 向当前焦点窗口输入文字（需 `--gui-use`） | `--confirm` 时询问 |
+| `press_key` | 向当前焦点窗口发送按键或组合键，如 `ctrl+s`、`Return`（需 `--gui-use`） | `--confirm` 时询问 |
+| `focus_window` | 激活指定窗口，按 id 或标题片段查找（需 `--gui-use`） | `--confirm` 时询问 |
 | `submit_plan` | 提交实施计划并等待用户批准（仅计划模式下提供） | 无 |
 | `load_skill` | 加载技能的完整 SKILL.md（仅启用技能时提供） | 无 |
 | `read_skill_resource` | 读取技能目录内的参考文件（仅存在资源时提供） | 无 |
@@ -1606,7 +1619,7 @@ Web 聊天框会拦截以下命令，其余斜杠命令会被当成普通消息�
 | `read_episode` | 读取情景记忆文件（仅启用记忆时提供） | 无 |
 | `generate_daily_episode` | 生成自动日总结（仅启用记忆时提供） | 计划模式守卫 |
 
-全部功能开启时共 35 个工具（不含 MCP 动态注入的工具）。
+全部功能开启时共 42 个工具（不含 MCP 动态注入的工具）。
 
 审批列的含义：
 
@@ -1661,6 +1674,36 @@ python3 benben-agent.py -i screenshot.png "这个报错是什么原因"
 图片会以 base64 保存在会话 JSONL 里，重新加载历史会话时可以直接显示；代价是带图片的会话文件会明显变大。
 
 支持 PNG、JPEG、GIF（按静态图）、WEBP、BMP；单张不超过 10 MB，每条消息最多 4 张。全程只用标准库，不缩放、不转码，超过限制会直接报错。
+
+## 屏幕工具（GUI）
+
+让模型看到你的桌面，并可以移动鼠标、点击、打字。**默认关闭**，要显式打开：
+
+```bash
+python3 benben-agent.py --gui-use "帮我看看这个报错弹窗，点掉它"
+```
+
+| 工具 | 作用 | 确认 |
+| --- | --- | --- |
+| `view_screen` | 截取整个屏幕，画面直接附进对话，模型能看见 | 不问（只读） |
+| `list_windows` | 列出可操作的窗口：id、pid、位置尺寸、标题、当前活动窗口 | 不问（只读） |
+| `click` | 移动到坐标并点击，支持左中右键、双击 | `--confirm` 时询问 |
+| `move_mouse` | 只移动不点击，用来悬停展开菜单 | `--confirm` 时询问 |
+| `type_text` | 向当前焦点窗口输入文字 | `--confirm` 时询问 |
+| `press_key` | 发送按键或组合键，如 `ctrl+s`、`Return` | `--confirm` 时询问 |
+| `focus_window` | 按 id 或标题片段激活窗口 | `--confirm` 时询问 |
+
+依赖：Linux + X11（`DISPLAY`）+ `xdotool`；截图用 `scrot`、ImageMagick 的 `import` 或 `gnome-screenshot` 中任意一个，也可以用 `xwd` + `convert`。缺什么启动时对应的工具就不出现，调用时会说明要装哪个。
+
+几点行为需要知道：
+
+- **截图会以 base64 进入对话**，和 `-i` 附加的图片一样，会话文件会变大；
+- 工具消息在 OpenAI chat 协议里只能是文本，所以画面作为**紧跟在工具结果后面的一条 user 消息**发出，三种协议都已验证；
+- **定时任务里始终不给**屏幕工具：后台无人值守，截图会把你的屏幕内容发给模型，点击也没人确认；
+- 运行在 `--web` 模式下时，设置页有「启用屏幕工具」开关，切换立即生效；
+- 坐标是绝对屏幕像素，左上角为 `(0, 0)`，和 `view_screen` 报告的尺寸一致。
+
+`--no-confirm` 关掉确认后，点击和打字也会直接执行，不再询问。这是刻意的：确认开关决定一切。
 
 ## 终端输出与 Markdown 渲染
 

@@ -267,6 +267,7 @@ import shutil
 import stat
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -468,7 +469,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.33.2"
+AGENT_VERSION = "0.34.0"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -1558,7 +1559,12 @@ class BaseChatClient:
         self.supports_stream = True
         self.supports_stream_options = True
         self.supports_cancel = True
-        self.stream_idle_timeout = 300.0
+        # Two different waits: connecting waits for the response headers, which
+        # real gateways send in about a second; an established stream goes quiet
+        # between events, sometimes for several seconds in the middle of a long
+        # answer. Sharing one value made the connect timeout absurdly loose.
+        self.stream_connect_timeout = 30.0
+        self.stream_idle_timeout = 60.0
         self.debug_stream = False
 
     def _headers(self) -> dict[str, str]:
@@ -1770,24 +1776,40 @@ class BaseChatClient:
         url: str,
         payload: dict[str, Any],
         timeout: float | None = None,
+        cancel_event: "threading.Event | None" = None,
     ) -> Any:
         """Open an SSE request, retrying connection/HTTP errors.
 
         A 4xx that looks like "this endpoint does not stream" raises
         StreamNotSupported so the caller can retry without streaming.
+
+        ``urlopen`` blocks until the response headers arrive. A gateway that
+        accepts the request and then says nothing would keep the caller stuck
+        there, ignoring a stop request for as long as the timeout, so the
+        connection is opened on a worker thread that can be aborted.
+
+        The connect wait uses ``stream_connect_timeout``, not the idle timeout:
+        headers arrive in about a second on a healthy gateway, while an
+        established stream legitimately goes quiet for seconds between events.
         """
         headers = self._headers()
         headers["Accept"] = "text/event-stream"
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
-        timeout_value = timeout or self.stream_idle_timeout
+        timeout_value = timeout or self.stream_connect_timeout
         for attempt in range(self.max_retries + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ChatCancelled()
             retry_after = None
             request = urllib.request.Request(
                 url, data=data, headers=headers, method="POST"
             )
             try:
-                return urllib.request.urlopen(request, timeout=timeout_value)
+                response = self._open_with_cancel(request, timeout_value, cancel_event)
+                self._apply_stream_idle_timeout(response)
+                return response
+            except ChatCancelled:
+                raise
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:1000]
                 retry_after = exc.headers.get("Retry-After")
@@ -1807,7 +1829,37 @@ class BaseChatClient:
                 raise error
             delay = _retry_delay(retry_after, attempt)
             print(f"[retry] {error}; retrying in {delay:.1f}s", file=sys.stderr)
-            time.sleep(delay)
+            # Sleep in slices so a stop request during the backoff is honoured
+            # instead of waiting out the full delay.
+            deadline = time.monotonic() + delay
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ChatCancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if cancel_event is not None:
+                    cancel_event.wait(min(0.1, remaining))
+                    if cancel_event.is_set():
+                        raise ChatCancelled()
+                else:
+                    time.sleep(min(0.1, remaining))
+
+    def _apply_stream_idle_timeout(self, response: Any) -> None:
+        """Switch the live socket from the connect timeout to the idle timeout.
+
+        urlopen() installs its timeout on the socket, and that same value then
+        governs every readline(). The connect wait should be short (headers come
+        fast) while the mid-stream wait should be longer (a long answer pauses
+        between events), so the socket timeout is reset once connected.
+        """
+        sock = _response_socket(response)
+        if sock is None:
+            return
+        try:
+            sock.settimeout(float(self.stream_idle_timeout))
+        except (OSError, AttributeError, ValueError):
+            pass
 
     def _sse_events(
         self,
@@ -1860,6 +1912,11 @@ class BaseChatClient:
                         raise ChatCancelled() from exc
                     raise ChatError(f"stream read failed: {exc}") from exc
                 if not raw_line:
+                    # A stop request shuts the socket down, which makes readline()
+                    # return b"" instead of raising, so the cancel has to be
+                    # re-checked here or it is reported as a truncated stream.
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ChatCancelled()
                     break
                 line = decoder.decode(raw_line)
                 for event in self._sse_events(line):
@@ -1990,7 +2047,7 @@ class ChatClient(BaseChatClient):
         saw_done = False
 
         response = self._open_stream(
-            f"{self.base_url}/chat/completions", payload
+            f"{self.base_url}/chat/completions", payload, cancel_event=cancel_event
         )
         direct = self._direct_json_response(response)
         if direct is not None:
@@ -2454,7 +2511,9 @@ class AnthropicClient(BaseChatClient):
         saw_event = False
         saw_stop = False
 
-        response = self._open_stream(f"{self._root()}/messages", payload)
+        response = self._open_stream(
+            f"{self._root()}/messages", payload, cancel_event=cancel_event
+        )
         direct = self._direct_json_response(response)
         if direct is not None:
             self._stream_debug("direct-json")
@@ -2861,7 +2920,9 @@ class ResponsesClient(BaseChatClient):
         final: dict[str, Any] | None = None
         saw_event = False
 
-        response = self._open_stream(f"{self._v1_root()}/responses", payload)
+        response = self._open_stream(
+            f"{self._v1_root()}/responses", payload, cancel_event=cancel_event
+        )
         direct = self._direct_json_response(response)
         if direct is not None:
             self._stream_debug("direct-json")
@@ -3027,6 +3088,7 @@ def default_settings() -> dict[str, Any]:
         "shell": "auto",
         "shell_enabled": True,
         "shell_fallback": True,
+        "gui": False,
         "confirm": False,
         "thinking": False,
         "reasoning": None,
@@ -3069,7 +3131,8 @@ def default_settings() -> dict[str, Any]:
         "live_max_lines": LIVE_MAX_LINES,
         "live_tick_seconds": LIVE_TICK_SECONDS,
         "stream": True,
-        "stream_idle_timeout": 300,
+        "stream_connect_timeout": 30,
+        "stream_idle_timeout": 60,
         "stream_flush_ms": 40,
         "debug_stream": False,
         "mcp": False,
@@ -3091,6 +3154,9 @@ LIVE_DEFAULT_KEYS = frozenset({
     "live_tick_seconds",
     "shell_enabled",
     "shell_fallback",
+    "gui",
+    "stream_idle_timeout",
+    "stream_connect_timeout",
 })
 
 
@@ -3239,6 +3305,7 @@ def _normalize_defaults(
     bool_keys = (
         "shell_enabled",
         "shell_fallback",
+        "gui",
         "confirm",
         "thinking",
         "plan_mode",
@@ -3500,6 +3567,7 @@ def _normalize_defaults(
         ("live_flush_ms", 0, 5000, "milliseconds"),
         ("live_max_lines", 1, 1000, "lines"),
         ("stream_idle_timeout", 10, 3600, "seconds"),
+        ("stream_connect_timeout", 5, 600, "seconds"),
         ("stream_flush_ms", 0, 1000, "milliseconds"),
         ("mcp_timeout", 1, 3600, "seconds"),
     ):
@@ -4407,6 +4475,7 @@ def resolve_settings(args: Any, config: dict[str, Any]) -> None:
     args.shell = pick("shell", "auto") or "auto"
     args.shell_enabled = bool(pick("shell_enabled", True))
     args.shell_fallback = bool(pick("shell_fallback", True))
+    args.gui = bool(pick("gui", False))
     args.confirm = bool(pick("confirm", False))
     args.thinking = bool(pick("thinking", False))
     args.reasoning = pick("reasoning", None)
@@ -4476,7 +4545,8 @@ def resolve_settings(args: Any, config: dict[str, Any]) -> None:
         pick("live_tick_seconds", LIVE_TICK_SECONDS)
     )
     args.stream = bool(pick("stream", True))
-    args.stream_idle_timeout = int(pick("stream_idle_timeout", 300))
+    args.stream_idle_timeout = int(pick("stream_idle_timeout", 60))
+    args.stream_connect_timeout = int(pick("stream_connect_timeout", 30))
     args.stream_flush_ms = int(pick("stream_flush_ms", 40))
     args.debug_stream = bool(pick("debug_stream", False))
     args.mcp = bool(pick("mcp", False))
@@ -4500,6 +4570,7 @@ def settings_from_runtime(
         "shell": workspace.shell_state.current.path,
         "shell_enabled": bool(workspace.allow_shell),
         "shell_fallback": bool(workspace.shell_fallback),
+        "gui": bool(workspace.allow_gui),
         "confirm": bool(workspace.confirm),
         "thinking": bool(show_thinking),
         "reasoning": reasoning.label if reasoning is not None else None,
@@ -4543,6 +4614,7 @@ def settings_from_runtime(
         "live_tick_seconds": float(args.live_tick_seconds),
         "stream": bool(args.stream),
         "stream_idle_timeout": int(args.stream_idle_timeout),
+        "stream_connect_timeout": int(args.stream_connect_timeout),
         "stream_flush_ms": int(args.stream_flush_ms),
         "debug_stream": bool(args.debug_stream),
         "mcp": bool(args.mcp),
@@ -5552,6 +5624,204 @@ def load_images(paths: list[str]) -> list[tuple[str, str]]:
     if len(paths) > MAX_IMAGES:
         raise ImageError(f"too many images: {len(paths)} (max {MAX_IMAGES})")
     return [load_image(path) for path in paths]
+
+
+# --------------------------------------------------------------------------- #
+# Screen capture and GUI control
+# --------------------------------------------------------------------------- #
+
+
+class ToolImage(NamedTuple):
+    """A tool result that carries an image the model should look at.
+
+    Tool messages in the OpenAI chat format only hold text, so the image travels
+    in a separate user message appended right after the result (see run_turn).
+    """
+
+    text: str
+    data_url: str
+    name: str
+
+
+SCREENSHOT_DIR = os.path.join(SESSION_DIR, "screens")
+SCREENSHOT_MAX_EDGE = 1920
+
+
+def _display_server() -> str | None:
+    """The display GUI tools should talk to, or None when there is no screen."""
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        return None
+    return os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or None
+
+
+def _gui_x11_tools() -> dict[str, str]:
+    """X11 helpers that exist here: capture and input synthesis."""
+    tools: dict[str, str] = {}
+    for name in ("scrot", "import", "gnome-screenshot", "xwd", "convert", "xdotool"):
+        found = shutil.which(name)
+        if found:
+            tools[name] = found
+    return tools
+
+
+def gui_capture_available() -> bool:
+    if _display_server() is None:
+        return False
+    tools = _gui_x11_tools()
+    capture = "scrot" in tools or "import" in tools or "gnome-screenshot" in tools
+    if "xwd" in tools and "convert" in tools:
+        capture = True
+    return capture
+
+
+def gui_input_available() -> bool:
+    return _display_server() is not None and bool(shutil.which("xdotool"))
+
+
+def _gui_unavailable_reason(need_input: bool) -> str:
+    if _display_server() is None:
+        return (
+            "no display server: set DISPLAY (X11) before starting the agent; "
+            "screen tools only work in a graphical session"
+        )
+    if need_input and not shutil.which("xdotool"):
+        return "xdotool is not installed; run: sudo apt install xdotool"
+    return (
+        "no screen capture tool found; install one of scrot, ImageMagick (import) "
+        "or gnome-screenshot"
+    )
+
+
+def _image_dimensions(path: str) -> tuple[int, int]:
+    """Width/height from the PNG or JPEG header; (0, 0) when unknown."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(32)
+    except OSError:
+        return (0, 0)
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and len(head) >= 24:
+        width, height = struct.unpack(">II", head[16:24])
+        return (int(width), int(height))
+    if head.startswith(b"\xff\xd8\xff"):
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            return (0, 0)
+        index = 2
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+                height, width = struct.unpack(">HH", data[index + 5:index + 9])
+                return (int(width), int(height))
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                index += 2
+                continue
+            length = struct.unpack(">H", data[index + 2:index + 4])[0]
+            index += 2 + length
+    return (0, 0)
+
+
+def capture_screen_png(path: str, timeout: float = 20.0) -> None:
+    """Write a PNG of the whole screen using whichever capture tool exists."""
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    tools = _gui_x11_tools()
+    errors: list[str] = []
+    for name in ("scrot", "import", "gnome-screenshot"):
+        exe = tools.get(name)
+        if not exe:
+            continue
+        if name == "scrot":
+            argv = [exe, "-o", path]
+            stdin_data: bytes | None = None
+        elif name == "import":
+            argv = [exe, "-window", "root", path]
+            stdin_data = None
+        else:
+            argv = [exe, "-f", path]
+            stdin_data = None
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, timeout=timeout, input=stdin_data
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        if proc.returncode == 0 and os.path.exists(path) and os.path.getsize(path):
+            return
+        errors.append(
+            f"{name}: exit {proc.returncode} "
+            f"{decode_output(proc.stderr, ('utf-8',))[:120]}"
+        )
+    if "xwd" in tools and "convert" in tools:
+        try:
+            dump = subprocess.run(
+                [tools["xwd"], "-root", "-silent"], capture_output=True, timeout=timeout
+            )
+            if dump.returncode == 0:
+                convert = subprocess.run(
+                    [tools["convert"], "xwd:-", path],
+                    input=dump.stdout,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                if convert.returncode == 0 and os.path.exists(path) and os.path.getsize(path):
+                    return
+                errors.append(
+                    f"convert: exit {convert.returncode} "
+                    f"{decode_output(convert.stderr, ('utf-8',))[:120]}"
+                )
+            else:
+                errors.append(
+                    f"xwd: exit {dump.returncode} "
+                    f"{decode_output(dump.stderr, ('utf-8',))[:120]}"
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors.append(f"xwd: {exc}")
+    detail = "; ".join(errors) if errors else "no capture tool available"
+    raise ToolError(f"screen capture failed: {detail}")
+
+
+def _window_is_managed(wid: str) -> bool:
+    """True when the window manager manages this window as a real top-level.
+
+    Chrome and VS Code create internal 200x200 X windows that pass every size
+    test but cannot be clicked; they never carry _NET_WM_STATE, while a real
+    top-level window does.
+    """
+    exe = shutil.which("xprop")
+    if not exe:
+        return True  # no xprop: fall back to the size filters alone
+    try:
+        proc = subprocess.run(
+            [exe, "-id", str(wid), "_NET_WM_STATE"],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    out = decode_output(proc.stdout, ("utf-8",))
+    return "_NET_WM_STATE" in out and "not found" not in out
+
+
+def _xdotool(*args: str, timeout: float = 15.0) -> str:
+    exe = shutil.which("xdotool")
+    if not exe:
+        raise ToolError(_gui_unavailable_reason(need_input=True))
+    try:
+        proc = subprocess.run(
+            [exe, *args], capture_output=True, timeout=timeout
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ToolError(f"xdotool failed: {exc}") from exc
+    stdout = decode_output(proc.stdout, ("utf-8",))
+    if proc.returncode != 0:
+        stderr = decode_output(proc.stderr, ("utf-8",)).strip()
+        raise ToolError(f"xdotool {args[0]} failed: {stderr or 'exit ' + str(proc.returncode)}")
+    return stdout
 
 
 def check_data_url(data_url: Any, name: str) -> tuple[str, str]:
@@ -6746,7 +7016,7 @@ def _compact_split(messages: list[dict[str, Any]], keep: int) -> int:
     seen = 0
     for index in range(len(messages) - 1, 0, -1):
         message = messages[index]
-        if message.get("role") == "user" and not message.get("_compact"):
+        if message.get("role") == "user" and not message.get("_compact") and not message.get("_tool_image"):
             seen += 1
             if seen >= keep:
                 return index
@@ -9455,7 +9725,17 @@ LIST_SHELLS_SCHEMA: dict[str, Any] = {
     },
 }
 
-READ_ONLY_TOOL_NAMES = frozenset({"list_dir", "read_file", "read_files", "read_file_outline", "search", "glob", "job_output", "job_list"})
+# Tools that only read state and never ask for approval. Screen capture and
+# the window list belong here: they change nothing on screen, and the model
+# needs them to see what it is about to act on.
+READ_ONLY_TOOL_NAMES = frozenset({
+    "list_dir", "read_file", "read_files", "read_file_outline", "search", "glob",
+    "job_output", "job_list", "view_screen", "list_windows",
+})
+GUI_TOOL_NAMES = frozenset({
+    "view_screen", "list_windows", "click", "move_mouse", "type_text",
+    "press_key", "focus_window",
+})
 SCHEDULE_TOOL_NAMES = frozenset({
     "create_schedule",
     "list_schedules",
@@ -9836,12 +10116,22 @@ def tool_schemas(workspace: "Workspace") -> list[dict[str, Any]]:
         if workspace.memory is None:
             return []
         return list(MEMORY_SCHEMAS)
+    # Screen tools are off unless the user turned them on, and never inside a
+    # scheduled run where nobody is watching the desktop.
+    gui_enabled = bool(workspace.allow_gui) and not workspace.scheduled_run
     if workspace.read_only:
         tools = [
             tool
             for tool in TOOL_SCHEMAS
             if tool["function"]["name"] in READ_ONLY_TOOL_NAMES
         ]
+        if gui_enabled:
+            for schema in GUI_SCHEMAS:
+                name = schema["function"]["name"]
+                if name == "view_screen" and gui_capture_available():
+                    tools.append(schema)
+                elif name == "list_windows" and gui_input_available():
+                    tools.append(schema)
         if workspace.memory is not None:
             tools.extend(
                 tool
@@ -9885,6 +10175,20 @@ def tool_schemas(workspace: "Workspace") -> list[dict[str, Any]]:
         )
         tools.append(list_shells)
         tools.append(SWITCH_SHELL_SCHEMA)
+        if gui_enabled:
+            available_gui = {
+                "view_screen": gui_capture_available(),
+                "list_windows": gui_input_available(),
+                "click": gui_input_available(),
+                "move_mouse": gui_input_available(),
+                "type_text": gui_input_available(),
+                "press_key": gui_input_available(),
+                "focus_window": gui_input_available(),
+            }
+            for schema in GUI_SCHEMAS:
+                name = schema["function"]["name"]
+                if available_gui.get(name, False):
+                    tools.append(schema)
         if workspace.memory is not None:
             tools.extend(MEMORY_SCHEMAS)
     if workspace.skills or workspace.skills_enabled:
@@ -10355,6 +10659,161 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
+GUI_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "view_screen",
+            "description": (
+                "Capture the whole screen and look at it. The picture is attached "
+                "to the conversation, so you can read the interface and decide "
+                "what to do next. Use it before clicking and again afterwards to "
+                "confirm the result. Read-only: it does not move the pointer or "
+                "type anything."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "Short label for this capture, used in the file name "
+                            "and in the text you see, e.g. 'before click'."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_windows",
+            "description": (
+                "List open windows with their id, pid, geometry and title. Use it "
+                "to find a window before focusing it, and to read coordinates. "
+                "Read-only."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "click",
+            "description": (
+                "Move the pointer to a screen position and click. Coordinates are "
+                "absolute screen pixels with the top-left corner as (0, 0) - the "
+                "same coordinates view_screen reports. Changes the screen: it "
+                "needs approval unless confirmation is switched off."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Horizontal pixel, 0 at the left edge."},
+                    "y": {"type": "integer", "description": "Vertical pixel, 0 at the top edge."},
+                    "button": {
+                        "type": "string",
+                        "description": "left (default), middle or right.",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Clicks to send: 1 (default), 2 for a double click, 3 maximum.",
+                    },
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_mouse",
+            "description": (
+                "Move the pointer without clicking. Useful to hover and reveal a "
+                "menu or tooltip. Changes the pointer position."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Horizontal pixel."},
+                    "y": {"type": "integer", "description": "Vertical pixel."},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "type_text",
+            "description": (
+                "Type text into whichever window has focus. Call focus_window "
+                "first when the target is not focused. Changes the screen."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type. Up to 5000 characters.",
+                    },
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": (
+                            "Delay between keystrokes in milliseconds "
+                            "(default 12, max 500). Raise it for slow applications."
+                        ),
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "press_key",
+            "description": (
+                "Press a key or key combination in the focused window, e.g. "
+                "'Return', 'Escape', 'ctrl+s', 'alt+Tab'. Changes the screen."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keys": {
+                        "type": "string",
+                        "description": "Key names joined with '+', e.g. ctrl+shift+t.",
+                    },
+                },
+                "required": ["keys"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "focus_window",
+            "description": (
+                "Activate a window so keystrokes reach it. Accepts a numeric id "
+                "from list_windows or part of a window title. Changes the screen."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Window id, or a substring of the title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    },
+]
+
+
 MCP_RESOURCE_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -10429,8 +10888,15 @@ JOURNAL_UNSAFE = (
 )
 DMESG_UNSAFE = {"--clear", "--console-off", "--console-on", "--level"}
 
-# sed only writes when asked to edit in place.
+# sed writes through -i, and its script text can also write or execute: `w file`
+# writes, `e command` (and the `e`/`w` flags of s///) run a shell command or write
+# a file. Those live in the script argument, not in a flag, so they need their own
+# scan; see _sed_script_is_unsafe().
 SED_UNSAFE_PREFIXES = ("-i", "--in-place")
+SED_VALUE_FLAGS = frozenset({
+    "-e", "--expression", "-f", "--file", "-l", "--line-length",
+    "--zero-terminated", "-z",
+})
 # awk can run commands and redirect output from inside the program text.
 AWK_UNSAFE_RE = re.compile(r"system\s*\(|getline|\bprint(?:f)?\b[^;{}]*[>|]")
 AWK_PROGRAM_FILE_FLAGS = ("-f", "--file", "-E", "--exec", "--source")
@@ -10570,6 +11036,52 @@ def _git_positionals(args: list[str]) -> list[str]:
     return [arg for arg in args if not arg.startswith("-")]
 
 
+# Config keys that make git run a program or load code during an otherwise
+# read-only command. `git -c core.fsmonitor=<cmd> status` really does run <cmd>.
+GIT_EXECUTING_CONFIG_KEYS = frozenset({
+    "core.fsmonitor",
+    "core.pager",
+    "core.editor",
+    "core.sshcommand",
+    "core.gitproxy",
+    "core.hookspath",
+    "core.alternaterefscommand",
+    "sequence.editor",
+    "diff.external",
+    "gpg.program",
+    "gpg.ssh.program",
+    "credential.helper",
+    "ssh.variant",
+    "uploadpack.packobjectshook",
+    "protocol.ext.allow",
+    "filter",
+})
+# Prefixes: filter.<driver>.clean/smudge/process, diff.<driver>.command, etc.
+GIT_EXECUTING_CONFIG_PREFIXES = (
+    "filter.",
+    "diff.",
+    "merge.",
+    "credential.",
+    "protocol.",
+    "include.",
+    "pager.",
+    "alias.",
+    "submodule.",
+    "tar.",
+    "url.",
+)
+
+
+def _git_config_setting_is_unsafe(setting: str) -> bool:
+    """True when `git -c <setting>` could execute code or read extra config."""
+    key = setting.split("=", 1)[0].strip().lower()
+    if not key:
+        return False
+    if key in GIT_EXECUTING_CONFIG_KEYS:
+        return True
+    return key.startswith(GIT_EXECUTING_CONFIG_PREFIXES)
+
+
 def is_read_only_git(args: list[str]) -> bool:
     """True when git does not destroy uncommitted/untracked data or history.
 
@@ -10585,6 +11097,20 @@ def is_read_only_git(args: list[str]) -> bool:
         if not token.startswith("-"):
             break
         base = token.lower().split("=", 1)[0]
+        if base == "-c":
+            # `git -c key=value` overrides config for this run, and a few keys
+            # make git execute a command or load code from elsewhere. Check the
+            # key, not just the flag.
+            if "=" in token:
+                setting = token.split("=", 1)[1]
+            else:
+                if index + 1 >= total:
+                    return False
+                setting = args[index + 1]
+            if _git_config_setting_is_unsafe(setting):
+                return False
+            index += 1 if "=" in token else 2
+            continue
         if base in GIT_GLOBAL_VALUE_FLAGS:
             index += 1 if "=" in token else 2
             continue
@@ -10627,6 +11153,113 @@ def is_read_only_git(args: list[str]) -> bool:
     return False
 
 
+def _sed_script_is_unsafe(script: str) -> bool:
+    """True when a sed script can write a file or run a command.
+
+    sed has two silent write channels beyond -i: the commands `w file` / `W file`
+    (write the pattern space) and `e` / `e command` (run a shell command), and
+    the same as s/// flags (`s/a/b/w out`, `s/a/b/e`).
+    """
+    text = script or ""
+    # s/// with a w or e flag: look at the flag tail after the third delimiter.
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])s(.)(?:.*?)(?<!\\)\1(?:.*?)(?<!\\)\1([gpiImM0-9]*[we][gpiImM0-9e]*)"
+    )
+    for match in pattern.finditer(text):
+        if "w" in match.group(2) or "e" in match.group(2):
+            return True
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in " \t\n;{}":
+            index += 1
+            continue
+        # Skip an optional address so `1w file` and `/re/w file` are caught too.
+        if char.isdigit() or char in "$~,+!":
+            index += 1
+            continue
+        if char == "/":
+            close = index + 1
+            while close < length and text[close] != "/":
+                close += 2 if text[close] == "\\" else 1
+            index = close + 1
+            continue
+        if char in "wWeE":
+            # w/W always write a file; e runs a command. Both change state.
+            return True
+        if char in "sy":
+            # s and y take a delimiter; skip the whole command so its body is
+            # not mistaken for a command letter.
+            delimiter = text[index + 1:index + 2]
+            if not delimiter:
+                return False
+            parts = 2 if char == "s" else 2
+            cursor = index + 2
+            seen = 0
+            while cursor < length and seen <= parts:
+                current = text[cursor]
+                if current == "\\":
+                    cursor += 2
+                    continue
+                if current == delimiter:
+                    seen += 1
+                if seen > parts:
+                    break
+                cursor += 1
+            # Jump past the flags to the next command.
+            while cursor < length and text[cursor] not in ";\n}":
+                cursor += 1
+            index = cursor + 1
+            continue
+        # Any other command: skip to the next separator.
+        while index < length and text[index] not in ";\n}":
+            index += 2 if text[index] == "\\" else 1
+        index += 1
+    return False
+
+
+def _sed_args_are_unsafe(args: list[str]) -> bool:
+    """Inspect sed flags and every script argument it was given."""
+    index = 0
+    saw_script = False
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if arg.startswith("-i") or arg.startswith("--in-place"):
+            return True
+        if arg.startswith("-") and arg != "-":
+            base = arg.split("=", 1)[0]
+            if base in ("-f", "--file"):
+                # The script lives in a file we cannot inspect.
+                return True
+            if base in ("--expression",):
+                value = arg.split("=", 1)[1] if "=" in arg else (
+                    args[index + 1] if index + 1 < len(args) else ""
+                )
+                if _sed_script_is_unsafe(value):
+                    return True
+                saw_script = True
+                index += 1 if "=" in arg else 2
+                continue
+            if base == "-e":
+                if index + 1 < len(args) and _sed_script_is_unsafe(args[index + 1]):
+                    return True
+                saw_script = True
+                index += 2
+                continue
+            index += 2 if base in SED_VALUE_FLAGS else 1
+            continue
+        if not saw_script:
+            if _sed_script_is_unsafe(arg):
+                return True
+            saw_script = True
+        index += 1
+    return False
+
+
 def _posix_read_only_commands(shell_name: str, platform_name: str) -> set[str]:
     """Drop allowlist entries that this shell/platform does not actually ship."""
     allowed = set(READ_ONLY_COMMANDS)
@@ -10658,6 +11291,8 @@ def _posix_words_are_read_only(words: list[str], allowed: set[str]) -> bool:
         return False
     if program == "awk" and _awk_args_are_unsafe(args):
         return False
+    if program == "sed" and _sed_args_are_unsafe(args):
+        return False
     if program == "xargs" and not _xargs_target_is_read_only(args, allowed):
         return False
     return True
@@ -10665,6 +11300,12 @@ def _posix_words_are_read_only(words: list[str], allowed: set[str]) -> bool:
 
 def _posix_read_only(command: str, shell_name: str, platform_name: str) -> bool:
     if not command.strip():
+        return False
+    # shlex treats a newline as plain whitespace, so `ls\nrm -rf x` tokenizes to
+    # ['ls', 'rm', '-rf', 'x'] and looks like `ls` with harmless arguments. The
+    # shell, however, runs both lines. Refuse anything that carries a raw line
+    # break: a read-only inspection never needs one.
+    if "\n" in command or "\r" in command:
         return False
     # $(...) runs a command; a plain $VAR only expands to a string and is never
     # re-parsed as shell syntax, so it cannot introduce a new command. Blocking
@@ -12806,10 +13447,14 @@ class Workspace:
         live_flush_ms: int = LIVE_FLUSH_MS,
         live_max_lines: int = LIVE_MAX_LINES,
         live_tick_seconds: float = LIVE_TICK_SECONDS,
+        allow_gui: bool = False,
     ) -> None:
         self.root = os.path.realpath(root)
         self.confirm = confirm
         self.allow_shell = allow_shell
+        # Screen tools stay off until asked for: they read the user's desktop
+        # and, once input tools are in play, can drive it.
+        self.allow_gui = allow_gui
         self.skills = skills or {}
         self.skills_enabled = False
         self.only_own_skills = False
@@ -14029,6 +14674,239 @@ class Workspace:
     def list_shells(self) -> str:
         return self.shell_state.describe()
 
+    # -- Screen and GUI ---------------------------------------------------- #
+
+    def _screenshot_path(self, name: str) -> str:
+        _ensure_sessions_dir()
+        os.makedirs(SCREENSHOT_DIR, mode=0o700, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "").strip())[:40].strip("-.")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        return os.path.join(SCREENSHOT_DIR, f"{stamp}-{safe or 'screen'}.png")
+
+    def view_screen(self, save_path: str = "", note: str = "") -> "ToolImage":
+        """Capture the screen and hand the picture to the model.
+
+        The image is returned as ToolImage rather than a plain string: tool
+        messages in the OpenAI chat format cannot carry images, so run_turn
+        appends it as a separate user message.
+        """
+        if not gui_capture_available():
+            raise ToolError(_gui_unavailable_reason(need_input=False))
+        if not self._approve(
+            "view_screen",
+            f"capture the screen{f' ({note})' if note else ''}",
+            read_only=True,
+        ):
+            raise ToolError("permission denied by user")
+        path = self._resolve(save_path) if save_path else self._screenshot_path(note)
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        try:
+            capture_screen_png(path)
+        except ToolError:
+            raise
+        except OSError as exc:
+            raise ToolError(f"screen capture failed: {exc}") from exc
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            raise ToolError("screen capture produced an empty file")
+        width, height = _image_dimensions(path)
+        try:
+            data_url, _name = load_image(path)
+        except ImageError as exc:
+            raise ToolError(f"screen capture is unusable: {exc}") from exc
+        size = os.path.getsize(path)
+        if size > MAX_IMAGE_BYTES:
+            raise ToolError(
+                f"screen capture is {size // (1024 * 1024)} MB, over the "
+                f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB image limit"
+            )
+        label = os.path.basename(path)
+        lines = [
+            f"captured {self._display(path)} as {label}",
+            f"image: {width}x{height}px, {size // 1024} KB",
+        ]
+        if width > SCREENSHOT_MAX_EDGE or height > SCREENSHOT_MAX_EDGE:
+            lines.append(
+                f"note: screen is larger than {SCREENSHOT_MAX_EDGE}px on one edge; "
+                "click coordinates still refer to the real screen size"
+            )
+        if note.strip():
+            lines.append(f"note: {note.strip()}")
+        return ToolImage("\n".join(lines), data_url, label)
+
+    def list_windows(self) -> str:
+        """Read-only window inventory built from chained xdotool calls.
+
+        xdotool binds a window stack to %@ and applies the rest of the command
+        to every window in it, so one call fills the whole table. Windows with
+        no title and a tiny geometry are desktop helper windows (ibus panels,
+        mutter guards); they cannot be clicked meaningfully, so they are dropped.
+        """
+        if not gui_input_available():
+            raise ToolError(_gui_unavailable_reason(need_input=True))
+        try:
+            ids = [
+                line.strip()
+                for line in _xdotool("search", "--name", ".+").splitlines()
+                if line.strip()
+            ]
+        except ToolError:
+            ids = []
+        if not ids:
+            return "no windows found (xdotool search --name .+ returned nothing)"
+
+        names: dict[str, str] = {}
+        try:
+            out = _xdotool("search", "--name", ".+", "getwindowname", "%@")
+            for wid, line in zip(ids, out.splitlines()):
+                names[wid] = line.strip()
+        except ToolError:
+            pass
+        geometry: dict[str, dict[str, str]] = {}
+        try:
+            out = _xdotool("search", "--name", ".+", "getwindowgeometry", "--shell", "%@")
+            current = ""
+            for line in out.splitlines():
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key == "WINDOW":
+                    current = value
+                    geometry[current] = {}
+                elif current:
+                    geometry[current][key] = value
+        except ToolError:
+            pass
+        active = ""
+        try:
+            active = _xdotool("getactivewindow").strip()
+        except ToolError:
+            active = ""
+
+        rows: list[str] = []
+        for wid in ids:
+            name = names.get(wid, "")
+            geom = geometry.get(wid, {})
+            try:
+                width = int(geom.get("WIDTH", "0"))
+                height = int(geom.get("HEIGHT", "0"))
+                x = int(geom.get("X", "0"))
+                y = int(geom.get("Y", "0"))
+            except ValueError:
+                continue
+            # 托盘图标、输入法候选窗、剪贴板所有者这类窗口是 10x10 甚至 1x1
+            # 的不可见窗口，或者被摆到屏幕外（负坐标）。它们点不到，列出来
+            # 只会让模型误以为能操作，所以统一丢掉。
+            if width < 80 or height < 60:
+                continue
+            if x + width <= 0 or y + height <= 0:
+                continue
+            # 窗口管理器托管的顶层窗口带 _NET_WM_STATE；Chrome / VS Code 会建
+            # 一些同样 200x200 的内部窗口，它们没有这一项，按"不是真窗口"处理。
+            if not _window_is_managed(wid):
+                continue
+            pid = "?"
+            try:
+                pid = _xdotool("getwindowpid", wid).strip() or "?"
+            except ToolError:
+                pid = "?"
+            marker = " <- active" if active and wid == active else ""
+            rows.append(
+                f"id={wid} pid={pid} geom={width}x{height}+{x}+{y} "
+                f"name={name or '(untitled)'}{marker}"
+            )
+        if not rows:
+            return "no user-visible windows found (only desktop helper windows are open)"
+        return "\n".join(rows)
+
+    def click(self, x: int, y: int, button: str = "left", count: int = 1) -> str:
+        if not gui_input_available():
+            raise ToolError(_gui_unavailable_reason(need_input=True))
+        if not isinstance(x, int) or not isinstance(y, int) or isinstance(x, bool):
+            raise ToolError("x and y must be integers (screen pixels)")
+        if x < 0 or y < 0:
+            raise ToolError("x and y must be non-negative")
+        mode = str(button or "left").strip().lower()
+        buttons = {"left": "1", "middle": "2", "right": "3"}
+        if mode not in buttons:
+            raise ToolError("button must be left, middle or right")
+        try:
+            times = int(count)
+        except (TypeError, ValueError):
+            raise ToolError("count must be an integer") from None
+        if times < 1 or times > 3:
+            raise ToolError("count must be between 1 and 3")
+        if not self._approve("click", f"{mode} click x{times} at ({x}, {y})"):
+            raise ToolError("permission denied by user")
+        _xdotool("mousemove", "--sync", str(x), str(y))
+        _xdotool("click", "--repeat", str(times), "--delay", "80", buttons[mode])
+        return f"{mode} click x{times} at ({x}, {y})"
+
+    def move_mouse(self, x: int, y: int) -> str:
+        if not gui_input_available():
+            raise ToolError(_gui_unavailable_reason(need_input=True))
+        if isinstance(x, bool) or isinstance(y, bool) or not isinstance(x, int) or not isinstance(y, int):
+            raise ToolError("x and y must be integers (screen pixels)")
+        _xdotool("mousemove", "--sync", str(x), str(y))
+        return f"moved pointer to ({x}, {y})"
+
+    def type_text(self, text: str, delay_ms: int = 12) -> str:
+        if not gui_input_available():
+            raise ToolError(_gui_unavailable_reason(need_input=True))
+        if not isinstance(text, str) or not text:
+            raise ToolError("text must be a non-empty string")
+        if len(text) > 5000:
+            raise ToolError("text is longer than 5000 characters; send it in chunks")
+        try:
+            delay = int(delay_ms)
+        except (TypeError, ValueError):
+            raise ToolError("delay_ms must be an integer") from None
+        delay = max(0, min(delay, 500))
+        preview = text if len(text) <= 80 else text[:80] + "..."
+        if not self._approve("type_text", f"type into the focused window: {preview}"):
+            raise ToolError("permission denied by user")
+        _xdotool("type", "--clearmodifiers", "--delay", str(delay), text)
+        return f"typed {len(text)} characters into the focused window"
+
+    def press_key(self, keys: str) -> str:
+        if not gui_input_available():
+            raise ToolError(_gui_unavailable_reason(need_input=True))
+        if not isinstance(keys, str) or not keys.strip():
+            raise ToolError("keys must be a non-empty string like 'ctrl+s' or 'Return'")
+        combo = keys.strip()
+        if len(combo) > 120:
+            raise ToolError("keys string is too long")
+        if not re.fullmatch(r"[A-Za-z0-9_+\-\. ]+", combo):
+            raise ToolError(
+                "keys may only contain key names and '+', e.g. ctrl+s, alt+Tab, Return"
+            )
+        if not self._approve("press_key", f"press {combo} in the focused window"):
+            raise ToolError("permission denied by user")
+        _xdotool("key", "--clearmodifiers", combo)
+        return f"pressed {combo}"
+
+    def focus_window(self, target: str) -> str:
+        if not gui_input_available():
+            raise ToolError(_gui_unavailable_reason(need_input=True))
+        if not isinstance(target, str) or not target.strip():
+            raise ToolError("target must be a window id or part of a window title")
+        wanted = target.strip()
+        if not self._approve("focus_window", f"focus window {wanted}"):
+            raise ToolError("permission denied by user")
+        if re.fullmatch(r"\d+", wanted):
+            _xdotool("windowactivate", "--sync", wanted)
+            return f"focused window id {wanted}"
+        found = _xdotool("search", "--name", wanted).split()
+        if not found:
+            raise ToolError(f"no window title matching {wanted!r} (use list_windows)")
+        wid = found[0].strip()
+        _xdotool("windowactivate", "--sync", wid)
+        try:
+            title = _xdotool("getwindowname", wid).strip()
+        except ToolError:
+            title = wanted
+        return f"focused window id {wid} ({title})"
+
     def switch_shell(self, name: str) -> str:
         if not isinstance(name, str) or not name.strip():
             raise ToolError("shell name must be a non-empty string")
@@ -14102,10 +14980,22 @@ class Workspace:
         if self.mcp is not None:
             self.mcp.close()
 
-    def dispatch(self, name: str, arguments: dict[str, Any]) -> str:
+    def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
         if self.memory_only and name not in MEMORY_TOOL_NAMES:
             raise ToolError(f"tool {name} is disabled for this memory task")
+        if name in GUI_TOOL_NAMES:
+            if not self.allow_gui:
+                raise ToolError(
+                    f"tool {name} is disabled: screen tools are off "
+                    "(enable with --gui-use or the gui setting)"
+                )
+            if self.scheduled_run:
+                raise ToolError(f"tool {name} is disabled inside a scheduled run")
         allowed_read = set(READ_ONLY_TOOL_NAMES)
+        if self.scheduled_run:
+            # 后台定时任务不给 GUI 工具：截图会把用户屏幕发给模型，而且没人
+            # 在旁边确认点击。
+            allowed_read -= GUI_TOOL_NAMES
         if self.memory is not None:
             allowed_read |= MEMORY_READ_TOOL_NAMES
         if self.skills or self.skills_enabled:
@@ -14165,6 +15055,13 @@ class Workspace:
             "http_request": self.http_request,
             "list_shells": self.list_shells,
             "switch_shell": self.switch_shell,
+            "view_screen": self.view_screen,
+            "list_windows": self.list_windows,
+            "click": self.click,
+            "move_mouse": self.move_mouse,
+            "type_text": self.type_text,
+            "press_key": self.press_key,
+            "focus_window": self.focus_window,
             "create_schedule": self.create_schedule,
             "list_schedules": self.list_schedules,
             "delete_schedule": self.delete_schedule,
@@ -17373,6 +18270,7 @@ def run_turn(
             if not tool_calls:
                 return True
 
+            pending_images: list[tuple[str, ToolImage]] = []
             for index, call in enumerate(tool_calls):
                 if not isinstance(call, dict):
                     continue
@@ -17417,11 +18315,33 @@ def run_turn(
                 ) as exc:
                     result = f"error: {exc}"
 
+                # 工具可以带回图片（目前只有 view_screen）。OpenAI chat 的 tool
+                # 消息只允许文本，所以图片走紧随其后的一条 user 消息；打上
+                # _tool_image 标记，让压缩不把它当成一个用户回合。
+                tool_image: ToolImage | None = None
+                if isinstance(result, ToolImage):
+                    tool_image = result
+                    result = result.text
+                elif not isinstance(result, str):
+                    result = str(result)
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+                if tool_image is not None:
+                    pending_images.append((name, tool_image))
                 if verbose_tools:
                     report("tool_result", _clip_tool_text(result))
                 if workspace.plan_result is not None:
                     break
+
+            # 图片统一放到这一轮所有 tool 消息之后：OpenAI 要求 assistant 的
+            # 每个 tool_call 紧跟着对应的 tool 消息，中间插 user 会打断这个配对。
+            for tool_name, tool_image in pending_images:
+                shot = build_user_message(
+                    f"[{tool_name}] 以下是你刚看到的画面",
+                    [(tool_image.data_url, tool_image.name)],
+                )
+                shot["_tool_image"] = True
+                messages.append(shot)
+            pending_images.clear()
 
             if workspace.plan_result is not None:
                 report("plan", workspace.plan_result.get("plan", ""))
@@ -19351,6 +20271,9 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
           <label class="toggle"><input id="set-shell-enabled" type="checkbox"> 启用 run_command</label>
         </div>
         <div class="form-row">
+          <label class="toggle"><input id="set-gui" type="checkbox"> 启用屏幕工具（截图 / 鼠标键盘控制）</label>
+        </div>
+        <div class="form-row">
           <label class="toggle"><input id="set-shell-fallback" type="checkbox"> 允许自动回退 shell</label>
         </div>
         <div class="form-row">
@@ -19447,6 +20370,10 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         <div class="form-row">
           <label for="set-stream-idle">流式空闲超时（秒）</label>
           <input id="set-stream-idle" type="number" min="10">
+        </div>
+        <div class="form-row">
+          <label for="set-stream-connect">响应头超时（秒）</label>
+          <input id="set-stream-connect" type="number" min="5" max="600">
         </div>
         <div class="form-row">
           <label for="set-stream-flush">流式刷新间隔（毫秒）</label>
@@ -21687,6 +22614,7 @@ function populateSettings(defaults) {
   settingsSet("reasoning", d.reasoning);
   settingsSet("shell", d.shell);
   settingsSet("shell-enabled", d.shell_enabled);
+  settingsSet("gui", d.gui);
   settingsSet("shell-fallback", d.shell_fallback);
   settingsSet("command-timeout", d.command_timeout);
   settingsSet("max-command-timeout", d.max_command_timeout);
@@ -21709,6 +22637,7 @@ function populateSettings(defaults) {
   settingsSet("verbose-tools", d.verbose_tools);
   settingsSet("debug-stream", d.debug_stream);
   settingsSet("stream-idle", d.stream_idle_timeout);
+  settingsSet("stream-connect", d.stream_connect_timeout);
   settingsSet("stream-flush", d.stream_flush_ms);
 }
 
@@ -21726,6 +22655,7 @@ function collectSettings() {
     reasoning: settingsText("reasoning") || null,
     shell: settingsText("shell") || "auto",
     shell_enabled: settingsBool("shell-enabled"),
+    gui: settingsBool("gui"),
     shell_fallback: settingsBool("shell-fallback"),
     command_timeout: settingsNumber("command-timeout"),
     max_command_timeout: settingsNumber("max-command-timeout"),
@@ -21750,6 +22680,7 @@ function collectSettings() {
     verbose_tools: settingsBool("verbose-tools"),
     debug_stream: settingsBool("debug-stream"),
     stream_idle_timeout: settingsNumber("stream-idle"),
+    stream_connect_timeout: settingsNumber("stream-connect"),
     stream_flush_ms: settingsNumber("stream-flush"),
   };
 }
@@ -24516,8 +25447,21 @@ def run_web(
     }
     default_workspace = workspace.root
     runtime: dict[str, Any] = {"client": client, "connection": connection}
+    # 流式超时挂在 client 上，而换模型会换 client。这两个值单独记一份，
+    # 换 client 时重新套上去，网页改设置也能立刻生效。
+    stream_timeouts: dict[str, int] = {
+        "idle": int(getattr(client, "stream_idle_timeout", 60)),
+        "connect": int(getattr(client, "stream_connect_timeout", 30)),
+    }
     config_state: dict[str, Any] = {"config": config}
     tools = tool_schemas(workspace)
+
+    def apply_stream_timeouts(target: Any) -> None:
+        """把已保存的流式超时套到（可能刚换过的）client 上。"""
+        if target is None:
+            return
+        target.stream_idle_timeout = float(stream_timeouts["idle"])
+        target.stream_connect_timeout = float(stream_timeouts["connect"])
 
     def refresh_web_system_message() -> None:
         nonlocal system_message, tools
@@ -24645,12 +25589,30 @@ def run_web(
                 1.0, float(values["live_tick_seconds"])
             )
             applied.append("live_tick_seconds")
+        if "stream_idle_timeout" in values or "stream_connect_timeout" in values:
+            # The two stream timeouts live on the client, which a model switch
+            # replaces, so update whichever client is current and remember the
+            # values for the next one.
+            target = runtime.get("client")
+            if "stream_idle_timeout" in values:
+                stream_timeouts["idle"] = max(10, int(values["stream_idle_timeout"]))
+                if target is not None:
+                    target.stream_idle_timeout = float(stream_timeouts["idle"])
+                applied.append("stream_idle_timeout")
+            if "stream_connect_timeout" in values:
+                stream_timeouts["connect"] = max(5, int(values["stream_connect_timeout"]))
+                if target is not None:
+                    target.stream_connect_timeout = float(stream_timeouts["connect"])
+                applied.append("stream_connect_timeout")
         if "shell_enabled" in values:
             workspace.allow_shell = bool(values["shell_enabled"])
             applied.append("shell_enabled")
         if "shell_fallback" in values:
             workspace.shell_fallback = bool(values["shell_fallback"])
             applied.append("shell_fallback")
+        if "gui" in values:
+            workspace.allow_gui = bool(values["gui"])
+            applied.append("gui")
         if "shell_enabled" in values:
             refresh_web_system_message()
         return applied
@@ -25591,6 +26553,7 @@ def run_web(
                     "api_format": active_connection.api_format,
                     "show_thinking": show,
                     "stream": bool(state.get("stream_enabled", True)),
+                    "stream_timeouts": dict(stream_timeouts),
                     "workspace": workspace.root,
                     "default_workspace": default_workspace,
                     "session": (
@@ -26711,6 +27674,7 @@ def run_web(
                     if make_active:
                         runtime["client"] = client_factory(saved_connection)
                         runtime["connection"] = saved_connection
+                        apply_stream_timeouts(runtime["client"])
                         if scheduler is not None:
                             scheduler.update_context(
                                 saved_connection, runtime["client"].model
@@ -26774,6 +27738,7 @@ def run_web(
                     config_state["config"] = draft
                     runtime["client"] = client_factory(selected)
                     runtime["connection"] = selected
+                    apply_stream_timeouts(runtime["client"])
                     if scheduler is not None:
                         scheduler.update_context(selected, runtime["client"].model)
                     if workspace.memory is not None:
@@ -27298,6 +28263,24 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="do not retry a command in other shells when the current shell does not recognize it",
     )
+    gui_group = parser.add_mutually_exclusive_group()
+    gui_group.add_argument(
+        "--gui-use",
+        dest="gui",
+        action="store_true",
+        default=None,
+        help=(
+            "expose screen tools (view_screen, list_windows, click, type_text, "
+            "press_key, focus_window); needs an X11 display and xdotool "
+            "(default: config or off)"
+        ),
+    )
+    gui_group.add_argument(
+        "--no-gui-use",
+        dest="gui",
+        action="store_false",
+        help="disable screen tools (default)",
+    )
     plain_group = parser.add_mutually_exclusive_group()
     plain_group.add_argument(
         "--plain",
@@ -27537,7 +28520,20 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         metavar="SECONDS",
-        help="drop a stream after this many seconds without events (default: 300)",
+        help=(
+            "drop a stream after this many seconds without events "
+            "(default: 60)"
+        ),
+    )
+    parser.add_argument(
+        "--stream-connect-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "give up when the response headers do not arrive within this many "
+            "seconds (default: 30)"
+        ),
     )
     parser.add_argument(
         "--stream-flush-ms",
@@ -27840,6 +28836,12 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if not 5 <= args.stream_connect_timeout <= 600:
+        print(
+            "error: --stream-connect-timeout must be between 5 and 600",
+            file=sys.stderr,
+        )
+        return 2
     if not 0 <= args.stream_flush_ms <= 1000:
         print("error: --stream-flush-ms must be between 0 and 1000", file=sys.stderr)
         return 2
@@ -27904,6 +28906,7 @@ def main(argv: list[str] | None = None) -> int:
             reasoning=reasoning_state["config"],
         )
         client.stream_idle_timeout = float(args.stream_idle_timeout)
+        client.stream_connect_timeout = float(args.stream_connect_timeout)
         client.debug_stream = bool(args.debug_stream) or bool(
             os.environ.get("BENBEN_DEBUG_STREAM")
         )
@@ -28002,6 +29005,7 @@ def main(argv: list[str] | None = None) -> int:
         live_flush_ms=args.live_flush_ms,
         live_max_lines=args.live_max_lines,
         live_tick_seconds=args.live_tick_seconds,
+        allow_gui=bool(args.gui),
     )
     atexit.register(workspace.close)
     workspace.skills = (

@@ -630,7 +630,8 @@ check(
 print("== config defaults ==")
 defaults = agent.default_settings()
 check("default stream", defaults["stream"] is True)
-check("default stream idle", defaults["stream_idle_timeout"] == 300)
+check("default stream idle", defaults["stream_idle_timeout"] == 60)
+check("default stream connect", defaults["stream_connect_timeout"] == 30)
 check("default stream flush", defaults["stream_flush_ms"] == 40)
 check("default debug stream", defaults["debug_stream"] is False)
 

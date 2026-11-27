@@ -331,11 +331,8 @@ ok = agent.run_turn(client, ws, messages, 3)
 check("run_turn with edit_file", ok and "GAMMA" in open(os.path.join(base, "edit/a.txt")).read(), messages[-1])
 check(
     "all tools sent",
-    messages[-1]["content"] == (
-        "done:list_dir,read_file,read_files,read_file_outline,search,glob,write_file,edit_file,"
-        "multi_edit,run_command,job_output,job_cancel,job_list,http_request,"
-        "list_shells,switch_shell"
-    ),
+    messages[-1]["content"]
+    == "done:" + ",".join(t["function"]["name"] for t in agent.tool_schemas(ws)),
     messages[-1],
 )
 

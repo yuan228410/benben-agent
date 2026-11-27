@@ -61,6 +61,9 @@ python3 tests/test_chat_lock_scope.py
 python3 tests/test_background_and_http.py
 python3 tests/test_compact_prompt.py
 python3 tests/test_usage_protocol.py
+python3 tests/test_gui_tools.py
+python3 tests/test_stream_cancel.py
+python3 tests/test_stream_timeout_settings.py
 ```
 
 测试会：
@@ -93,7 +96,7 @@ python3 tests/test_usage_protocol.py
 | `test_config.py` | 配置读写、权限、校验、优先级、模型解析、client 工厂 |
 | `test_connect.py` | `/connect` 向导、预设、切换/删除、`--profile`、`--no-env` |
 | `test_web_connections.py` | Web 连接设置、会话标题/导出、工具详情、思考/停止控件、会话回收站恢复/永久删除/清空 |
-| `test_shell.py` | shell 检测顺序、`$SHELL` 优先、Windows 编码、工具切换、自动回退、系统提示 |
+| `test_shell.py` | shell 检测顺序、`$SHELL` 优先、Windows 编码、工具切换、自动回退、系统提示；只读判定的隐藏写入通道（换行绕过、`sed` 的 `e`/`w`/`s///w`/`s///e`/`-f`、`git -c` 的危险配置键）以及正常命令不被误伤 |
 | `test_shell_choice.py` | `run_command` 的 `shell` 参数：按指定 shell 执行、不改默认、不回退、只读判定、工具描述 |
 | `test_plan_mode.py` | 计划模式：工具不削减、`submit_plan`、守卫三档、提示词、CLI、Web API、配置持久化、会话级计划状态 |
 | `test_scheduler.py` | 时间表达式、任务存储、只读/完整权限、运行记录、补跑一次、CLI `/schedule` |
@@ -131,3 +134,6 @@ python3 tests/test_usage_protocol.py
 | `test_background_and_http.py` | 后台任务与 HTTP 工具：`background=true` 起任务、`job_output` 读尾部、`job_cancel` 杀进程树、数量上限与自动超时、`http_request` 的 GET/POST/4xx/重定向/非法 URL |
 | `test_compact_prompt.py` | 压缩摘要模板：8 个小节齐全、规则要点（省略系统指令/路径原样保留/不调用工具）、散文回复也照收且不额外发请求、滚动压缩的合并说明且不重复旧摘要 |
 | `test_usage_protocol.py` | 前后端 usage 协议：跑一次真实回合拿到后端发出的 usage_live 文本和结构化 data，再喂给页面真实函数——结构化 data 能直接渲染，文本兜底能解出上下文百分比且与快照一致。防止两边字段名再次静默脱节 |
+| `test_gui_tools.py` | 屏幕工具：默认关闭且 `dispatch` 拒绝执行、`--gui-use` 才暴露、无显示时不给工具、`view_screen` 返回 `ToolImage`、截图作为 tool 结果之后的独立 user 消息发回模型（tool 消息保持纯文本、本地标记不上线）、确认开关控制 `click` 等写操作、只读与定时任务下的工具裁剪、参数校验、PNG/JPEG 尺寸解析、压缩切分不把图片消息当用户回合 |
+| `test_stream_cancel.py` | 停止流式请求：流中途静默能被停止且报 `ChatCancelled`（而不是"流提前结束"）、请求一直不返回响应头也能停止（不再卡到 idle 超时）、重试退避期间停止不被延迟、正常流不受影响 |
+| `test_stream_timeout_settings.py` | 流式超时：连接超时与空闲超时是两个独立值（默认 30/60）、两项均可热更新、保存即时生效、换连接后保留新值而不是回到默认 |
