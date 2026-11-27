@@ -61,7 +61,10 @@ delta = re.search(
 check("usage_live event handled", delta is not None)
 if delta:
     body = delta.group(1)
-    check("usage_live updates meter", "renderUsageMeter(event.text)" in body, body[:200])
+    check("usage_live uses structured data first",
+          "renderContextMeter(event.data)" in body, body[:260])
+    check("usage_live falls back to parsing text",
+          "renderUsageMeter(event.text)" in body, body[:260])
     check("usage_live stays out of the transcript",
           "addLine" not in body, body[:200])
 
@@ -76,6 +79,10 @@ if delta_full:
 
 check("usage_live emitted per model call",
       'report("usage_live"' in text)
+check("usage_live carries a structured snapshot",
+      'usage_snapshot())' in text)
+check("web layer forwards structured events",
+      "emit_data=emit_data" in text and "def emit_data(" in text)
 check("usage_live excludes total",
       "format_usage(include_total=False)" in text)
 check("cli ignores usage_live",
@@ -167,18 +174,21 @@ const ctx = vm.createContext(sandbox);
 vm.runInContext(js, ctx, { filename: "benben-web.js" });
 
 const out = { parsed: [], rendered: [] };
+// 样本必须与后端 format_usage 的真实输出一致（字段名 in:/cached:/new:/hit:/ctx:）。
+// 早先这里是 last: input=... context=... —— 后端早已改成冒号形式，
+// 前后端一起错，所以测试一直是绿的，界面上却一个数字都不动。
 for (const line of [
-  "[usage] last: input=1000 cached=800 new=200 hit=80% | context=12345/256000 (4%)",
-  "[usage] context=~5000/100000 (5%)",
-  "[usage] last: input=100 (no context here)",
+  "[usage] in:1000 cached:800 new:200 hit:80% | ctx:4%(12345/256000)",
+  "[usage] ctx:5%(~5000/100000)",
+  "[usage] in:100 cached:60 new:40 hit:60%",
 ]) {
   out.parsed.push(ctx.parseUsageContext(line));
 }
 // 后端拼好的完整 usage 行（含 total）走 renderUsageMeter
 for (const line of [
-  "[usage] last: input=232488 cached=230912 new=1576 hit=99% | context=232835/1000000 (23%)",
-  "[usage] last: input=1 cached=0 new=1 hit=0% | context=72000/100000 (72%) | total: calls=3 input=9 cached=0 new=9 hit=0% output=5 reasoning=0 tokens=14",
-  "[usage] last: input=1 cached=0 new=1 hit=0% | context=~5000/100000 (5%)",
+  "[usage] in:232488 cached:230912 new:1576 hit:99% | ctx:23%(232835/1000000)",
+  "[usage] in:1 cached:0 new:1 hit:0% | ctx:72%(72000/100000) | total: 3x in:9 hit:0% out:5 tokens:14",
+  "[usage] in:1 cached:0 new:1 hit:0% | ctx:5%(~5000/100000)",
 ]) {
   meter.classList = mkClassList();
   meter.hidden = false;
@@ -217,7 +227,6 @@ fs.writeFileSync(process.argv[3], JSON.stringify(out), "utf8");
 """,
         encoding="utf-8",
     )
-    # 上面把 js 当参数传，需要先落盘
     Path(str(Path(runner) / "benben-web.js")).write_text(js, encoding="utf-8")
     # 结果走文件而不是 stdout：Windows 下 stdout 管道要跨一道编码，
     # 解码偏了就会把非 ASCII 的分隔符 "·" 换成 U+FFFD，导到

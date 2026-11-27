@@ -468,7 +468,7 @@ try:
     )
 except ValueError:
     WEB_APPROVAL_TIMEOUT = 120.0
-AGENT_VERSION = "0.33.1"
+AGENT_VERSION = "0.33.2"
 CONFIG_VERSION = 2
 CONFIG_FILENAME = "config.json"
 MODELS_FILE = os.path.join(SESSION_DIR, "models.json")
@@ -17035,6 +17035,7 @@ def run_turn(
     show_thinking: bool = False,
     session: "Session | None" = None,
     emit: "Callable[[str, str], None] | None" = None,
+    emit_data: "Callable[[str, str, dict[str, Any]], None] | None" = None,
     tools: list[dict[str, Any]] | None = None,
     cancel_event: "threading.Event | None" = None,
     verbose_tools: bool = False,
@@ -17052,7 +17053,7 @@ def run_turn(
     stream_state = {"content": False, "thinking": False}
     reply_index = 0
 
-    def report(kind: str, text: str) -> None:
+    def report(kind: str, text: str, data: dict[str, Any] | None = None) -> None:
         if kind == "thinking" and stream_state["thinking"]:
             stream_state["thinking"] = False
             if printer is not None:
@@ -17065,7 +17066,12 @@ def run_turn(
                     printer.finish_reply()
                 return
         if emit is not None:
-            emit(kind, text)
+            # data 是有结构的事件负载（目前只有 usage_live 用），
+            # 走单独的通道，免得每处 emit 调用都要多传一个参数。
+            if data is not None and emit_data is not None:
+                emit_data(kind, text, data)
+            else:
+                emit(kind, text)
         elif kind == "content_start":
             if printer is not None:
                 printer.begin_content()
@@ -17144,6 +17150,65 @@ def run_turn(
         call_count += 1
         merge_usage(usage_total, usage)
 
+    def usage_snapshot() -> dict[str, Any]:
+        """本次模型调用后的用量和上下文占用，供前端直接渲染。
+
+        网页端以前从 ``format_usage`` 的文本里用正则反解数字，后端把
+        ``input=`` 改成 ``in:`` 时前端静默失配，状态条整个回合都不刷新。
+        结构化地给一份，前端就不用猜文本格式。
+        """
+        snapshot: dict[str, Any] = {}
+        if last_call_usage:
+            last_cached = max(
+                0, int(last_call_usage.get("cached_tokens", 0) or 0)
+            )
+            last_input = max(
+                0, int(last_call_usage.get("prompt_tokens", 0) or 0)
+            )
+            if last_input > 0:
+                snapshot["input"] = last_input
+                snapshot["cached"] = last_cached
+                snapshot["new"] = max(0, last_input - last_cached)
+                snapshot["hit"] = min(100, last_cached * 100 // last_input)
+        if context_window:
+            window = max(1, int(context_window))
+            context_tokens, is_estimate = context_size()
+            snapshot.update({
+                "tokens": context_tokens,
+                "window": window,
+                "percent": min(100, int(context_tokens * 100 / window)),
+                "remaining": max(0, window - context_tokens),
+                "estimated": is_estimate,
+            })
+        return snapshot
+
+    def context_size() -> "tuple[int, bool]":
+        """当前上下文的 token 占用，以及它是否只是本地估算。
+
+        有真实用量时以最后一次 prompt token 为锚点，加上这次回复，再把之后
+        追加的消息（工具结果等）按本地估算补上；没有基准时只能全量估算。
+        """
+        if last_call_usage:
+            real_tokens = int(last_call_usage.get("prompt_tokens", 0) or 0)
+            if real_tokens > 0:
+                completion_tokens = max(
+                    0, int(last_call_usage.get("completion_tokens", 0) or 0)
+                )
+                # 以真实 prompt 计数为锚，加上真实 completion；
+                # 最后一条回复之后追加的消息（比如工具结果）走估算。
+                context_tokens = real_tokens + completion_tokens
+                baseline = getattr(client, "last_prompt_estimate", None)
+                if (
+                    isinstance(baseline, int)
+                    and baseline >= 0
+                    and last_reply is not None
+                ):
+                    delta = context_tokens_now() - baseline
+                    reply_estimate = _message_tokens(last_reply)
+                    context_tokens += max(0, delta - reply_estimate)
+                return context_tokens, False
+        return context_tokens_now(), True
+
     def format_usage(include_total: bool) -> str:
         """Build the ``[usage]`` line.
 
@@ -17174,33 +17239,7 @@ def run_turn(
             )
         if context_window:
             window = max(1, int(context_window))
-            context_tokens = 0
-            is_estimate = True
-            if last_call_usage:
-                real_tokens = int(
-                    last_call_usage.get("prompt_tokens", 0) or 0
-                )
-                if real_tokens > 0:
-                    completion_tokens = max(
-                        0,
-                        int(last_call_usage.get("completion_tokens", 0) or 0),
-                    )
-                    # Anchor to the real prompt count and add the real
-                    # completion. Any messages appended after the final
-                    # reply (for example tool results) are estimated.
-                    context_tokens = real_tokens + completion_tokens
-                    baseline = getattr(client, "last_prompt_estimate", None)
-                    if (
-                        isinstance(baseline, int)
-                        and baseline >= 0
-                        and last_reply is not None
-                    ):
-                        delta = context_tokens_now() - baseline
-                        reply_estimate = _message_tokens(last_reply)
-                        context_tokens += max(0, delta - reply_estimate)
-                    is_estimate = False
-            if is_estimate:
-                context_tokens = context_tokens_now()
+            context_tokens, is_estimate = context_size()
             percent = min(100, int(context_tokens * 100 / window))
             tilde = "~" if is_estimate else ""
             parts.append(
@@ -17320,7 +17359,8 @@ def run_turn(
             # 供网页端右上角状态条刷新。整轮结束时的完整版（含 total）在
             # finally 里再发一次，CLI 只认那个，不受这里影响。
             if last_call_usage or context_window:
-                report("usage_live", format_usage(include_total=False))
+                report("usage_live", format_usage(include_total=False),
+                       usage_snapshot())
 
             if show_thinking and isinstance(reasoning, str) and reasoning.strip():
                 report("thinking", reasoning)
@@ -17399,7 +17439,7 @@ def run_turn(
         client.last_turn_usage = dict(usage_total)
         client.last_turn_truncated = truncated
         if usage_total or last_call_usage or context_window:
-            report("usage", format_usage(include_total=True))
+            report("usage", format_usage(include_total=True), usage_snapshot())
         if truncated:
             report("warning", "输出被 max_tokens 截断，回答可能不完整")
         if session is not None:
@@ -21292,10 +21332,12 @@ function renderUsageMeter(text) {
   const context = parseUsageContext(text);
 
   // 完整行 80+ 字符太长，只取关键数字重建；信息一项不少。
-  const hit = raw.match(/hit=(\d+)%/);
-  const cached = raw.match(/cached=(\d+)/);
-  const input = raw.match(/input=(\d+)/);
-  const fresh = raw.match(/new=(\d+)/);
+  // 字段名跟后端 format_usage 一致（in:/cached:/new:/hit:），
+  // 曾经这里写的是 input=/context=，与后端不符导致一个数字都取不到。
+  const hit = raw.match(/hit:(\d+)%/);
+  const cached = raw.match(/cached:(\d+)/);
+  const input = raw.match(/in:(\d+)/);
+  const fresh = raw.match(/new:(\d+)/);
   const label = buildMeterLabel({
     hit: hit ? Number(hit[1]) : undefined,
     cached: cached ? Number(cached[1]) : undefined,
@@ -21330,15 +21372,16 @@ function setContextMeter(label, percent, estimated) {
   ctxMeterEl.removeAttribute("title");
 }
 
-// 从 usage 文本里解析 context=1234/256000 (12%)
+// 从 usage 文本里解析 context=... （仅作老服务端的兜底：
+// 新服务端在事件的 data 里直接给出结构化的 tokens/window/percent）
 function parseUsageContext(text) {
-  const match = String(text || "").match(/context=(~?)(\d+)\/(\d+)\s*\((\d+)%\)/);
+  const match = String(text || "").match(/ctx:(\d+)%\((~?)(\d+)\/(\d+)\)/);
   if (!match) return null;
   return {
-    estimated: match[1] === "~",
-    tokens: Number(match[2]),
-    window: Number(match[3]),
-    percent: Number(match[4]),
+    percent: Number(match[1]),
+    estimated: match[2] === "~",
+    tokens: Number(match[3]),
+    window: Number(match[4]),
   };
 }
 
@@ -24229,15 +24272,23 @@ async function send(explicitText) {
           addLine("tool", "思考: " + event.text);
         }
         else if (event.type === "usage_live") {
-          // 每次模型调用后到达的精简用量行（无 total），只刷新右上角状态条，
-          // 不往对话流里追加文本，免得每调一次工具就多一行噪声。
-          renderUsageMeter(event.text);
+          // 每次模型调用后到达的精简用量。优先用事件里的结构化 data；
+          // 老服务端只给 text，此时回退到解文本。
+          if (event.data && typeof event.data.window === "number") {
+            renderContextMeter(event.data);
+          } else {
+            renderUsageMeter(event.text);
+          }
         }
         else if (event.type === "usage") {
           finishStreamBubble();
           endStreamThinking();
           // 整轮结束时的完整用量（含 total）：状态条和对话流都更新。
-          renderUsageMeter(event.text);
+          if (event.data && typeof event.data.window === "number") {
+            renderContextMeter(event.data);
+          } else {
+            renderUsageMeter(event.text);
+          }
           addLine("tool", event.text);
         }
         else if (event.type === "approval") {
@@ -25022,6 +25073,18 @@ def run_web(
                 else:
                     events.append({"type": kind, "text": text})
 
+            def emit_data(kind: str, text: str, data: dict[str, Any]) -> None:
+                """带结构化负载的事件。
+
+                网页端靠事件里的字段渲染状态条，不用再从 text 里反解数字；
+                非流式（同步）路径也带上，重放事件时行为一致。
+                """
+                payload = {"type": kind, "text": text, "data": data}
+                if stream:
+                    self._sse(payload)
+                else:
+                    events.append(payload)
+
             for note in auto_notes:
                 emit("warning", note)
             request_context = context_usage(
@@ -25055,6 +25118,7 @@ def run_web(
                         show_thinking=turn_show_thinking,
                         session=turn_session,
                         emit=emit,
+                        emit_data=emit_data,
                         tools=tools,
                         cancel_event=chat_state["cancel"],
                         verbose_tools=True,
